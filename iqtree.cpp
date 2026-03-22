@@ -358,6 +358,7 @@ void myPartitionsDestroy(partitionList *pl) {
 // This is done independent of Tung's initializePLL function
 // to support reordering aln pattern by parsimony score
 void IQTree::initTopologyByPLLRandomAdition(Params &params){
+    cout << "--Reach 361 iqtree.cpp, initTopologyByPLLRandomAdition\n";
 	pllInstance * tmpInst = NULL;
 	pllInstanceAttr tmpAttr;
 	pllAlignmentData * tmpAlignmentData;
@@ -1722,6 +1723,7 @@ double IQTree::doTreeSearch() {
     	 *---------------------------------------*/
 		double perturbScore;
 		if(!on_ratchet_hclimb1){
+            // cout << "REACH " << 1725 << " iqtree.cpp: what is this\n";
 			if (iqp_assess_quartet == IQP_BOOTSTRAP) {
 				// create bootstrap sample
 				Alignment* bootstrap_alignment;
@@ -2104,9 +2106,11 @@ string IQTree::doNNISearch(int& nniCount, int& nniSteps) {
 
 //		if(false){
 		if(on_ratchet_hclimb1 && params->hclimb1_nni){
+            cout << "--REACH 2108, on_ratchet_hclimb1 && params->hclimb1_nni\n";
 			curScore = optimizeNNI(nniCount, nniSteps);
 			treeString = getTreeString();
 		}else{
+            cout << "--REACH 2112, else\n";
 			string treeString1 = getTreeString();
 			size_t index = 0;
 			while (true) {

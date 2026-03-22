@@ -1115,6 +1115,7 @@ void computeInitialTree(Params &params, IQTree &iqtree, string &dist_file, int &
 
     string out_file = params.out_prefix;
     if (params.user_file) {
+		cout << "--REACH 1118 phyloanalysis.cpp: user-defined tree\n";
         // start the search with user-defined tree
     	cout << endl;
         cout << "Reading input tree file " << params.user_file << " ..." << endl;
@@ -1157,6 +1158,7 @@ void computeInitialTree(Params &params, IQTree &iqtree, string &dist_file, int &
 		break;
 	case STT_PLL_PARSIMONY:
 		cout << endl;
+		cout << "--REACH 1162 phyloanalysis.cpp: STT_PLL_PARSIMONY\n";
 		cout << "Create initial parsimony tree by phylogenetic likelihood library (PLL)... ";
 		// generate a parsimony tree for model optimization
 		iqtree.pllInst->randomNumberSeed = params.ran_seed;
@@ -1206,6 +1208,7 @@ void computeInitialTree(Params &params, IQTree &iqtree, string &dist_file, int &
     }
     initTree = iqtree.getTreeString();
     if (params.pll) {
+		cout << "--REACH 1213 phyloanalysis.cpp: params.pll = true\n";
         pllNewickTree *newick = pllNewickParseString(initTree.c_str());
         pllTreeInitTopologyNewick(iqtree.pllInst, newick, PLL_TRUE);
         pllNewickParseDestroy(&newick);
@@ -1670,6 +1673,7 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 
     // Temporary fix since PLL only supports DNA/Protein: switch to IQ-TREE parsimony kernel
     if (params.start_tree == STT_PLL_PARSIMONY) {
+		cout << "--REACH 1674 phyloanalysis.cpp: if dna/protein use PLL_IQtree\n";
 		if (iqtree.isSuperTree()) {
 			PhyloSuperTree *stree = (PhyloSuperTree*)&iqtree;
 			for (PhyloSuperTree::iterator it = stree->begin(); it != stree->end(); it++)
@@ -1682,6 +1686,7 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 
     /***************** Initialization for PLL and sNNI ******************/
     if (params.start_tree == STT_PLL_PARSIMONY || params.pll) {
+		cout << "--REACH 1687 phyloanalysis.cpp: initialize PLL_IQtree\n";
         /* Initialized all data structure for PLL*/
 //        cout << "WHAT'S GOING ON HERE?" << endl;
 //        verbose_mode = VB_MAX;
@@ -1759,6 +1764,7 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 
     if (params.min_iterations > 0) {
         double initTime = getCPUTime();
+		cout << "--REACH 1769 phyloanalysis.cpp: min_iterations = " << params.min_iterations << '\n';
 
         if (!params.user_file && (params.start_tree == STT_PARSIMONY || params.start_tree == STT_PLL_PARSIMONY)) {
         	int numDup = initCandidateTreeSet(params, iqtree, numInitTrees);
