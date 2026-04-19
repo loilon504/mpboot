@@ -3000,14 +3000,15 @@ static void stepwiseAddition(pllInstance *tr, partitionList *pr, nodeptr p, node
   // tr->ti[1] = p->number;
   // tr->ti[2] = p->back->number;
 
-  mp = evaluateParsimonyIterativeFast(tr, pr, PLL_FALSE);
+  // mp = evaluateParsimonyIterativeFast(tr, pr, PLL_FALSE);
   {
-    size_t nNodes = 0;
-    auto levels = mpbootgpu::computeTraversalInfoBFS(p, tr->mxtips, PLL_FALSE, nNodes);
-    levels.resize(levels.size() + 1);
-    levels.back().push_back({tr->mxtips * 2, p->number, p->back->number});
-    nNodes++;
-    mpbootgpu::newviewParsimonyGpu(tr, pr, levels, nNodes);
+    computeTraversalInfoParsimony(p, tr->ti, &counter, tr->mxtips, PLL_FALSE, PLL_FALSE);
+    tr->ti[counter] = tr->mxtips * 2;
+    tr->ti[counter + 1] = p->number;
+    tr->ti[counter + 2] = p->back->number;
+    counter += 4;
+    tr->ti[0] = counter;
+    mpbootgpu::newviewParsimonyGpu(tr, pr);
     mp = tr->parsimonyScore[tr->mxtips * 2];
   }
 
@@ -3186,9 +3187,9 @@ static void _pllMakeParsimonyTreeFast(pllInstance *tr, partitionList *pr, int sp
 
         {
           // mpbootgpu::InlineProfilerTimer p("newviewParsimonyGpu");
-          size_t nNodes = 0;
-          auto levels = mpbootgpu::computeTraversalInfoBFS(q, tr->mxtips, PLL_FALSE, nNodes);
-          mpbootgpu::newviewParsimonyGpu(tr, pr, levels, nNodes);
+          computeTraversalInfoParsimony(q, tr->ti, &counter, tr->mxtips, PLL_FALSE, 0);
+          tr->ti[0] = counter;
+          mpbootgpu::newviewParsimonyGpu(tr, pr);
         }
 
       }

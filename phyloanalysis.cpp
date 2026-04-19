@@ -1760,7 +1760,7 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 
 	/********************* Init constant data for PLL in Gpu *******************/
 	if (params.use_gpu) {
-		mpbootgpu::parsimonyGpuInit(iqtree.pllInst, iqtree.pllPartitions);
+		mpbootgpu::newviewGpuInit(iqtree.pllInst, iqtree.pllPartitions);
 	}
 
 
