@@ -13,22 +13,28 @@ namespace mpbootgpu
 #define MAX_STATES 32
 
 // Warp reduce
-__device__ __forceinline__ unsigned int warpReduceSum(unsigned int val)
+__device__ __forceinline__ unsigned int warpReduceSum(
+    unsigned int val
+)
 {
     const unsigned int FULL_MASK = 0xffffffffu;
     for (int offset = 16; offset > 0; offset >>= 1)
+    {
         val += __shfl_down_sync(FULL_MASK, val, offset);
+    }
     return val;
 }
 
+// Layout GPU: [node][site][state]  →  base[states*(width*node + i) + k]
+// layout CPU: [node][state][site] = base[width*states*node + width*k + i])
 __global__ void newviewParsimonyKernel(
-    parsimonyNumber*            d_parsVect,      
-    unsigned int*               d_nodeScores,    
-    const int*  __restrict__    d_ti,            
-    int                         tiCount,         
-    const size_t* __restrict__  d_widths,        
-    const size_t* __restrict__  d_states,        
-    const size_t* __restrict__  d_parsVectOffset,
+    parsimonyNumber*            d_parsVect,       
+    unsigned int*               d_nodeScores,     
+    const int*  __restrict__    d_ti,             
+    int                         tiCount,          
+    const size_t* __restrict__  d_widths,         
+    const size_t* __restrict__  d_states,         
+    const size_t* __restrict__  d_parsVectOffset, 
     int                         numPartitions
 )
 {
@@ -38,12 +44,11 @@ __global__ void newviewParsimonyKernel(
     size_t width  = d_widths[model];
     size_t states = d_states[model];
 
-    // use flag for warp reduce
     bool active = (i < (int)width);
 
     parsimonyNumber* base = d_parsVect + d_parsVectOffset[model];
 
-    int laneId = threadIdx.x & 31;   // lane in warp
+    int laneId = threadIdx.x & 31;
 
     for (int index = 4; index < tiCount; index += 4)
     {
@@ -55,27 +60,27 @@ __global__ void newviewParsimonyKernel(
 
         if (active)
         {
+            parsimonyNumber* lBase = base + states * (width * qNumber + i);  // [q][i][0..states]
+            parsimonyNumber* rBase = base + states * (width * rNumber + i);  // [r][i][0..states]
+            parsimonyNumber* pBase = base + states * (width * pNumber + i);  // [p][i][0..states]
+
             parsimonyNumber t_N = 0;
             parsimonyNumber t_A[MAX_STATES], o_A[MAX_STATES];
 
             for (size_t k = 0; k < states; k++) {
-                parsimonyNumber lv = base[(width * states * qNumber) + width * k + i];
-                parsimonyNumber rv = base[(width * states * rNumber) + width * k + i];
-                t_A[k] = lv & rv;
-                o_A[k] = lv | rv;
+                t_A[k] = lBase[k] & rBase[k];
+                o_A[k] = lBase[k] | rBase[k];
                 t_N   |= t_A[k];
             }
 
             t_N = ~t_N;
 
             for (size_t k = 0; k < states; k++)
-                base[(width * states * pNumber) + width * k + i] = t_A[k] | (t_N & o_A[k]);
+                pBase[k] = t_A[k] | (t_N & o_A[k]);
 
             bits = (unsigned int)__popc(t_N);
         }
 
-        // Warp reduce: add bits of 32 lanes into lane 0
-        // → lane 0 atomicAdd 1 instead of 32
         unsigned int warpSum = warpReduceSum(bits);
         if (laneId == 0 && warpSum > 0)
             atomicAdd(&d_nodeScores[pNumber], warpSum);
@@ -83,70 +88,40 @@ __global__ void newviewParsimonyKernel(
 }
 
 
-// __global__ void newviewParsimonyKernel(
-//     parsimonyNumber* d_parsVect,                 
-//     unsigned int* d_nodeScores,                  
-//     const int* __restrict__ d_ti,                
-//     int tiCount,                                 
-//     const size_t* __restrict__ d_widths,         
-//     const size_t* __restrict__ d_states,         
-//     const size_t* __restrict__ d_parsVectOffset, 
-//     int numPartitions
-// )
-// {
-//     int model = blockIdx.y;
-//     int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-//     size_t width = d_widths[model];
-//     size_t states = d_states[model];
-
-//     if (i >= (int)width)
-//     {
-//         return;
-//     }
-
-//     parsimonyNumber* base = d_parsVect + d_parsVectOffset[model];
-
-//     // CPU postorder but this thread only process site i
-//     for (int index = 4; index < tiCount; index += 4)
-//     {
-//         size_t pNumber = (size_t)d_ti[index];
-//         size_t qNumber = (size_t)d_ti[index + 1];
-//         size_t rNumber = (size_t)d_ti[index + 2];
-
-//         parsimonyNumber t_N = 0;
-//         parsimonyNumber t_A[MAX_STATES], o_A[MAX_STATES];
-
-//         for (size_t k = 0; k < states; k++)
-//         {
-//             parsimonyNumber lv = base[(width * states * qNumber) + width * k + i];
-//             parsimonyNumber rv = base[(width * states * rNumber) + width * k + i];
-//             t_A[k] = lv & rv;
-//             o_A[k] = lv | rv;
-//             t_N |= t_A[k];
-//         }
-
-//         t_N = ~t_N;
-
-//         for (size_t k = 0; k < states; k++)
-//         {
-//             base[(width * states * pNumber) + width * k + i] = t_A[k] | (t_N & o_A[k]);
-//         }
-
-//         // Cộng popcount vào score của node p
-//         // atomicAdd vì nhiều thread (các site khác nhau) cùng ghi vào d_nodeScores[p]
-//         unsigned int bits = (unsigned int)__popc(t_N);
-//         if (bits > 0)
-//         {
-//             atomicAdd(&d_nodeScores[pNumber], bits);
-//         }
-//     }
-// }
+// =============================================================================
+// reorderParsVect
+// Change layout host [node][state][site] → layout GPU [node][site][state]
+// host: parsVect[width*states*node + width*k + i]
+// gpu:  parsVect[states*(width*node + i) + k]
+// =============================================================================
+static void reorderParsVect(
+    const parsimonyNumber* src,  // layout host: [node][state][site]
+    parsimonyNumber* dst,        // layout GPU:  [node][site][state]
+    size_t numNodes,
+    size_t width,
+    size_t states
+)
+{
+    for (size_t node = 0; node < numNodes; node++)
+    {
+        for (size_t i = 0; i < width; i++)
+        {
+            for (size_t k = 0; k < states; k++)
+            {
+                // src index: [node][state k][site i]
+                size_t srcIdx = width * states * node + width * k + i;
+                // dst index: [node][site i][state k]
+                size_t dstIdx = states * (width * node + i) + k;
+                dst[dstIdx] = src[srcIdx];
+            }
+        }
+    }
+}
 
 struct NewviewGpuBuffers
 {
     parsimonyNumber* d_parsVect = nullptr;
-    unsigned int* d_nodeScores = nullptr;  // score per node (accum)
+    unsigned int* d_nodeScores = nullptr;
     int* d_ti = nullptr;
     size_t* d_widths = nullptr;
     size_t* d_states = nullptr;
@@ -256,17 +231,28 @@ void newviewParsimonyGpu(
     // if (!d_buf.parsVectUploaded || d_buf.parsVectUploaded)
     if (!d_buf.parsVectUploaded)
     {
+        std::vector<parsimonyNumber> h_reordered(d_buf.parsVectBytes / sizeof(parsimonyNumber));
+
         size_t offset = 0;
         for (int m = 0; m < numPartitions; m++)
         {
-            size_t elems = pr->partitionData[m]->parsimonyLength * pr->partitionData[m]->states
-                           * nodesInTree;
-            cudaMemcpyAsync(
-                (char*)d_buf.d_parsVect + offset, pr->partitionData[m]->parsVect,
-                elems * sizeof(parsimonyNumber), cudaMemcpyHostToDevice, d_buf.stream
+            size_t width = pr->partitionData[m]->parsimonyLength;
+            size_t states = pr->partitionData[m]->states;
+            size_t elems = width * states * nodesInTree;
+
+            reorderParsVect(
+                pr->partitionData[m]->parsVect,  // src: layout host
+                h_reordered.data() + offset,     // dst: layout GPU
+                nodesInTree, width, states
             );
-            offset += elems * sizeof(parsimonyNumber);
+            offset += elems;
         }
+
+        cudaMemcpyAsync(
+            d_buf.d_parsVect, h_reordered.data(), d_buf.parsVectBytes, cudaMemcpyHostToDevice,
+            d_buf.stream
+        );
+
         d_buf.parsVectUploaded = true;
     }
 
