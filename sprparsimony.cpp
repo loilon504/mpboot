@@ -7,6 +7,8 @@
 #include "sprparsimony.h"
 #include "parstree.h"
 #include <string>
+#include "gpu/include/profiler.hpp"
+#include "gpu/include/sprparsimony.hpp"
 /**
  * PLL (version 1.0.0) a software library for phylogenetic inference
  * Copyright (C) 2013 Tomas Flouri and Alexandros Stamatakis
@@ -553,6 +555,7 @@ void newviewSankoffParsimonyIterativeFastSIMD(pllInstance *tr, partitionList * p
 
 static void newviewParsimonyIterativeFast(pllInstance *tr, partitionList *pr, int perSiteScores)
 {
+  PROFILE_SCOPE("newviewParsimony");
 	if(pllCostMatrix) {
 //        newviewSankoffParsimonyIterativeFast(tr, pr, perSiteScores);
 //        return;
@@ -2840,7 +2843,8 @@ static void compressDNA(pllInstance *tr, partitionList *pr, int *informative, in
     i,
     model;
 
-  totalNodes = 2 * (size_t)tr->mxtips;
+  // totalNodes = 2 * (size_t)tr->mxtips;
+  totalNodes = 2 * (size_t)tr->mxtips + 1;
 
 
 
@@ -2991,12 +2995,21 @@ static void stepwiseAddition(pllInstance *tr, partitionList *pr, nodeptr p, node
   p->next->next->back = r;
   r->back = p->next->next;
 
-  computeTraversalInfoParsimony(p, tr->ti, &counter, tr->mxtips, PLL_FALSE, PLL_FALSE);
-  tr->ti[0] = counter;
-  tr->ti[1] = p->number;
-  tr->ti[2] = p->back->number;
+  // computeTraversalInfoParsimony(p, tr->ti, &counter, tr->mxtips, PLL_FALSE, PLL_FALSE);
+  // tr->ti[0] = counter;
+  // tr->ti[1] = p->number;
+  // tr->ti[2] = p->back->number;
 
   mp = evaluateParsimonyIterativeFast(tr, pr, PLL_FALSE);
+  {
+    size_t nNodes = 0;
+    auto levels = mpbootgpu::computeTraversalInfoBFS(p, tr->mxtips, PLL_FALSE, nNodes);
+    levels.resize(levels.size() + 1);
+    levels.back().push_back({tr->mxtips * 2, p->number, p->back->number});
+    nNodes++;
+    mpbootgpu::newviewParsimonyGpu(tr, pr, levels, nNodes);
+    mp = tr->parsimonyScore[tr->mxtips * 2];
+  }
 
   if(mp < tr->bestParsimony) bestTreeScoreHits = 1;
   else if(mp == tr->bestParsimony) bestTreeScoreHits++;
@@ -3133,6 +3146,7 @@ static void _pllMakeParsimonyTreeFast(pllInstance *tr, partitionList *pr, int sp
 
   bestTreeScoreHits = 1;
 
+  int maxNumNodes = 0;
   while(tr->ntips < tr->mxtips)
     {
       nodeptr q;
@@ -3164,12 +3178,22 @@ static void _pllMakeParsimonyTreeFast(pllInstance *tr, partitionList *pr, int sp
         hookupDefault(q->next,       tr->insertNode);
         hookupDefault(q->next->next, r);
 
-        computeTraversalInfoParsimony(q, tr->ti, &counter, tr->mxtips, PLL_FALSE, 0);
-        tr->ti[0] = counter;
+        // computeTraversalInfoParsimony(q, tr->ti, &counter, tr->mxtips, PLL_FALSE, 0);
+        // tr->ti[0] = counter;
+        // maxNumNodes = max(maxNumNodes, (counter - 4) / 4);
 
-        newviewParsimonyIterativeFast(tr, pr, 0);
+        // newviewParsimonyIterativeFast(tr, pr, 0);
+
+        {
+          // mpbootgpu::InlineProfilerTimer p("newviewParsimonyGpu");
+          size_t nNodes = 0;
+          auto levels = mpbootgpu::computeTraversalInfoBFS(q, tr->mxtips, PLL_FALSE, nNodes);
+          mpbootgpu::newviewParsimonyGpu(tr, pr, levels, nNodes);
+        }
+
       }
     }
+  // cout << "LOG INFO, maxNumNodes = " << maxNumNodes  << '\n';
 
   nodeRectifierPars(tr);
 //  cout << "DONE stepwise addition" << endl;
@@ -3242,6 +3266,7 @@ void _pllComputeRandomizedStepwiseAdditionParsimonyTree(pllInstance * tr, partit
  * @return best parsimony score found
  */
 int pllOptimizeSprParsimony(pllInstance * tr, partitionList * pr, int mintrav, int maxtrav, IQTree *_iqtree){
+  PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/doNNISearch/pllOptimizeSprParsimony");
 	int perSiteScores = globalParam->gbo_replicates > 0;
 
 	iqtree = _iqtree; // update pointer to IQTree

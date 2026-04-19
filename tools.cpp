@@ -825,6 +825,8 @@ void parseArg(int argc, char *argv[], Params &params) {
     params.write_init_tree = false;
     params.write_local_optimal_trees = false;
 
+	params.use_gpu = false;
+
 	if (params.nni5) {
 	    params.nni_type = NNI5;
 	} else {
@@ -2694,6 +2696,10 @@ void parseArg(int argc, char *argv[], Params &params) {
 				if (cnt >= argc)
 					throw "Use -sprdist <SPR distance used in parsimony search>";
 				params.sprDist = convert_int(argv[cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-use_gpu") == 0) {
+				params.use_gpu = true;
 				continue;
 			}
 			if (argv[cnt][0] == '-') {

@@ -54,6 +54,9 @@
 #include "tinatree.h"
 #include "sprparsimony.h"
 #include <algorithm>
+#include "gpu/include/test.cuh"
+#include "gpu/include/profiler.hpp"
+#include "gpu/include/sprparsimony.hpp"
 
 void reportReferences(Params &params, ofstream &out, string &original_model) {
 	out << "To cite IQ-TREE please use:" << endl << endl
@@ -1270,6 +1273,66 @@ int initCandidateTreeSet(Params &params, IQTree &iqtree, int numInitTrees) {
     double startTime = getCPUTime();
     int numDupPars = 0;
 //    if(params.maximum_parsimony) iqtree.candidateTrees.clear(); // Diep: added this to fix the bug of sorted aln <> orig aln
+#ifdef _OPENMP
+	omp_set_dynamic(0);
+    omp_set_max_active_levels(1);
+    omp_set_num_threads(params.num_threads);
+	cout << "\nUse OpenMP in initCandidateTreeSet, " << params.num_threads << " threads\n";
+	vector<string> candidateTrees(numInitTrees);
+#pragma omp for schedule(static)
+	for (int treeNr = 1; treeNr < numInitTrees; treeNr++) {
+        if (params.start_tree == STT_PLL_PARSIMONY) {
+			pllInstance* localInst = iqtree.pllInst;
+			// iqtree.pllInst->randomNumberSeed = params.ran_seed + treeNr * 12345;
+			localInst->randomNumberSeed = params.ran_seed + treeNr * 12345;
+			// uint32_t seed = params.ran_seed + treeNr * 12345;
+
+
+			if(params.maximum_parsimony){
+				_pllComputeRandomizedStepwiseAdditionParsimonyTree(localInst, iqtree.pllPartitions, params.sprDist, &iqtree);
+			}
+			else
+				pllComputeRandomizedStepwiseAdditionParsimonyTree(iqtree.pllInst, iqtree.pllPartitions, params.sprDist);
+
+	        pllTreeToNewick(localInst->tree_string, localInst, iqtree.pllPartitions,
+					localInst->start->back, PLL_TRUE, PLL_TRUE, PLL_FALSE, PLL_FALSE, PLL_FALSE,
+					PLL_SUMMARIZE_LH, PLL_FALSE, PLL_FALSE);
+			candidateTrees[treeNr] = string(localInst->tree_string);
+        }
+	}
+
+	for (int i = 1; i < numInitTrees; ++i)
+	{
+        if (iqtree.candidateTrees.treeExist(candidateTrees[i])) {
+            numDupPars++;
+            continue;
+        } else {
+        	if (params.start_tree == STT_PLL_PARSIMONY)
+        		iqtree.readTreeString(candidateTrees[i]);
+            if (params.count_trees) {
+                string tree = iqtree.getTopology();
+                if (pllTreeCounter.find(tree) == pllTreeCounter.end()) {
+                    // not found in hash_map
+                    pllTreeCounter[candidateTrees[i]] = 1;
+                } else {
+                    // found in hash_map
+                    pllTreeCounter[candidateTrees[i]]++;
+                }
+        	}
+            // Diep added IF statement for MP doesn't need branch optimization
+            if(params.maximum_parsimony){
+        		iqtree.initializeAllPartialPars();
+        		iqtree.clearAllPartialLH();
+        		iqtree.curScore = -iqtree.computeParsimony();
+        		iqtree.candidateTrees.update(candidateTrees[i], iqtree.curScore);
+                if (iqtree.curScore > iqtree.bestScore) {
+                    iqtree.setBestTree(candidateTrees[i], iqtree.curScore);
+                }
+            }else
+            	iqtree.candidateTrees.update(candidateTrees[i], -DBL_MAX);
+        }
+    }
+#else
     for (int treeNr = 1; treeNr < numInitTrees; treeNr++) {
         string curParsTree;
         if (params.start_tree == STT_PLL_PARSIMONY) {
@@ -1318,6 +1381,7 @@ int initCandidateTreeSet(Params &params, IQTree &iqtree, int numInitTrees) {
             	iqtree.candidateTrees.update(curParsTree, -DBL_MAX);
         }
     }
+#endif
     double parsTime = getCPUTime() - startTime;
     cout << "(" << numDupPars << " duplicated parsimony trees)" << endl;
     cout << "CPU time: " << parsTime << endl;
@@ -1686,12 +1750,18 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 
     /***************** Initialization for PLL and sNNI ******************/
     if (params.start_tree == STT_PLL_PARSIMONY || params.pll) {
+		PROFILE_SCOPE("runTreeReconstruction/initializePLL");
 		cout << "--REACH 1687 phyloanalysis.cpp: initialize PLL_IQtree\n";
         /* Initialized all data structure for PLL*/
 //        cout << "WHAT'S GOING ON HERE?" << endl;
 //        verbose_mode = VB_MAX;
     	iqtree.initializePLL(params);
     }
+
+	/********************* Init constant data for PLL in Gpu *******************/
+	if (params.use_gpu) {
+		mpbootgpu::parsimonyGpuInit(iqtree.pllInst, iqtree.pllPartitions);
+	}
 
 
     /********************* Compute pairwise distances *******************/
@@ -1702,7 +1772,10 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
     /********************** CREATE INITIAL TREE(S) **********************/
     int numInitTrees;
     string initTree;
-    computeInitialTree(params, iqtree, dist_file, numInitTrees, initTree);
+	{
+		PROFILE_SCOPE("runTreeReconstruction/computeInitialTree");
+	    computeInitialTree(params, iqtree, dist_file, numInitTrees, initTree);
+	}
 
     /*************** SET UP PARAMETERS and model testing ****************/
 
@@ -1767,6 +1840,7 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 		cout << "--REACH 1769 phyloanalysis.cpp: min_iterations = " << params.min_iterations << '\n';
 
         if (!params.user_file && (params.start_tree == STT_PARSIMONY || params.start_tree == STT_PLL_PARSIMONY)) {
+			PROFILE_SCOPE("runTreeReconstruction/initCandidateTreeSet");
         	int numDup = initCandidateTreeSet(params, iqtree, numInitTrees);
         	assert(iqtree.candidateTrees.size() != 0);
         	cout << "Finish initializing candidate tree set. ";
@@ -1829,6 +1903,8 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 
 	/****************** Do tree search ***************************/
 	if (params.min_iterations > 1) {
+		PROFILE_SCOPE("runTreeReconstruction/doTreeSearch");
+		cout << "--REACH 1839 phyloanalysis.cpp, min_iterations = " << params.min_iterations << '\n';
 		iqtree.readTreeString(iqtree.bestTreeString);
 		iqtree.doTreeSearch();
 		iqtree.setAlignment(iqtree.aln);
@@ -2246,6 +2322,7 @@ void runPhyloAnalysis(Params &params) {
         // Diep: Relocate the call to optimizeAlignment HERE 
         // to not interfere with other utilities (such as standard bootstrap)
         if(params.maximum_parsimony){
+			PROFILE_SCOPE("optimizeAlignment");
             optimizeAlignment(tree, params);// Diep: this is to rearrange columns for better speed in REPS
         }
                     
@@ -2261,7 +2338,10 @@ void runPhyloAnalysis(Params &params) {
 			tree->removedTaxons = removed_seqs;
 		}
 		// call main tree reconstruction
-		runTreeReconstruction(params, original_model, *tree, model_info);
+		{
+			PROFILE_SCOPE("runTreeReconstruction");
+			runTreeReconstruction(params, original_model, *tree, model_info);
+		}
 		if (params.gbo_replicates && params.online_bootstrap) {
 			if (params.print_ufboot_trees)
 				tree->writeUFBootTrees(params, removed_seqs, twin_seqs);
@@ -2332,6 +2412,7 @@ void runPhyloAnalysis(Params &params) {
 
     delete tree->aln;
 	delete tree;
+	mpbootgpu::Profiler::instance().report();
 }
 
 void printSiteParsimonyUserTree(Params &params) {

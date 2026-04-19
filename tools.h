@@ -1677,6 +1677,11 @@ struct Params {
 
     /** TRUE to write initial tree to a file (default: false) */
     bool write_init_tree;
+
+    /*
+     * Loi: To use gpu
+     */
+    bool use_gpu;
 };
 
 /**

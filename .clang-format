@@ -1,0 +1,47 @@
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 100
+TabWidth: 4
+UseTab: Never
+
+BreakBeforeBraces: Allman
+
+AlignOperands: Align
+
+AllowAllArgumentsOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: true
+AlignAfterOpenBracket: BlockIndent
+
+AllowShortBlocksOnASingleLine: false
+AllowShortCaseExpressionOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortCompoundRequirementOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLambdasOnASingleLine: None
+AllowShortLoopsOnASingleLine: false
+AllowShortNamespacesOnASingleLine: false
+BinPackArguments: true
+BinPackParameters: false
+BreakBeforeBinaryOperators: NonAssignment
+BreakConstructorInitializers: BeforeColon
+BreakFunctionDefinitionParameters: true
+BreakTemplateDeclarations: Yes
+IncludeBlocks: Regroup
+InsertBraces: true
+
+KeepEmptyLines:
+  AtEndOfFile: false
+  AtStartOfBlock: false
+  AtStartOfFile: false
+
+LambdaBodyIndentation: Signature
+
+NamespaceIndentation: None
+
+PenaltyBreakAssignment: 1000
+PenaltyBreakBeforeFirstCallParameter: 0
+
+SortIncludes: true
+Standard: c++14

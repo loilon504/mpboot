@@ -31,6 +31,7 @@
 #include "vectorclass/vectorclass.h"
 #include "vectorclass/vectormath_common.h"
 #include "parstree.h"
+#include "gpu/include/profiler.hpp"
 
 Params *globalParam;
 Alignment *globalAlignment;
@@ -1694,6 +1695,8 @@ double IQTree::doTreeSearch() {
 //		long tmp_num_ratchet_bootcands = treels.size();
         if(params->ratchet_iter >= 0){
         	if(params->ratchet_iter == ratchet_iter_count){
+                PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/PerturbAlignment");
+                // cout << "Iteration " << curIt << ", perturb alignment\n";
 //				string candidateTree = candidateTrees.getRandCandVecTree(); // Diep: to pick from vector-stored candidates
 				string candidateTree = candidateTrees.getRandCandTree();
 				readTreeString(candidateTree);
@@ -1723,6 +1726,8 @@ double IQTree::doTreeSearch() {
     	 *---------------------------------------*/
 		double perturbScore;
 		if(!on_ratchet_hclimb1){
+            PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/PerturbTree");
+            // cout << "Iteration " << curIt << ", perturb tree\n";
             // cout << "REACH " << 1725 << " iqtree.cpp: what is this\n";
 			if (iqp_assess_quartet == IQP_BOOTSTRAP) {
 				// create bootstrap sample
@@ -1766,6 +1771,7 @@ double IQTree::doTreeSearch() {
 				}
 
 				if(params->maximum_parsimony && params->spr_parsimony && (params->snni || params->pll)){ // SPR for mpars
+                    // cout << "   Just computeParsimony\n";
 //					pllNewickTree *perturbTree = pllNewickParseString(perturb_tree_string.c_str());
 //					assert(perturbTree != NULL);
 //					pllTreeInitTopologyNewick(pllInst, perturbTree, PLL_FALSE);
@@ -1774,6 +1780,7 @@ double IQTree::doTreeSearch() {
 					curScore = perturbScore = -computeParsimony();
 //                    pllNewickParseDestroy(&perturbTree);
 				}else if (params->pll) {
+                    // cout << "   pll\n";
 					pllNewickTree *perturbTree = pllNewickParseString(perturb_tree_string.c_str());
 					assert(perturbTree != NULL);
 					pllTreeInitTopologyNewick(pllInst, perturbTree, PLL_FALSE);
@@ -1785,6 +1792,7 @@ double IQTree::doTreeSearch() {
 					curScore = pllInst->likelihood;
 					perturbScore = curScore;
 				} else {
+                    // cout << "   optimizeAllBranches\n";
 					initializeAllPartialLh();
 					clearAllPartialLH();
 					if (isSuperTree()) {
@@ -1801,7 +1809,10 @@ double IQTree::doTreeSearch() {
         int nni_count = 0;
         int nni_steps = 0;
 
-		imd_tree = doNNISearch(nni_count, nni_steps);
+        {
+            PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/doNNISearch");
+		    imd_tree = doNNISearch(nni_count, nni_steps);
+        }
 
         if (iqp_assess_quartet == IQP_BOOTSTRAP) {
             // restore alignment
@@ -1819,6 +1830,8 @@ double IQTree::doTreeSearch() {
          * PARSIMONY RATCHET-LIKE IDEA
          * -------------------------------------------------------------------------*/
         if(on_ratchet_hclimb1){
+            PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/on_ratchet_hclimb1");
+            // cout << "Iteration " << curIt << ", on_ratchet_hclimb1 = true\n";
 			ratchet_iter_count = 0;
 
 			// restore alignment
@@ -2110,7 +2123,7 @@ string IQTree::doNNISearch(int& nniCount, int& nniSteps) {
 			curScore = optimizeNNI(nniCount, nniSteps);
 			treeString = getTreeString();
 		}else{
-            cout << "--REACH 2112, else\n";
+            // cout << "--REACH 2112, else\n";
 			string treeString1 = getTreeString();
 			size_t index = 0;
 			while (true) {
