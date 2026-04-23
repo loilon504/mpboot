@@ -1912,9 +1912,17 @@ static unsigned int evaluateParsimony(pllInstance *tr, partitionList *pr, nodept
 			computeTraversalInfoParsimony(q, ti, &counter, tr->mxtips, full, perSiteScores);
 	}
 
-	ti[0] = counter;
+	// ti[0] = counter;
 
-	result = evaluateParsimonyIterativeFast(tr, pr, perSiteScores);
+	// result = evaluateParsimonyIterativeFast(tr, pr, perSiteScores);
+  {
+    tr->ti[counter] = tr->mxtips * 2;
+    tr->ti[counter + 1] = p->number;
+    tr->ti[counter + 2] = q->number;
+    counter += 4;
+    tr->ti[0] = counter;
+    result = mpbootgpu::newviewParsimonyGpu(tr, pr);
+  }
 
 	return result;
 }
@@ -1932,7 +1940,8 @@ static void newviewParsimony(pllInstance *tr, partitionList *pr, nodeptr  p, int
     computeTraversalInfoParsimony(p, tr->ti, &counter, tr->mxtips, PLL_FALSE, perSiteScores);
     tr->ti[0] = counter;
 
-    newviewParsimonyIterativeFast(tr, pr, perSiteScores);
+    // newviewParsimonyIterativeFast(tr, pr, perSiteScores);
+    mpbootgpu::newviewParsimonyGpu(tr, pr);
   }
 }
 
@@ -2204,7 +2213,8 @@ static void restoreTreeParsimony(pllInstance *tr, partitionList *pr, nodeptr p, 
   computeTraversalInfoParsimony(p, tr->ti, &counter, tr->mxtips, PLL_FALSE, perSiteScores);
   tr->ti[0] = counter;
 
-  newviewParsimonyIterativeFast(tr, pr, perSiteScores);
+  // newviewParsimonyIterativeFast(tr, pr, perSiteScores);
+  mpbootgpu::newviewParsimonyGpu(tr, pr);
 }
 
 
@@ -3008,8 +3018,7 @@ static void stepwiseAddition(pllInstance *tr, partitionList *pr, nodeptr p, node
     tr->ti[counter + 2] = p->back->number;
     counter += 4;
     tr->ti[0] = counter;
-    mpbootgpu::newviewParsimonyGpu(tr, pr);
-    mp = tr->parsimonyScore[tr->mxtips * 2];
+    mp = mpbootgpu::newviewParsimonyGpu(tr, pr);
   }
 
   if(mp < tr->bestParsimony) bestTreeScoreHits = 1;
@@ -3181,7 +3190,6 @@ static void _pllMakeParsimonyTreeFast(pllInstance *tr, partitionList *pr, int sp
 
         // computeTraversalInfoParsimony(q, tr->ti, &counter, tr->mxtips, PLL_FALSE, 0);
         // tr->ti[0] = counter;
-        // maxNumNodes = max(maxNumNodes, (counter - 4) / 4);
 
         // newviewParsimonyIterativeFast(tr, pr, 0);
 
@@ -3194,7 +3202,6 @@ static void _pllMakeParsimonyTreeFast(pllInstance *tr, partitionList *pr, int sp
 
       }
     }
-  // cout << "LOG INFO, maxNumNodes = " << maxNumNodes  << '\n';
 
   nodeRectifierPars(tr);
 //  cout << "DONE stepwise addition" << endl;
@@ -3276,8 +3283,12 @@ int pllOptimizeSprParsimony(pllInstance * tr, partitionList * pr, int mintrav, i
 		// oct 23: in non-ratchet iteration, allocate is not triggered
 		_updateInternalPllOnRatchet(tr, pr);
 		_allocateParsimonyDataStructures(tr, pr, perSiteScores);
+    mpbootgpu::resetParsVect();
 	}else if(first_call || (iqtree && iqtree->on_opt_btree))
+  {
 		_allocateParsimonyDataStructures(tr, pr, perSiteScores); // called once if not running ratchet
+    mpbootgpu::resetParsVect();
+  }
 
 	if(first_call){
 		first_call = false;

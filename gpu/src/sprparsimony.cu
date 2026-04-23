@@ -28,20 +28,20 @@ __device__ __forceinline__ unsigned int warpReduceSum(
 // Layout GPU: [node][site][state]  →  base[states*(width*node + i) + k]
 // layout CPU: [node][state][site] = base[width*states*node + width*k + i])
 __global__ void newviewParsimonyKernel(
-    parsimonyNumber*            d_parsVect,       
-    unsigned int*               d_nodeScores,     
-    const int*  __restrict__    d_ti,             
-    int                         tiCount,          
-    const size_t* __restrict__  d_widths,         
-    const size_t* __restrict__  d_states,         
-    const size_t* __restrict__  d_parsVectOffset, 
-    int                         numPartitions
+    parsimonyNumber* d_parsVect,
+    unsigned int* d_parsimonyScore,
+    const int* __restrict__ d_ti,
+    int tiCount,
+    const size_t* __restrict__ d_widths,
+    const size_t* __restrict__ d_states,
+    const size_t* __restrict__ d_parsVectOffset,
+    int numPartitions
 )
 {
     int model = blockIdx.y;
-    int i     = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-    size_t width  = d_widths[model];
+    size_t width = d_widths[model];
     size_t states = d_states[model];
 
     bool active = (i < (int)width);
@@ -49,6 +49,14 @@ __global__ void newviewParsimonyKernel(
     parsimonyNumber* base = d_parsVect + d_parsVectOffset[model];
 
     int laneId = threadIdx.x & 31;
+
+    if (i == 0 && model == 0)
+    {
+        for (int index = 4; index < tiCount; index += 4)
+        {
+            d_parsimonyScore[(size_t)d_ti[index]] = 0;
+        }
+    }
 
     for (int index = 4; index < tiCount; index += 4)
     {
@@ -67,26 +75,49 @@ __global__ void newviewParsimonyKernel(
             parsimonyNumber t_N = 0;
             parsimonyNumber t_A[MAX_STATES], o_A[MAX_STATES];
 
-            for (size_t k = 0; k < states; k++) {
+            for (size_t k = 0; k < states; k++)
+            {
                 t_A[k] = lBase[k] & rBase[k];
                 o_A[k] = lBase[k] | rBase[k];
-                t_N   |= t_A[k];
+                t_N |= t_A[k];
             }
 
             t_N = ~t_N;
 
             for (size_t k = 0; k < states; k++)
+            {
                 pBase[k] = t_A[k] | (t_N & o_A[k]);
+            }
 
             bits = (unsigned int)__popc(t_N);
         }
 
         unsigned int warpSum = warpReduceSum(bits);
         if (laneId == 0 && warpSum > 0)
-            atomicAdd(&d_nodeScores[pNumber], warpSum);
+        {
+            atomicAdd(&d_parsimonyScore[pNumber], warpSum);
+        }
     }
 }
 
+// Kernel that compute parsimonyScore[] to prevent download
+__global__ void accumulateParsimonyScoreKernel(
+    unsigned int* d_parsimonyScore, const int* __restrict__ d_ti, int tiCount
+)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0)
+    {
+        return;
+    }
+
+    for (int index = 4; index < tiCount; index += 4)
+    {
+        size_t p = (size_t)d_ti[index];
+        size_t q = (size_t)d_ti[index + 1];
+        size_t r = (size_t)d_ti[index + 2];
+        d_parsimonyScore[p] += d_parsimonyScore[q] + d_parsimonyScore[r];
+    }
+}
 
 // =============================================================================
 // reorderParsVect
@@ -121,7 +152,7 @@ static void reorderParsVect(
 struct NewviewGpuBuffers
 {
     parsimonyNumber* d_parsVect = nullptr;
-    unsigned int* d_nodeScores = nullptr;
+    unsigned int* d_parsimonyScore = nullptr;
     int* d_ti = nullptr;
     size_t* d_widths = nullptr;
     size_t* d_states = nullptr;
@@ -147,9 +178,9 @@ void newviewGpuCleanup()
     {
         cudaFree(d_buf.d_parsVect);
     }
-    if (d_buf.d_nodeScores)
+    if (d_buf.d_parsimonyScore)
     {
-        cudaFree(d_buf.d_nodeScores);
+        cudaFree(d_buf.d_parsimonyScore);
     }
     if (d_buf.d_ti)
     {
@@ -194,32 +225,79 @@ void newviewGpuInit(
     size_t partitionBytes = numPartitions * sizeof(size_t);
     size_t nodeScoresBytes = nodesInTree * sizeof(unsigned int);
 
-    cudaMalloc(&d_buf.d_parsVect, parsVectBytes);
-    cudaMalloc(&d_buf.d_nodeScores, nodeScoresBytes);
-    cudaMalloc(&d_buf.d_widths, partitionBytes);
-    cudaMalloc(&d_buf.d_states, partitionBytes);
-    cudaMalloc(&d_buf.d_parsVectOffset, partitionBytes);
+    auto toMB = [](size_t bytes)
+    {
+        return (double)bytes / (1024.0 * 1024.0);
+    };
 
-    cudaStreamCreate(&d_buf.stream);
+    size_t totalGpuBytes = parsVectBytes + nodeScoresBytes
+                           + partitionBytes * 3;  // d_widths + d_states + d_parsVectOffset
 
-    cudaMemcpyAsync(
+    printf("\n==== GPU Memory Usage (newviewGpuInit) ====\n");
+    printf("  nodesInTree    : %zu\n", nodesInTree);
+    printf("  numPartitions  : %d\n", numPartitions);
+    printf("  d_parsVect     : %.2f MB  (%zu bytes)\n", toMB(parsVectBytes), parsVectBytes);
+    printf("  d_parsimonyScore: %.2f MB (%zu bytes)\n", toMB(nodeScoresBytes), nodeScoresBytes);
+    printf("  d_widths       : %.2f MB  (%zu bytes)\n", toMB(partitionBytes), partitionBytes);
+    printf("  d_states       : %.2f MB  (%zu bytes)\n", toMB(partitionBytes), partitionBytes);
+    printf("  d_parsVectOffset: %.2f MB (%zu bytes)\n", toMB(partitionBytes), partitionBytes);
+    printf("  ─────────────────────────────────────────\n");
+    printf("  Total (excl d_ti): %.2f MB  (%zu bytes)\n", toMB(totalGpuBytes), totalGpuBytes);
+    printf("===========================================\n\n");
+
+    CUDA_CHECK(cudaSetDevice(1));
+    CUDA_CHECK(cudaMalloc(&d_buf.d_parsVect, parsVectBytes));
+    CUDA_CHECK(cudaMalloc(&d_buf.d_parsimonyScore, nodeScoresBytes));
+    CUDA_CHECK(cudaMalloc(&d_buf.d_widths, partitionBytes));
+    CUDA_CHECK(cudaMalloc(&d_buf.d_states, partitionBytes));
+    CUDA_CHECK(cudaMalloc(&d_buf.d_parsVectOffset, partitionBytes));
+
+    CUDA_CHECK(cudaStreamCreate(&d_buf.stream));
+
+    CUDA_CHECK(cudaMemcpyAsync(
         d_buf.d_widths, h_widths.data(), partitionBytes, cudaMemcpyHostToDevice, d_buf.stream
-    );
-    cudaMemcpyAsync(
+    ));
+    CUDA_CHECK(cudaMemcpyAsync(
         d_buf.d_states, h_states.data(), partitionBytes, cudaMemcpyHostToDevice, d_buf.stream
-    );
-    cudaMemcpyAsync(
+    ));
+    CUDA_CHECK(cudaMemcpyAsync(
         d_buf.d_parsVectOffset, h_parsVectOffset.data(), partitionBytes, cudaMemcpyHostToDevice,
         d_buf.stream
-    );
-    // cudaStreamSynchronize(d_buf.stream);
+    ));
 
     d_buf.numPartitions = numPartitions;
     d_buf.parsVectBytes = parsVectBytes;
     d_buf.nodeScoresBytes = nodeScoresBytes;
 }
 
-void newviewParsimonyGpu(
+void uploadParsvect(
+    pllInstance* tr, partitionList* pr
+)
+{
+    int numPartitions = d_buf.numPartitions;
+    size_t nodesInTree = (size_t)(2 * tr->mxtips + 1);
+
+    std::vector<parsimonyNumber> h_reordered(d_buf.parsVectBytes / sizeof(parsimonyNumber));
+
+    size_t offset = 0;
+    for (int m = 0; m < numPartitions; m++)
+    {
+        size_t width = pr->partitionData[m]->parsimonyLength;
+        size_t states = pr->partitionData[m]->states;
+        size_t elems = width * states * nodesInTree;
+        reorderParsVect(
+            pr->partitionData[m]->parsVect, h_reordered.data() + offset, nodesInTree, width, states
+        );
+        offset += elems;
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        d_buf.d_parsVect, h_reordered.data(), d_buf.parsVectBytes, cudaMemcpyHostToDevice,
+        d_buf.stream
+    ));
+}
+
+parsimonyNumber newviewParsimonyGpu(
     pllInstance* tr, partitionList* pr
 )
 {
@@ -227,99 +305,70 @@ void newviewParsimonyGpu(
     size_t nodesInTree = (size_t)(2 * tr->mxtips + 1);
     int tiCount = tr->ti[0];
 
-    // Upload parsVect only once
-    // if (!d_buf.parsVectUploaded || d_buf.parsVectUploaded)
+    // Lazy upload parsVect
+    // if (true)
     if (!d_buf.parsVectUploaded)
     {
-        std::vector<parsimonyNumber> h_reordered(d_buf.parsVectBytes / sizeof(parsimonyNumber));
-
-        size_t offset = 0;
-        for (int m = 0; m < numPartitions; m++)
-        {
-            size_t width = pr->partitionData[m]->parsimonyLength;
-            size_t states = pr->partitionData[m]->states;
-            size_t elems = width * states * nodesInTree;
-
-            reorderParsVect(
-                pr->partitionData[m]->parsVect,  // src: layout host
-                h_reordered.data() + offset,     // dst: layout GPU
-                nodesInTree, width, states
-            );
-            offset += elems;
-        }
-
-        cudaMemcpyAsync(
-            d_buf.d_parsVect, h_reordered.data(), d_buf.parsVectBytes, cudaMemcpyHostToDevice,
-            d_buf.stream
-        );
-
+        uploadParsvect(tr, pr);
         d_buf.parsVectUploaded = true;
     }
 
-    // Upload ti[] (postorder traversal)
+    // Upload ti[]
     size_t tiBytes = tiCount * sizeof(int);
     if (d_buf.tiBytes < tiBytes)
     {
         if (d_buf.d_ti)
         {
-            cudaFree(d_buf.d_ti);
+            CUDA_CHECK(cudaFree(d_buf.d_ti));
         }
-        cudaMalloc(&d_buf.d_ti, tiBytes);
+        CUDA_CHECK(cudaMalloc(&d_buf.d_ti, tiBytes));
         d_buf.tiBytes = tiBytes;
     }
-    cudaMemcpyAsync(d_buf.d_ti, tr->ti, tiBytes, cudaMemcpyHostToDevice, d_buf.stream);
+    CUDA_CHECK(cudaMemcpyAsync(d_buf.d_ti, tr->ti, tiBytes, cudaMemcpyHostToDevice, d_buf.stream));
 
-    // Reset nodeScores
-    cudaMemsetAsync(d_buf.d_nodeScores, 0, d_buf.nodeScoresBytes, d_buf.stream);
-
-    // ------------------------------------------------------------------
-    // Launch kernel
-    //    Grid.x = ceil(maxWidth / BLOCK_SIZE)  — cover width của partition lớn nhất
-    //    Grid.y = numPartitions
-    // ------------------------------------------------------------------
+    // Kernel 1: compute cur[] and local score (parallel per site)
     size_t maxWidth = 0;
     for (int m = 0; m < numPartitions; m++)
     {
         maxWidth = std::max(maxWidth, pr->partitionData[m]->parsimonyLength);
     }
 
-    size_t blockSize = 32;
-    dim3 block(blockSize);
-    dim3 grid((maxWidth + blockSize - 1) / blockSize, numPartitions);
+    dim3 block(BLOCK_SIZE);
+    dim3 grid((maxWidth + BLOCK_SIZE - 1) / BLOCK_SIZE, numPartitions);
 
-    newviewParsimonyKernel<<<grid, block, 0, d_buf.stream>>>(
-        d_buf.d_parsVect, d_buf.d_nodeScores, d_buf.d_ti, tiCount, d_buf.d_widths, d_buf.d_states,
-        d_buf.d_parsVectOffset, numPartitions
-    );
-
-    // Download parsVect
-    // size_t offset = 0;
-    // for (int m = 0; m < numPartitions; m++)
-    // {
-    //     size_t elems = pr->partitionData[m]->parsimonyLength * pr->partitionData[m]->states
-    //                     * nodesInTree;
-    //     cudaMemcpyAsync(
-    //         pr->partitionData[m]->parsVect, (char*)d_buf.d_parsVect + offset,
-    //         elems * sizeof(parsimonyNumber), cudaMemcpyDeviceToHost, d_buf.stream
-    //     );
-    //     offset += elems * sizeof(parsimonyNumber);
-    // }
-
-    // Download nodeScores → update parsimonyScore[]
-    std::vector<unsigned int> h_nodeScores(nodesInTree);
-    cudaMemcpyAsync(
-        h_nodeScores.data(), d_buf.d_nodeScores, nodesInTree * sizeof(unsigned int),
-        cudaMemcpyDeviceToHost, d_buf.stream
-    );
-    cudaStreamSynchronize(d_buf.stream);
-
-    for (int index = 4; index < tiCount; index += 4)
     {
-        size_t p = (size_t)tr->ti[index];
-        size_t q = (size_t)tr->ti[index + 1];
-        size_t r = (size_t)tr->ti[index + 2];
-        tr->parsimonyScore[p] = h_nodeScores[p] + tr->parsimonyScore[q] + tr->parsimonyScore[r];
+        InlineProfilerTimer p("Kernel 1");
+        newviewParsimonyKernel<<<grid, block, 0, d_buf.stream>>>(
+            d_buf.d_parsVect, d_buf.d_parsimonyScore, d_buf.d_ti, tiCount, d_buf.d_widths,
+            d_buf.d_states, d_buf.d_parsVectOffset, numPartitions
+        );
+        CUDA_CHECK(cudaStreamSynchronize(d_buf.stream));
     }
+    {
+        InlineProfilerTimer p("Kernel 2");
+        // Kernel 2: compute parsimonyScore[] to prevent download
+        accumulateParsimonyScoreKernel<<<1, 1, 0, d_buf.stream>>>(
+            d_buf.d_parsimonyScore, d_buf.d_ti, tiCount
+        );
+        CUDA_CHECK(cudaStreamSynchronize(d_buf.stream));
+    }
+
+    {
+        InlineProfilerTimer p("Download parsimonyScore");
+        CUDA_CHECK(cudaMemcpyAsync(
+            tr->parsimonyScore, d_buf.d_parsimonyScore, nodesInTree * sizeof(unsigned int),
+            cudaMemcpyDeviceToHost, d_buf.stream
+        ));
+        CUDA_CHECK(cudaStreamSynchronize(d_buf.stream));
+    }
+
+    size_t rootNode = (size_t)tr->ti[tiCount - 4];
+    return tr->parsimonyScore[rootNode];
+}
+
+void resetParsVect()
+{
+    d_buf.parsVectUploaded = false;
 }
 
 // static void newviewParsimonyIterativeFast(

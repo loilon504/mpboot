@@ -1338,11 +1338,14 @@ int initCandidateTreeSet(Params &params, IQTree &iqtree, int numInitTrees) {
         if (params.start_tree == STT_PLL_PARSIMONY) {
 			iqtree.pllInst->randomNumberSeed = params.ran_seed + treeNr * 12345;
 
+			auto timeStart = getCPUTime();
 			if(params.maximum_parsimony){
 				_pllComputeRandomizedStepwiseAdditionParsimonyTree(iqtree.pllInst, iqtree.pllPartitions, params.sprDist, &iqtree);
 			}
 			else
 				pllComputeRandomizedStepwiseAdditionParsimonyTree(iqtree.pllInst, iqtree.pllPartitions, params.sprDist);
+			auto timePll = getCPUTime() - timeStart;
+			cout << fixed << setprecision(3) << "Create tree " << treeNr << " take " << timePll << endl;
 
 	        pllTreeToNewick(iqtree.pllInst->tree_string, iqtree.pllInst, iqtree.pllPartitions,
 					iqtree.pllInst->start->back, PLL_TRUE, PLL_TRUE, PLL_FALSE, PLL_FALSE, PLL_FALSE,

@@ -119,9 +119,9 @@ class InlineProfilerTimer
     ~InlineProfilerTimer()
     {
         auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start_).count();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start_).count();
 
-        std::cout << name_ << ": " << duration << " ms\n";
+        std::cout << name_ << ": " << duration << " ns\n";
     }
 
    private:
