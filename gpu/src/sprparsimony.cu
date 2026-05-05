@@ -332,6 +332,7 @@ parsimonyNumber newviewParsimonyGpu(
     {
         maxWidth = std::max(maxWidth, pr->partitionData[m]->parsimonyLength);
     }
+    std::cout << "MAX WIDTH: " << maxWidth << std::endl;
 
     dim3 block(BLOCK_SIZE);
     dim3 grid((maxWidth + BLOCK_SIZE - 1) / BLOCK_SIZE, numPartitions);
