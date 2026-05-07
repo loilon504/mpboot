@@ -3185,7 +3185,6 @@ static void _pllMakeParsimonyTreeFast(pllInstance *tr, partitionList *pr, int sp
 //  cout << "DONE stepwise addition" << endl;
 
   randomMP = tr->bestParsimony;
-  cout << "Pre-SPR score: " << randomMP << '\n';
 
 //	int * hill_climbing_perm = (int *)rax_malloc((size_t)(tr->mxtips + tr->mxtips - 1) * sizeof(int));
 	int j;

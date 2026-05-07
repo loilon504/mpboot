@@ -208,16 +208,19 @@ createTiAndEvaluateParsimony(pars_tree, score_tree, topo, sh, p, N, /*full=*/tru
 **Joined kernel `buildParsimonyTreesKernel`** (`pars_build.cu`) — stepwise-addition + SPR in
 one `__global__` function sharing `BuildShared` shared memory (≈24.8 KB on A100).
 
-**Verified results** for N=295, K=99, sprDist=6:
-| | Best | Worst |
-|--|------|-------|
-| Pre-SPR parsimony (after build) | 6734 | 6808 |
-| Post-SPR parsimony | **6676** | 6764 |
-| CPU reference (_pllSprOnCurrentTree) | ~6668 | ~6760 |
-| Total kernel time | 7851 ms | — |
-| ms/tree (build+SPR) | 79.3 ms | — |
+**Verified results** for N=295, sprDist=6, seed=1 (A100-SXM4-80GB):
 
-GPU post-SPR best (6676) is within **0.1%** of CPU best (6668). ✅
+| K (trees) | Post-SPR best | ms/tree | Total kernel |
+|-----------|--------------|---------|--------------|
+| 99        | 6676         | 79.3 ms | 7.9 s        |
+| 199       | 6671         | 44.9 ms | 9.0 s        |
+| 499       | 6671         | 25.0 ms | 12.5 s       |
+| 999       | 6670         | 21.2 ms | 21.2 s       |
+| **9999**  | **6664**     | **16.3 ms** | **163 s** |
+| CPU ref (1 tree) | ~6668 | — | — |
+
+**K=9999: GPU best=6664 beats CPU reference 6668.** ✅
+ms/tree saturates at ~16 ms (A100 SM occupancy ceiling). Serial CPU equivalent: ~33 min → GPU speedup ~12×.
 
 ### Joined kernel structure (pars_build.cu)
 

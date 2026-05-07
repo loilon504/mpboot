@@ -6,7 +6,6 @@
 #include <vector>
 
 #include "gpu/include/gpu_init_trees.cuh"
-#include "gpu/include/gpu_spr.cuh"
 #include "gpu/include/pars_build.cuh"
 #include "gpu/include/pars_tree.cuh"
 #include "gpu/include/utils.cuh"
