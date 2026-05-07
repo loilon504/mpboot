@@ -19,8 +19,7 @@ Called from `IQTree::initCandidateTreesParsimony()` when `--use_gpu` is passed.
 | [2] | `gpuParsimonyMemAlloc` | GPU allocs `d_parsVect[K][2N+1][width][states]`, `d_parsScore[K][2N+1]`, `d_topos[K]` |
 | [3] | `uploadTipParsVect` | Reorders tip parsVect CPU→GPU layout and uploads (tips are **read-only**, shared across all K trees) |
 | [4] | `cpuToGpuTopology` + `uploadTopology` | Converts PLL pointer-ring → flat int arrays (`GpuTopology`), uploads one initial topology to all K trees |
-| [5] | `buildParsimonyTreesKernel` | Each CUDA block builds one tree via **stepwise addition** on GPU |
-| [6] | `gpuSprKernel` | Each CUDA block runs **SPR hill-climbing** on its tree |
+| [5+6] | `buildParsimonyTreesKernel` | **Joined kernel**: stepwise addition (phases 0-2) + SPR hill-climbing (phase 3). Shares `BuildShared` (≈24.8 KB). |
 | [7] | `downloadTopology` + `gpuTopoToCpu` + `pllTreeToNewick` | Download K topologies, convert back to PLL pointer-rings, emit Newick strings |
 
 ### Key file map
@@ -28,8 +27,9 @@ Called from `IQTree::initCandidateTreesParsimony()` when `--use_gpu` is passed.
 | File | Purpose |
 |------|---------|
 | `gpu/src/gpu_init_trees.cu` | Entry point: orchestrates the full pipeline |
-| `gpu/src/pars_build.cu` | Stepwise-addition kernel (`buildParsimonyTreesKernel`) |
-| `gpu/src/gpu_spr.cu` | SPR hill-climbing kernel (`gpuSprKernel`) |
+| `gpu/src/pars_build.cu` | **Main kernel** (build + SPR) + SPR device functions |
+| `gpu/src/gpu_spr.cu` | No-op stub (SPR moved to pars_build.cu) |
+| `gpu/include/pars_build.cuh` | `gpuStepwiseBuildTrees(mem, seeds, sprDist, stream)` |
 | `gpu/src/pars_tree.cu` | Memory alloc, topology conversion, upload/download |
 | `gpu/include/pars_tree.cuh` | `GpuTopology`, `GpuParsimonyMem`, `warpNewviewStep`, `warpEvaluateScore` |
 | `gpu/include/topo_helpers.cuh` | `vfToNum`, `nodepVf`, `vfNextFace`, `vfNnxtFace`, `gpuRandum` |

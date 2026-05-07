@@ -32,7 +32,7 @@ int gpuInitCandidateTrees(
     const Params& params, IQTree& iqtree, int numInitTrees, std::vector<std::string>& candidateTrees
 )
 {
-    const int K = numInitTrees - 1;  // tree indices 1..numInitTrees-1
+    int K = numInitTrees - 1;  // tree indices 1..numInitTrees-1
 
     pllInstance* tr = iqtree.pllInst;
     partitionList* pr = iqtree.pllPartitions;
@@ -101,30 +101,19 @@ int gpuInitCandidateTrees(
         return ms;
     };
 
+    // ── [5+6] Joined kernel: stepwise-addition + SPR ─────────────────────────
     float build_ms = ev_time(
         [&]
         {
-            gpuStepwiseBuildTrees(mem, seeds.data(), stream);
+            gpuStepwiseBuildTrees(mem, seeds.data(), params.sprDist, stream);
         }
     );
     printf(
-        "[GPU]   [5] GPU kernel (stepwise build):  %.1f ms  (%d trees, %.2f ms/tree)\n",
+        "[GPU]   [5+6] GPU kernel (build+SPR):     %.1f ms  (%d trees, %.2f ms/tree)\n",
         (double)build_ms, K, K > 0 ? (double)build_ms / K : 0.0
     );
 
-    // ── [6] GPU SPR hill-climbing (all K trees in parallel) ──────────────────
-    float spr_ms = ev_time(
-        [&]
-        {
-            gpuSprBuildTrees(mem, params.sprDist, stream);
-        }
-    );
-    printf(
-        "[GPU]   [6] GPU SPR:                       %.1f ms  (%d trees, %.2f ms/tree)\n",
-        (double)spr_ms, K, K > 0 ? (double)spr_ms / K : 0.0
-    );
-
-    // ── [6b] Debug: download pre- and post-SPR parsimony scores ─────────────
+    // ── [6b] Pre/post-SPR parsimony summary ──────────────────────────────────
     {
         unsigned int best_pre = UINT_MAX, worst_pre = 0;
         unsigned int best_post = UINT_MAX, worst_post = 0;
@@ -133,13 +122,20 @@ int gpuInitCandidateTrees(
             GpuTopology h_topo_tmp;
             downloadTopology(mem, k, &h_topo_tmp, stream);
             cudaStreamSynchronize(stream);
-            if (h_topo_tmp.preSprParsimony < best_pre) best_pre = h_topo_tmp.preSprParsimony;
-            if (h_topo_tmp.preSprParsimony > worst_pre) worst_pre = h_topo_tmp.preSprParsimony;
-            if (h_topo_tmp.bestParsimony < best_post) best_post = h_topo_tmp.bestParsimony;
-            if (h_topo_tmp.bestParsimony > worst_post) worst_post = h_topo_tmp.bestParsimony;
+            if (h_topo_tmp.preSprParsimony < best_pre)  best_pre   = h_topo_tmp.preSprParsimony;
+            if (h_topo_tmp.preSprParsimony > worst_pre)  worst_pre  = h_topo_tmp.preSprParsimony;
+            if (h_topo_tmp.bestParsimony   < best_post)  best_post  = h_topo_tmp.bestParsimony;
+            if (h_topo_tmp.bestParsimony   > worst_post) worst_post = h_topo_tmp.bestParsimony;
         }
-        printf("[GPU]   [6b] Pre-SPR  parsimony: best=%u  worst=%u\n", best_pre, worst_pre);
-        printf("[GPU]   [6b] Post-SPR parsimony: best=%u  worst=%u\n", best_post, worst_post);
+        if (params.sprDist > 0)
+        {
+            printf("[GPU]   [6b] Pre-SPR  parsimony: best=%u  worst=%u\n", best_pre,  worst_pre);
+            printf("[GPU]   [6b] Post-SPR parsimony: best=%u  worst=%u\n", best_post, worst_post);
+        }
+        else
+        {
+            printf("[GPU]   [6b] Build parsimony:    best=%u  worst=%u\n", best_post, worst_post);
+        }
     }
 
     // ── [7] Download + Newick ─────────────────────────────────────────────────

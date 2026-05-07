@@ -7,7 +7,9 @@ namespace mpbootgpu
 {
 
 // ─── RNG: exact replication of PLL's randum() ────────────────────────────────
-__device__ __forceinline__ double gpuRandum(long* seed)
+__device__ __forceinline__ double gpuRandum(
+    long* seed
+)
 {
     long s0 = *seed & 4095;
     long s1 = (*seed >> 12) & 4095;
@@ -16,9 +18,9 @@ __device__ __forceinline__ double gpuRandum(long* seed)
 
     long sum = m0 * s0;
     long ns0 = sum & 4095;
-    sum      = (sum >> 12) + m0 * s1 + m1 * s0;
+    sum = (sum >> 12) + m0 * s1 + m1 * s0;
     long ns1 = sum & 4095;
-    sum      = (sum >> 12) + m0 * s2 + m1 * s1;
+    sum = (sum >> 12) + m0 * s2 + m1 * s1;
     long ns2 = sum & 255;
 
     *seed = (ns2 << 24) | (ns1 << 12) | ns0;
@@ -28,42 +30,58 @@ __device__ __forceinline__ double gpuRandum(long* seed)
 // ─── Topology index helpers ───────────────────────────────────────────────────
 // Tips  : vf = num-1  → num = vf+1          (vf < N)
 // Inner : vf = N + 3*(num-N-1) + face_idx   (vf >= N)
-__device__ __forceinline__ int vfToNum(int vf, int N)
+__device__ __forceinline__ int vfToNum(
+    int vf, int N
+)
 {
     return (vf < N) ? (vf + 1) : (N + 1 + (vf - N) / 3);
 }
 
 // vface of tr->nodep[num]: face[2] for inner nodes, vf=num-1 for tips.
-__device__ __forceinline__ int nodepVf(int num, int N)
+__device__ __forceinline__ int nodepVf(
+    int num, int N
+)
 {
     if (num <= N)
+    {
         return num - 1;
+    }
     return N + 3 * (num - N - 1) + 2;
 }
 
 // Ring layout: face[2]→face[1]→face[0]→face[2]
-__device__ __forceinline__ int vfNextFace(int vf, int N)
+__device__ __forceinline__ int vfNextFace(
+    int vf, int N
+)
 {
     if (vf < N)
+    {
         return vf;  // tip self-loop
+    }
     int base = N + 3 * ((vf - N) / 3);
-    int f    = (vf - N) % 3;
-    int nf   = (f == 2) ? 1 : (f == 1) ? 0 : 2;
+    int f = (vf - N) % 3;
+    int nf = (f == 2) ? 1 : (f == 1) ? 0 : 2;
     return base + nf;
 }
 
-__device__ __forceinline__ int vfNnxtFace(int vf, int N)
+__device__ __forceinline__ int vfNnxtFace(
+    int vf, int N
+)
 {
     if (vf < N)
+    {
         return vf;
+    }
     int base = N + 3 * ((vf - N) / 3);
-    int f    = (vf - N) % 3;
-    int nf   = (f == 2) ? 0 : (f == 1) ? 2 : 1;
+    int f = (vf - N) % 3;
+    int nf = (f == 2) ? 0 : (f == 1) ? 2 : 1;
     return base + nf;
 }
 
 // hookup: back_vf[a] = b, back_vf[b] = a  (lane 0 only)
-__device__ __forceinline__ void gpuHookup(int* back_vf, int a, int b)
+__device__ __forceinline__ void gpuHookup(
+    int* back_vf, int a, int b
+)
 {
     back_vf[a] = b;
     back_vf[b] = a;

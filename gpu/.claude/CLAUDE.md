@@ -162,89 +162,115 @@ restoreTreeRearrangeParsimony:
 
 ---
 
-## 3. Current GPU Implementation Status
+## 3. New GPU Functions (pars_tree.cuh) — xPars-Aware Traversal
 
-### What is working
-- **Step [5] Stepwise build**: kernel builds 99 trees in ~440 ms (4.4 ms/tree). Trees are
-  topologically valid and parsimony is plausible (pre-SPR best=15368 for N=295).
-- **Topology conversion** (`cpuToGpuTopology`, `gpuTopoToCpu`): correct.
-- **`recomputeAllNodes`**: correctly traverses N-2 inner nodes in post-order from start_vface
-  and returns the full-tree parsimony. Verified: processes 293 nodes for N=295 (see bug #2).
-- **`warpNewviewStep`, `warpEvaluateScore`**: Fitch logic matches CPU.
-- **`applyMove`** (= `removeNodeParsimony` + `restoreTreeParsimony` + newview):
-  hookup logic matches CPU.
+The following device functions mirror the CPU's `computeTraversalInfoParsimony` /
+`newviewParsimonyIterativeFast` / `evaluateParsimonyIterativeFast` pipeline.
+All are template on `SharedT` (works for both `BuildShared` and `SprShared`).
 
-### Bug #1 — SPR makes trees WORSE (main open bug)
+### `computeTraversalInfoParsimony(topo, sh, node, N, full)`
+Builds `sh.ti[]` from `node`'s perspective (iterative DFS via `sh.tiStack`).
+- Mirrors CPU's xPars flag transfer: if `!xpars[p]`, moves xpars from `pNext` or `pNnxt`.
+- `full=false`: only recurses into children with `xpars=0` (lazy mode).
+- `full=true`: recurses into all inner children unconditionally.
+- Appends `(p_num, q_num, r_num)` tuples to `sh.ti[]` (starting at `sh.tiSize`).
+- **Must be called from lane 0 only.**
 
-**Symptom**: Pre-SPR best = 15368, Post-SPR best = **16369** (should be ~6668 matching CPU).
-SPR is consistently worsening trees. For k=0, `sh.randomMP` goes from 18175 → ~18800
-across iterations.
+### `newviewParsimony(pars_tree, score_tree, sh, evaluate, width, states)`
+Processes `sh.ti[]` bottom-up (`i = tiSize-3 … 3`), updating `parsVect` and `score_tree`.
+- If `evaluate=false`: just updates, returns `score_tree[sh.ti[3]]` (top-of-ti node).
+- If `evaluate=true`: after newview, also evaluates at edge `(sh.ti[1], sh.ti[2])` and
+  returns `score_tree[ti[1]] + score_tree[ti[2]] + cross(parsVect[ti[1]], parsVect[ti[2]])`.
+- All 32 lanes participate in parsVect computation; lane 0 handles score accumulation.
 
-**Root cause hypothesis**: `testInsert`'s `mp` estimate is **too low** (underestimate),
-causing moves to be accepted that actually increase true tree parsimony. After `applyMove`,
-`recomputeAllNodes` reveals the true (higher) parsimony, and the do-while loop exits
-thinking it improved (randomMP < startMP from the wrong baseline).
+### `createTiAndNewviewParsimony(pars_tree, score_tree, topo, sh, p, N, width, states, lane)`
+Wrapper: sets `sh.tiSize = 3`, calls `computeTraversalInfoParsimony(p, lazy)`, then
+`newviewParsimony(evaluate=false)`. Updates `parsVect[vfToNum(p)]` and all stale descendants.
 
-**Suspected mechanism**: After `removeNodeParsimony(p)`, some `score_tree[]` values used
-in `testInsert` are **stale** from the last `recomputeAllNodes`. Specifically,
-`score_tree[sh.tip_p_num]` (= score for p's back-neighbor q) may include p's old
-contribution if q is an ancestor of p in the rooted DFS from start_vface.
-The CPU avoids this via the lazy `evaluateParsimony(p, FALSE)` call at line 2291 (before
-removeNodeParsimony), which refreshes parsimonyScore[i] and q's parsimonyScore from their
-current directions.
+### `createTiAndEvaluateParsimony(pars_tree, score_tree, topo, sh, p, N, full, width, states)`
+Wrapper: sets `sh.tiSize = 3`, sets `sh.ti[1]=vfToNum(p)`, `sh.ti[2]=vfToNum(back_vf[p])`,
+then calls `computeTraversalInfoParsimony` for both p and `back_vf[p]`.
+Returns full-tree parsimony at edge `(p_num, back_vf[p]_num)`.
+- `full=true`: equivalent to CPU's `evaluateParsimony(p, PLL_TRUE)` — unconditional refresh.
+- `full=false`: equivalent to CPU's `evaluateParsimony(p, PLL_FALSE)` — lazy refresh.
 
-**Attempted fixes** (all applied in current code):
-1. Added `q_num > N` guard in `doAddTraverse` to skip tip edges in testInsert. ✓ (necessary)
-2. Added `recomputeAllNodes` after each `applyMove` to keep score_tree fresh. ✓ (necessary)
-3. Corrected `testInsert` formula: parsVect[p_num] = Fitch(sh.tip_p_num, q_edge_num);
-   evaluate at (p_num, r_num). ✓ (analytically matches CPU)
-
-**Result after all fixes**: still 16369. Fixes 1 and 2 were necessary but not sufficient.
-
-**Next angle to investigate**:
-The GPU's `testInsert` does NOT replicate the CPU's critical `evaluateParsimony(p, FALSE)`
-at line 2291, which refreshes stale scores before removeNodeParsimony. In the GPU, when
-testing moves for node i, `score_tree[q_num]` (= sh.tip_p_num) and `score_tree[ins_num]`
-were computed by the last `recomputeAllNodes` from the **start_vface direction**. If p (node i)
-lies along the DFS path from start to some other node, removing p may not immediately
-affect score_tree values in p's subtree — but score_tree for p's ancestors (including q)
-will be stale after the topology changes from prior moves.
-
-**Debug to add**: Print `sh.bestParsimony` (testInsert's mp estimate) vs
-`fullMP` (recomputeAllNodes after applyMove). If they consistently differ, this confirms
-the underestimation. Target: make these equal.
-
-### Bug #2 — DFS processes 293 nodes, expects N-1=294
-
-`recomputeAllNodes` prints `inner_nodes_processed=293 (expected N-1=294)` for N=295.
-Expected: N-1 = 294 inner nodes. Off by one.
-The code initializes counter to 0 and increments in the `top_idx==2` branch for each inner
-node. Root node (back_vf[start_vface] = node 462) is pushed first; it should be processed.
-Likely cause: one inner node in the tree has a back_vf pointing to NULL/−1 (disconnected
-after the build step), or a cycle is causing the DFS to skip a node. The debug print
-`[TOPO k=0] back_vf[1174]=-1` for node 589 (= 2N-1 = 589 for N=295) suggests that the
-last inner node built in stepwise addition has a stale NULL back_vf.
-
-### Performance note
-
-SPR kernel takes 11384 ms for 99 trees (115 ms/tree). This is dominated by:
-- O(2N × sprDist-depth DFS × testInsert evaluations) per iteration
-- `recomputeAllNodes` after every applied move (O(N) work)
-
-Once correctness is achieved, optimization should:
-- Limit recomputeAllNodes to only nodes on the path affected by the move
-- Consider warp-level parallelism for the DFS (currently lane 0 drives stack, all lanes do parsVect)
+**GPU equivalent of CPU line-2291 call:**
+```cpp
+createTiAndEvaluateParsimony(pars_tree, score_tree, topo, sh, p, N, /*full=*/true, width, states)
+```
 
 ---
 
-## 4. Key File Map
+## 4. Current GPU Implementation Status (2026-05-07)
+
+### ✅ Fully working
+
+**Joined kernel `buildParsimonyTreesKernel`** (`pars_build.cu`) — stepwise-addition + SPR in
+one `__global__` function sharing `BuildShared` shared memory (≈24.8 KB on A100).
+
+**Verified results** for N=295, K=99, sprDist=6:
+| | Best | Worst |
+|--|------|-------|
+| Pre-SPR parsimony (after build) | 6734 | 6808 |
+| Post-SPR parsimony | **6676** | 6764 |
+| CPU reference (_pllSprOnCurrentTree) | ~6668 | ~6760 |
+| Total kernel time | 7851 ms | — |
+| ms/tree (build+SPR) | 79.3 ms | — |
+
+GPU post-SPR best (6676) is within **0.1%** of CPU best (6668). ✅
+
+### Joined kernel structure (pars_build.cu)
+
+`buildParsimonyTreesKernel(... sprDist ...)`:
+1. **Phase 0** (lane 0): Fisher-Yates shuffle → `sh.seed`, build 3-tip tree.
+2. **Phase 1**: Stepwise addition for tips 4..N. Uses `sh.ti[]` + `computeTraversalInfoParsimony`
+   + `newviewParsimony` (xPars-aware). After this, `sh.bestParsimony` = tree parsimony.
+3. **Phase 2**: Set `topo->start_vface = nodepVf(1, N)`.
+4. **Phase 3** (if `sprDist > 0`): SPR hill-climbing.
+   - Init: `sh.randomMP = sh.bestParsimony` (from build phase — xPars already consistent).
+   - **No `recomputeAllNodes` needed**: xPars flags from build are valid.
+   - `do-while randomMP < startMP`:
+     - For i = 1..2N-2: `createTiAndEvaluateParsimony(p, full=true)` (line-2291 equivalent)
+     - P-branch: removeNode → doAddTraverse → restore → createTiAndNewview
+     - Q-branch: same with q
+     - Apply best move if improving
+
+### Key design decisions
+
+- **`SprShared` removed** — `BuildShared` now holds all fields for both phases.
+- **`sh.seed` shared** — build sets it via `sh.seed = d_seeds[k]`; SPR inherits it directly.
+- **`sh.randomMP` init** — set from `sh.bestParsimony` (last build insertion score) instead of
+  calling `recomputeAllNodes`. Valid because xPars flags are already consistent after build.
+- **`sh.stack[]` reused** — build DFS stack reused as SPR addTraverse stackVf (sequential phases).
+- **`gpuSprKernel` removed** — `gpu_spr.cu` now contains only a no-op `gpuSprBuildTrees` stub.
+- **Pipeline steps [5]+[6] merged** → single call `gpuStepwiseBuildTrees(mem, seeds, sprDist, stream)`.
+
+### Fixed bugs
+
+| Bug | Status |
+|-----|--------|
+| #A `testInsert`: `vfNnxtFace(q,N)` → `vfNnxtFace(p,N)` (crash) | ✅ Fixed |
+| #B `sh.randomMP` uninitialized (wrong SPR threshold) | ✅ Fixed (use bestParsimony) |
+| #C Missing `__syncwarp()` in `createTiAndEvaluateParsimony` | ✅ Fixed |
+
+### Open issues
+
+- **Bug #C DFS off-by-one**: `recomputeAllNodes` (now unused) processed 293/294 nodes due to
+  last inner node having `back_vf = -1`. No longer blocks correctness because we don't use
+  `recomputeAllNodes` for SPR init. Root cause (last node of build not fully hookup'd) may
+  still exist but has no observable impact.
+
+---
+
+## 5. Key File Map
 
 | File | Purpose |
 |------|---------|
-| `gpu/src/gpu_init_trees.cu` | Entry point: orchestrates the full pipeline |
-| `gpu/src/pars_build.cu` | Stepwise-addition kernel (`buildParsimonyTreesKernel`) |
-| `gpu/src/gpu_spr.cu` | SPR hill-climbing kernel (`gpuSprKernel`) |
+| `gpu/src/gpu_init_trees.cu` | Entry point — calls `gpuStepwiseBuildTrees(sprDist)`, shows [5+6] timing |
+| `gpu/src/pars_build.cu` | **Main kernel**: build phase + SPR phase; all SPR device functions |
+| `gpu/src/gpu_spr.cu` | No-op stub for `gpuSprBuildTrees` (SPR is now in pars_build.cu) |
 | `gpu/src/pars_tree.cu` | Memory alloc, topology conversion, upload/download |
-| `gpu/include/pars_tree.cuh` | `GpuTopology`, `GpuParsimonyMem`, `warpNewviewStep`, `warpEvaluateScore` |
+| `gpu/include/pars_tree.cuh` | `BuildShared`, `GpuTopology`, template traversal functions |
+| `gpu/include/pars_build.cuh` | `gpuStepwiseBuildTrees(mem, seeds, sprDist, stream)` declaration |
 | `gpu/include/topo_helpers.cuh` | `vfToNum`, `nodepVf`, `vfNextFace`, `vfNnxtFace`, `gpuRandum` |
-| `mpboot/sprparsimony.cpp` | CPU reference: `makeParsimonyTreeFast`, `rearrangeParsimony`, `testInsertParsimony`, `newviewParsimonyIterativeFast`, `evaluateParsimonyIterativeFast` |
+| `mpboot/sprparsimony.cpp` | CPU reference: `_pllSprOnCurrentTree`, `rearrangeParsimony`, `testInsertParsimony` |

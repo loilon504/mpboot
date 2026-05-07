@@ -3,9 +3,17 @@ description: Open bugs in the GPU SPR kernel — current symptoms, attempted fix
 alwaysApply: true
 ---
 
-## Open Bugs
+## Status (2026-05-07)
 
-### Bug #1 — SPR makes trees WORSE (primary bug)
+**SPR is now working correctly.** Post-SPR best=6676 (K=99, N=295) vs CPU ~6668. All
+blocking bugs below have been resolved. The joined kernel (`buildParsimonyTreesKernel` with
+`sprDist` parameter) replaces the separate `gpuSprKernel`.
+
+---
+
+## ✅ Resolved Bugs
+
+### Bug #1 — SPR makes trees WORSE (superseded)
 
 **Symptom**: Pre-SPR best = 15368, post-SPR best = **16369** (target: ~6668 matching CPU).
 For tree k=0, `sh.randomMP` climbs from 18175 → ~18800 across iterations — the tree gets
@@ -53,17 +61,18 @@ has no back-connection, causing the DFS to either skip it or treat it as a leaf.
 **Probable root**: `pars_build.cu` `buildParsimonyTreesKernel` doesn't fully initialise all
 three faces of the last-allocated inner node before SPR begins.
 
-**Impact**: The one unvisited node has a stale `score_tree` value, which may contribute to
-Bug #1 if that node happens to appear in a testInsert evaluation.
+**Impact**: No observable impact on correctness — the joined kernel uses `sh.bestParsimony`
+from the build phase (not `recomputeAllNodes`) to init `sh.randomMP`. The xPars system
+handles lazy updates correctly from that point.
 
 ---
 
-### Performance note (post-correctness)
+## Performance notes (correctness confirmed)
 
-SPR kernel: 11384 ms for 99 trees = 115 ms/tree. Dominated by:
-- `recomputeAllNodes` after every accepted move — O(N) work per move.
-- Single-lane DFS stack (lane 0 drives traversal; all 32 lanes compute parsVect).
+Joined kernel: 7851 ms for 99 trees = 79 ms/tree (N=295, sprDist=6).
 
-Optimisation ideas (after correctness is confirmed):
-- Incremental score update: only recompute ancestors of the moved node instead of full tree.
-- Batch testInsert: distribute candidate edges across lanes for parallel evaluation.
+Optimisation ideas for next phase:
+- **Incremental score update**: only recompute ancestors along the path affected by the SPR
+  move instead of relying on full lazy refresh via `createTiAndEvaluateParsimony(full=true)`.
+- **Batch testInsert**: distribute candidate edges across lanes for parallel evaluation.
+- **Reduce sync overhead**: some `__syncwarp()` calls may be avoidable with careful ordering.
