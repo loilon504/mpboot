@@ -558,7 +558,6 @@ void newviewSankoffParsimonyIterativeFastSIMD(pllInstance *tr, partitionList * p
 
 static void newviewParsimonyIterativeFast(pllInstance *tr, partitionList *pr, int perSiteScores)
 {
-  PROFILE_SCOPE("newviewParsimony");
 	if(pllCostMatrix) {
 //        newviewSankoffParsimonyIterativeFast(tr, pr, perSiteScores);
 //        return;

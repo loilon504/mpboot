@@ -58,6 +58,7 @@
 #include "gpu/include/sprparsimony.hpp"
 #include "gpu/include/gpu_init_trees.cuh"
 #include <chrono>
+#include <chrono>
 
 void reportReferences(Params &params, ofstream &out, string &original_model) {
 	out << "To cite IQ-TREE please use:" << endl << endl
@@ -1266,116 +1267,95 @@ void initializeParams(Params &params, IQTree &iqtree, vector<ModelInfo> &model_i
  *  @return number of duplicated trees
  */
 int initCandidateTreeSet(Params &params, IQTree &iqtree, int numInitTrees) {
-	mpbootgpu::InlineProfilerTimer p("initCandidateTreeSet");
-    int nni_count = 0;
-    int nni_steps = 0;
     int numDup = 0;
     cout << "Generating " << numInitTrees - 1 << " parsimony trees... ";
     cout.flush();
     double startTime = getCPUTime();
+	auto sTime = std::chrono::high_resolution_clock::now();
     int numDupPars = 0;
 //    if(params.maximum_parsimony) iqtree.candidateTrees.clear(); // Diep: added this to fix the bug of sorted aln <> orig aln
 
-    // -----------------------------------------------------------------------
-    // Phase 1: Generate parsimony trees.
-    // Results are stored in candidateTrees[1..numInitTrees-1].
-    // With OpenMP: each thread gets its own cloned pllInstance + partitionList
-    // so node topology and parsimony scratch arrays are fully independent.
-    // Read-only alignment data (yVector, aliaswgt) is shared safely.
-    // -----------------------------------------------------------------------
-    vector<string> candidateTrees(numInitTrees);
-
-    // ── GPU path: stepwise addition for all K trees in parallel ──────────────
     if (params.use_gpu && params.start_tree == STT_PLL_PARSIMONY) {
+        // GPU path: build all K trees in parallel on GPU, then register sequentially.
         cout << "\nUsing GPU for parallel parsimony tree building\n";
-        mpbootgpu::gpuInitCandidateTrees(params, iqtree, numInitTrees, candidateTrees);
-        goto phase2;  // skip CPU tree-building loops below
-    }
-
-#ifdef _OPENMP
-    omp_set_dynamic(0);
-    omp_set_max_active_levels(1);
-    omp_set_num_threads(params.num_threads);
-    cout << "\nUse OpenMP in initCandidateTreeSet, " << params.num_threads << " threads\n";
-
-#pragma omp parallel for schedule(dynamic) num_threads(params.num_threads)
-    for (int treeNr = 1; treeNr < numInitTrees; treeNr++) {
-        if (params.start_tree == STT_PLL_PARSIMONY) {
-            pllInstance*   localInst = pllInstanceClone(iqtree.pllInst);
-            partitionList* localPr   = pllPartitionsClone(iqtree.pllPartitions);
-            localInst->randomNumberSeed = params.ran_seed + treeNr * 12345;
-
-            if (params.maximum_parsimony)
-                _pllComputeRandomizedStepwiseAdditionParsimonyTree(localInst, localPr, params.sprDist, &iqtree);
-            else
-                pllComputeRandomizedStepwiseAdditionParsimonyTree(localInst, localPr, params.sprDist);
-
-            pllTreeToNewick(localInst->tree_string, localInst, localPr,
-                localInst->start->back,
-                PLL_TRUE, PLL_TRUE, PLL_FALSE, PLL_FALSE, PLL_FALSE,
-                PLL_SUMMARIZE_LH, PLL_FALSE, PLL_FALSE);
-            candidateTrees[treeNr] = string(localInst->tree_string);
-
-            pllPartitionsCloneFree(localPr);
-            pllInstanceCloneFree(localInst);
+        vector<string> gpuTrees(numInitTrees);
+        mpbootgpu::gpuInitCandidateTrees(params, iqtree, numInitTrees, gpuTrees);
+        for (int i = 1; i < numInitTrees; ++i) {
+            if (gpuTrees[i].empty()) continue;
+            if (iqtree.candidateTrees.treeExist(gpuTrees[i])) { numDupPars++; continue; }
+            iqtree.readTreeString(gpuTrees[i]);
+            if (params.count_trees) {
+                string tree = iqtree.getTopology();
+                if (pllTreeCounter.find(tree) == pllTreeCounter.end())
+                    pllTreeCounter[gpuTrees[i]] = 1;
+                else
+                    pllTreeCounter[gpuTrees[i]]++;
+            }
+            if (params.maximum_parsimony) {
+                iqtree.initializeAllPartialPars();
+                iqtree.clearAllPartialLH();
+                iqtree.curScore = -iqtree.computeParsimony();
+                iqtree.candidateTrees.update(gpuTrees[i], iqtree.curScore);
+                if (iqtree.curScore > iqtree.bestScore)
+                    iqtree.setBestTree(gpuTrees[i], iqtree.curScore);
+            } else {
+                iqtree.candidateTrees.update(gpuTrees[i], -DBL_MAX);
+            }
         }
-    }
-#else
-    for (int treeNr = 1; treeNr < numInitTrees; treeNr++) {
-        if (params.start_tree == STT_PLL_PARSIMONY) {
-            iqtree.pllInst->randomNumberSeed = params.ran_seed + treeNr * 12345;
+    } else {
+        // CPU path: build and register each tree immediately in a single loop.
+        // readTreeString is cheap here because pllInst holds the just-built topology.
+        for (int treeNr = 1; treeNr < numInitTrees; treeNr++) {
+            string curParsTree;
+            if (params.start_tree == STT_PLL_PARSIMONY) {
+                iqtree.pllInst->randomNumberSeed = params.ran_seed + treeNr * 12345;
 
-            if (params.maximum_parsimony)
-                _pllComputeRandomizedStepwiseAdditionParsimonyTree(iqtree.pllInst, iqtree.pllPartitions, params.sprDist, &iqtree);
-            else
-                pllComputeRandomizedStepwiseAdditionParsimonyTree(iqtree.pllInst, iqtree.pllPartitions, params.sprDist);
+                if (params.maximum_parsimony)
+                    _pllComputeRandomizedStepwiseAdditionParsimonyTree(iqtree.pllInst, iqtree.pllPartitions, params.sprDist, &iqtree);
+                else
+                    pllComputeRandomizedStepwiseAdditionParsimonyTree(iqtree.pllInst, iqtree.pllPartitions, params.sprDist);
 
-            pllTreeToNewick(iqtree.pllInst->tree_string, iqtree.pllInst, iqtree.pllPartitions,
-                iqtree.pllInst->start->back,
-                PLL_TRUE, PLL_TRUE, PLL_FALSE, PLL_FALSE, PLL_FALSE,
-                PLL_SUMMARIZE_LH, PLL_FALSE, PLL_FALSE);
-            candidateTrees[treeNr] = string(iqtree.pllInst->tree_string);
-        } else {
-            iqtree.computeParsimonyTree(NULL, iqtree.aln);
-            candidateTrees[treeNr] = iqtree.getTreeString();
-        }
-    }
-#endif
-
-    // -----------------------------------------------------------------------
-    // Phase 2: Register trees into candidate set (sequential — shared state).
-    // -----------------------------------------------------------------------
-    phase2:
-    for (int i = 1; i < numInitTrees; ++i) {
-        if (candidateTrees[i].empty()) continue;
-        if (iqtree.candidateTrees.treeExist(candidateTrees[i])) {
-            numDupPars++;
-            continue;
-        }
-        if (params.start_tree == STT_PLL_PARSIMONY)
-            iqtree.readTreeString(candidateTrees[i]);
-        if (params.count_trees) {
-            string tree = iqtree.getTopology();
-            if (pllTreeCounter.find(tree) == pllTreeCounter.end())
-                pllTreeCounter[candidateTrees[i]] = 1;
-            else
-                pllTreeCounter[candidateTrees[i]]++;
-        }
-        // Diep added IF statement for MP doesn't need branch optimization
-        if (params.maximum_parsimony) {
-            iqtree.initializeAllPartialPars();
-            iqtree.clearAllPartialLH();
-            iqtree.curScore = -iqtree.computeParsimony();
-            iqtree.candidateTrees.update(candidateTrees[i], iqtree.curScore);
-            if (iqtree.curScore > iqtree.bestScore)
-                iqtree.setBestTree(candidateTrees[i], iqtree.curScore);
-        } else {
-            iqtree.candidateTrees.update(candidateTrees[i], -DBL_MAX);
+                pllTreeToNewick(iqtree.pllInst->tree_string, iqtree.pllInst, iqtree.pllPartitions,
+                    iqtree.pllInst->start->back,
+                    PLL_TRUE, PLL_TRUE, PLL_FALSE, PLL_FALSE, PLL_FALSE,
+                    PLL_SUMMARIZE_LH, PLL_FALSE, PLL_FALSE);
+                curParsTree = string(iqtree.pllInst->tree_string);
+            } else {
+                iqtree.computeParsimonyTree(NULL, iqtree.aln);
+                curParsTree = iqtree.getTreeString();
+            }
+            if (iqtree.candidateTrees.treeExist(curParsTree)) {
+                numDupPars++;
+                continue;
+            }
+            if (params.start_tree == STT_PLL_PARSIMONY)
+                iqtree.readTreeString(curParsTree);
+            if (params.count_trees) {
+                string tree = iqtree.getTopology();
+                if (pllTreeCounter.find(tree) == pllTreeCounter.end())
+                    pllTreeCounter[curParsTree] = 1;
+                else
+                    pllTreeCounter[curParsTree]++;
+            }
+            // Diep added IF statement for MP doesn't need branch optimization
+            if (params.maximum_parsimony) {
+                iqtree.initializeAllPartialPars();
+                iqtree.clearAllPartialLH();
+                iqtree.curScore = -iqtree.computeParsimony();
+                iqtree.candidateTrees.update(curParsTree, iqtree.curScore);
+                if (iqtree.curScore > iqtree.bestScore)
+                    iqtree.setBestTree(curParsTree, iqtree.curScore);
+            } else {
+                iqtree.candidateTrees.update(curParsTree, -DBL_MAX);
+            }
         }
     }
     double parsTime = getCPUTime() - startTime;
     cout << "(" << numDupPars << " duplicated parsimony trees)" << endl;
     cout << "CPU time: " << parsTime << endl;
+	auto eTime = std::chrono::high_resolution_clock::now();
+	double ms = std::chrono::duration_cast<std::chrono::milliseconds>(eTime - sTime).count();
+	cout << "CPU time high resolution clock: " << ms << " ms" << endl;
 
 	// do not do anything for parsimony because tree was already optimized by SPR
 	if (params.maximum_parsimony){
@@ -1862,7 +1842,8 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
         cout << "Current best score: " << (params.maximum_parsimony ? -iqtree.bestScore : iqtree.bestScore) << " / CPU time: "
                 << getCPUTime() - initTime << endl << endl;
 	}
-	exit(0);
+	exit(0);	exit(0);
+
 
     if (params.leastSquareNNI) {
     	iqtree.computeSubtreeDists();

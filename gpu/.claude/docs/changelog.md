@@ -574,6 +574,86 @@ landscape parsimony có nhiều local optima tốt ở 6665; cần rất nhiều
 
 ---
 
+## Kết quả thực nghiệm — CPU serial baseline (branch mpboot gốc, 2026-05-11)
+
+**Ngày**: 2026-05-11
+**Dataset**: `data_debug/tree1.phy` — N=295 taxa, 1836 columns, 1400 patterns (DNA)
+**Hardware**: CPU serial (1 core), không dùng GPU
+**Tham số**: sprDist=6, seed=1 (`_pllComputeRandomizedStepwiseAdditionParsimonyTree`)
+**Code**: branch mpboot gốc — `initCandidateTreeSet` single-loop gốc
+
+### Bảng kết quả
+
+| K (numpars) | Thực chạy | ms/tree | Tổng thời gian |
+|-------------|-----------|---------|----------------|
+| 100         | 99        | 44.2 ms | 4.38 s         |
+| 200         | 199       | 45.0 ms | 8.95 s         |
+| 500         | 499       | 43.7 ms | 21.80 s        |
+| 1000        | 999       | 43.8 ms | 43.73 s        |
+| **10000**   | **9999**  | **45.3 ms** | **453.41 s** |
+
+### Kết quả quan trọng
+
+**ms/tree bằng phẳng ~44ms ở mọi K** — CPU serial là thuần tuyến tính O(K).
+Post-initCandidateSet best parsimony = **6668** (nhất quán mọi K với seed=1).
+Không có lợi thế scaling: chạy 10000 cây = chạy 10 lần × 1000 cây.
+
+### So sánh với GPU (A100-SXM4-80GB, 2026-05-11)
+
+| K | CPU serial (ms/tree) | GPU (ms/tree) | GPU total | CPU total | Speedup tổng |
+|---|---------------------|---------------|-----------|-----------|-------------|
+| 100 | 44.2 ms | 83.2 ms | 8.24 s | 4.38 s | 0.53× |
+| 200 | 45.0 ms | 39.6 ms | 7.87 s | 8.95 s | 1.14× |
+| 500 | 43.7 ms | 24.2 ms | 12.05 s | 21.80 s | 1.81× |
+| 1000 | 43.8 ms | 23.1 ms | 23.07 s | 43.73 s | **1.90×** |
+| **10000** | **45.3 ms** | **20.8 ms** | **207.6 s** | **453.4 s** | **2.18×** |
+
+**GPU breakeven điểm ~K=150**: dưới đó GPU chậm hơn CPU do overhead khởi tạo (upload parsVect, alloc, kernel launch). Trên K≈500 GPU vượt CPU rõ rệt.
+
+**K=10000: GPU tổng thời gian 207s vs CPU 453s → GPU speedup tổng 2.18×.**
+
+### Phân tích
+
+**Tại sao GPU speedup chỉ ~2× thay vì 10×+?**
+- CPU single-loop `_pllComputeRandomizedStepwiseAdditionParsimonyTree` chạy fast (~44ms/tree)
+  nhờ: xPars lazy eval bỏ qua newview cho subtrees đã fresh; CPU cache locality tốt.
+- GPU ~21ms/tree là bottleneck tính toán thực sự (A100 SM saturation với K≥500).
+- Overhead GPU: upload 295 tips × parsVect + alloc + kernel launch ≈ vài giây cố định.
+- Lợi thế GPU không phải tốc độ per-tree mà là **chất lượng**: K=10000 GPU best=6662
+  (sau SPR) vs CPU K=10000 best=6668 (chỉ stepwise+SPR, chưa NNI).
+
+**Tại sao hai-phase code (branch GPU cũ trước fix) chậm ~900ms/tree?**
+
+Branch GPU trung gian dùng cấu trúc hai phase:
+- Phase 1: build tất cả K cây, lưu Newick strings vào `vector<string>`
+- Phase 2: với mỗi cây, gọi `readTreeString(candidateTrees[i])`
+
+Khi Phase 2 xử lý cây i, `pllInst` đang giữ topology của **cây N** (cây cuối build).
+`readTreeString` phải:
+1. `freeNode()` — giải phóng topology hiện tại
+2. `readTree()` — parse Newick và rebuild topology từ đầu
+3. `pllTreeInitTopologyNewick()` — sync PLL topology (O(N))
+
+Ngược lại trong code gốc single-loop, `readTreeString` được gọi ngay sau build — `pllInst`
+đang giữ đúng topology → bước rebuild rất nhẹ, chỉ sync metadata pointer mapping.
+
+Fix: khôi phục single-loop inline registration (branch GPU branch hiện tại đã fix).
+
+### Bài học / Ghi chú cho khóa luận
+
+1. **CPU baseline thực sự ~44ms/tree** — con số "~0.2s/tree" từ trước đó ước tính quá cao.
+   Speedup GPU so với CPU là ~2.2× về tổng thời gian (K=10000), không phải 12×.
+
+2. **Ưu thế GPU chủ yếu là quality, không phải speed**: GPU với K=10000 tìm best=6662
+   (sau SPR) — bằng CPU+NNI-refined. CPU K=10000 serial chỉ cho best=6668.
+   GPU khám phá nhiều starting points hơn trong cùng thời gian → landscape coverage tốt hơn.
+
+3. **readTreeString cost phụ thuộc ngữ cảnh**: Gọi khi pllInst khớp topology → O(N) nhẹ.
+   Gọi khi pllInst có topology khác → O(N) nặng + PLL rebuild. Không thể nhìn code và
+   biết cost mà không biết state của pllInst tại thời điểm gọi.
+
+---
+
 ## Bug #8 — `node_num >= N` trong stepwise addition: cùng lỗi vf vs. num
 
 **Ngày**: 2026-05-11
