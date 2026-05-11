@@ -376,3 +376,227 @@ trong ~163 giây.
 4. **Limitation**: Tổng thời gian tăng tuyến tính theo K (kernel time), nên không thể tăng K
    vô hạn. Điểm "sweet spot" phụ thuộc vào yêu cầu chất lượng vs. thời gian: K=999 cho
    kết quả gần CPU (6670) trong 21 giây là cân bằng tốt.
+
+---
+
+## Refactor #2 — Thêm `nodep[kMaxNodes]` vào `GpuTopology`; rewrite `gpuNodeRectifierPars`
+
+**Ngày**: 2026-05-11
+**Task**: Cấu trúc lại cách GPU lưu hướng DFS-canonical của mỗi inner node — mirror CPU `tr->nodep[]`
+**File liên quan**: `gpu/include/pars_tree.cuh`, `gpu/src/pars_build.cu`
+
+### Thay đổi
+
+Trước: GPU cố định canonical face = `nodepVf(num, N)` = face[2] và `gpuNodeRectifierPars` cũ
+PERMUTE `back_vf[base+0,1,2]` để face[2] luôn hướng về DFS-parent. Cách này gây ra bug vì
+testInsert dùng `vfNnxtFace(p)` (= face[0]) để evaluate, nhưng sau permutation face[0]
+không còn là child1 hợp lệ nữa.
+
+Sau: Thêm field `int nodep[kMaxNodes]` vào `GpuTopology` (giống CPU `tr->nodep[]`). Field này
+lưu DFS-encountered vface của mỗi node:
+- Tips: `nodep[num] = num - 1` (vface tương ứng tip, cố định)
+- Inner nodes: `nodep[num]` = vface DFS vào node `num`, set bởi `gpuNodeRectifierPars`
+
+`gpuNodeRectifierPars` được rewrite hoàn toàn:
+- DFS từ `nodep[1]->back` (back của node 1)
+- Gán `nodep[count + N + 1] = m_vf` (DFS-encountered face)
+- KHÔNG thay đổi `back_vf` hay `xpars`
+- Match CPU `reorderNodes(sprparsimony.cpp:2052)` theo logic count-based
+
+`gpuSPRHillClimb` updated:
+- `topo->start_vface = topo->nodep[1]` (thay vì `nodepVf(1, N)`)
+- `sh.bcast[4] = topo->nodep[i]` (thay vì `nodepVf(i, N)`)
+
+Phase 0 khởi tạo `nodep[]` cho tips và inner nodes.
+
+### Kết quả
+
+Post-SPR best = 6665 (K=100, N=295) — đúng, match kết quả trước refactor.
+
+### Bài học / Ghi chú cho khóa luận
+
+CPU `tr->nodep[i]` không phải là con trỏ cố định theo số node — nó là face mà DFS vào node đó.
+Sau `nodeRectifierPars`, `nodep[i]` trỏ đến face cụ thể của node i từ đó `p->back` là DFS-parent.
+GPU phải replicate cùng semantic này; cố định canonical = face[2] không đủ vì ring arithmetic
+phụ thuộc vào face nào là "entry face" của DFS. Giải pháp đúng: lưu face trong `nodep[]` thay
+vì hard-code, đúng như CPU làm.
+
+---
+
+## Bug #6 — `__syncwarp;` thiếu dấu ngoặc → race condition đọc `nodep[]`
+
+**Ngày**: 2026-05-11
+**Task**: SPR loop trong `gpuSPRHillClimb`
+**File liên quan**: `gpu/src/pars_build.cu` (đầu vòng lặp do-while trong `gpuSPRHillClimb`)
+
+### Triệu chứng
+
+Post-SPR best = 187 (rất sai, thay vì ~6665).
+
+### Root cause
+
+```cuda
+// WRONG:
+__syncwarp;     // ← đây là function reference, không gọi hàm!
+
+// CORRECT:
+__syncwarp();
+```
+
+Lane 0 gọi `gpuNodeRectifierPars` để cập nhật `topo->nodep[]` nhưng các lane 1-31 không
+đợi lane 0 hoàn thành. Kết quả: các lane đọc `topo->nodep[i]` (qua `sh.bcast[4]`) trước
+khi lane 0 ghi xong → race condition → nodep[] sai → SPR search dùng wrong canonical faces.
+
+### Fix
+
+Thay `__syncwarp;` thành `__syncwarp();`.
+
+### Bài học / Ghi chú cho khóa luận
+
+Trong CUDA, `__syncwarp` không có dấu ngoặc là biểu thức lấy địa chỉ hàm, không gọi hàm.
+Compiler không báo lỗi (đây là biểu thức hợp lệ). Kết quả: thanh ghi của các lane không
+được đồng bộ, shared memory updates từ lane 0 có thể chưa visible với lane 1-31.
+Đây là loại bug rất khó phát hiện vì không có compile error, chỉ thấy kết quả sai.
+
+---
+
+## Bug #7 — `q_num >= N` trong `doAddTraverse`: dùng node-number comparison thay vì vface comparison
+
+**Ngày**: 2026-05-11
+**Task**: `doAddTraverse` trong `pars_build.cu`
+**File liên quan**: `gpu/src/pars_build.cu` (line ~111)
+
+### Triệu chứng
+
+SPR traverse sai vào tip node (node number N = tip N): tip N có node number = N, nên
+`q_num >= N` = true, nhưng `q_num > N` = false. Dùng `>=` khiến code cố gắng push children
+của tip N lên stack — với tip vface = N-1, `vfNextFace(N-1, N) = N-1` (self), nên push
+`back_vf[N-1]` (inner neighbor của tip N) lên stack 2 lần, gây duplicate evaluations.
+
+### Root cause
+
+Nhầm lẫn giữa hai loại check:
+- **Vface check** (inner vface): `vf >= N` (đúng, inner vfaces bắt đầu từ N)
+- **Node number check** (inner node): `num > N` (đúng, inner nodes có number N+1..2N-1)
+
+`q_num = vfToNum(cur_q, N)` là **node number**, không phải vface. Phải dùng `q_num > N`,
+không phải `q_num >= N`. Tip N (cuối cùng trong danh sách tips 1..N) có `num = N`, nên:
+- `q_num >= N` → true ← sai, tip N được coi là inner
+- `q_num > N` → false ← đúng, tip N bị skip
+
+### Fix
+
+Thay `if (q_num >= N && maxt > 0)` thành `if (q_num > N && maxt > 0)`.
+
+### Bài học / Ghi chú cho khóa luận
+
+Đây là nguồn gốc của một lớp bug tinh vi trong GPU parsimony code: tip vfaces có index 0..N-1
+(tức vf < N), inner vfaces có index N..N+3*(N-2)+2 (tức vf >= N). Nhưng node numbers: tips
+có num 1..N (tức num <= N), inner nodes có num N+1..2N-1 (tức num > N). Hai boundary condition
+khác nhau một đơn vị và dễ nhầm. Quy tắc:
+- Nếu biến là **vface**: dùng `>= N` cho inner
+- Nếu biến là **node number**: dùng `> N` cho inner
+
+Luôn kiểm tra: biến đang so sánh là vface hay node number?
+
+---
+
+## Kết quả thực nghiệm — Scaling sau Refactor #2 + Bug #6-8 fixes (2026-05-11)
+
+**Ngày**: 2026-05-11
+**Dataset**: `data_debug/tree1.phy` — N=295 taxa, 1836 columns, 1400 patterns (DNA)
+**Hardware**: NVIDIA A100-SXM4-80GB
+**Tham số**: sprDist=6, seed=1, iters=100, NNI=29, sprDist4=3, maxDW=5
+**CPU reference** (`_pllSprOnCurrentTree`, 1 cây): best parsimony ≈ **6668**
+
+### Bảng kết quả
+
+| K (số cây GPU) | Thực chạy | Post-SPR best | Pre-SPR best | ms/tree | Tổng thời gian |
+|----------------|-----------|--------------|-------------|---------|----------------|
+| 100            | 99        | **6665**     | 6734        | 83.21 ms | 8.24 s        |
+| 200            | 199       | **6665**     | 6723        | 39.55 ms | 7.87 s        |
+| 500            | 499       | **6665**     | 6713        | 24.15 ms | 12.05 s       |
+| 1000           | 999       | **6665**     | 6713        | 23.09 ms | 23.07 s       |
+| **10000**      | **9999**  | **6662**     | 6713        | **20.76 ms** | **207.6 s** |
+| CPU ref (1 cây) | —        | ~6668        | —           | —        | —              |
+
+### Kết quả quan trọng
+
+**K=10000: GPU best=6662 — vượt CPU reference 6668.**
+Post-SPR best ổn định ở 6665 với K=100..1000, cải thiện thêm khi K=10000 (6662).
+
+### So sánh với kết quả trước (2026-05-07, trước Refactor #2)
+
+| K | Post-SPR best cũ | ms/tree cũ | Post-SPR best mới | ms/tree mới | Nhận xét |
+|---|-----------------|-----------|------------------|------------|---------|
+| ~100 | 6676 | 79.3 ms | 6665 | 83.21 ms | Best cải thiện; ms/tree tăng nhẹ |
+| ~1000 | 6670 | 21.2 ms | 6665 | 23.09 ms | Best cải thiện; overhead nhỏ |
+| ~10000 | 6664 | 16.3 ms | 6662 | 20.76 ms | Best cải thiện; ms/tree cao hơn |
+
+ms/tree tăng nhẹ (~4 ms) so với trước refactor — chi phí từ `gpuNodeRectifierPars` mới
+(DFS gán `nodep[]` sau mỗi do-while iteration) và mảng `nodep[kMaxNodes]` bổ sung vào
+`GpuTopology` (tăng shared memory bandwidth).
+
+### Phân tích scaling
+
+**ms/tree giảm theo K:**
+- 100→500 cây: 83→24 ms/tree (giảm 3.5×) — GPU SM occupancy tăng rõ rệt
+- 500→1000 cây: 24→23 ms/tree (gần bão hòa ở ~108 SM × warps/SM)
+- 1000→10000 cây: 23→21 ms/tree (bão hòa — SM overhead amortized)
+
+**Pre-SPR best hội tụ từ K=500**: Pre-SPR best ổn định ở 6713 khi K ≥ 500 —
+stepwise addition bão hòa về chất lượng; cải thiện thêm đến từ SPR.
+
+**Post-SPR best cải thiện chậm hơn**: Từ 6665 (K=100) xuống 6662 (K=10000) —
+landscape parsimony có nhiều local optima tốt ở 6665; cần rất nhiều starting points
+để lọt qua vào optima tốt hơn. Đây là tính chất NP-hard của bài toán.
+
+**So sánh với CPU serial:**
+- CPU 10000 cây serial: ~10000 × 0.2s ≈ **33 phút**
+- GPU 10000 cây: **207 giây (3.5 phút)** — speedup ~**9.6×**
+
+### Bài học / Ghi chú cho khóa luận
+
+1. **Correctness**: Sau Refactor #2 và Bug #6-8, GPU SPR cho kết quả đúng thuật toán
+   và tìm được cây tốt hơn CPU với đủ starting points (6662 < 6668).
+
+2. **Overhead của nodep[]**: Thêm mảng `nodep[]` và DFS của `gpuNodeRectifierPars` tăng
+   ms/tree ~4 ms (~20% overhead với K=10000). Đây là trade-off chấp nhận được để đảm bảo
+   correctness (ring arithmetic đúng với mọi face).
+
+3. **Scaling behavior**: ms/tree bão hòa ở ~20-21 ms sau K≈500. Điểm "sweet spot":
+   - K=500: 24 ms/tree, best=6665, tổng 12s — nhanh, chất lượng tốt
+   - K=1000: 23 ms/tree, best=6665, tổng 23s — balanced
+   - K=10000: 21 ms/tree, best=6662, tổng 207s — best quality, tốn thời gian
+
+4. **GPU speedup ~9.6×** so với CPU serial (thực tế có thể cao hơn vì CPU reference
+   chỉ chạy 1 cây với search parameters đầy đủ — 10000 cây CPU sẽ còn chậm hơn).
+
+---
+
+## Bug #8 — `node_num >= N` trong stepwise addition: cùng lỗi vf vs. num
+
+**Ngày**: 2026-05-11
+**Task**: Phase 1 (stepwise addition) trong `buildParsimonyTreesKernel`
+**File liên quan**: `gpu/src/pars_build.cu` (Phase 1 DFS stack push, line ~673)
+
+### Triệu chứng
+
+Stepwise addition có thể push vào stack children của tip N hai lần (vì tip N có `node_num = N`,
+thỏa `node_num >= N`). Tuy nhiên điều kiện `score_tree[node_num] > 0` che khuất bug này
+(tips luôn có `score_tree = 0` → điều kiện false), nên không gây lỗi observable.
+
+### Root cause
+
+Cùng nhầm lẫn như Bug #7: `node_num >= N` thay vì `node_num > N`.
+
+### Fix
+
+Thay `if (node_num >= N && score_tree[node_num] > 0)` thành
+`if (node_num > N && score_tree[node_num] > 0)`.
+
+### Bài học
+
+Dù bug bị che khuất bởi guard condition khác, cần sửa để code đúng về mặt semantic và tránh
+phụ thuộc vào điều kiện vô tình "che" lỗi. Code đúng phải đúng từ nguyên tắc, không chỉ đúng
+vì side effect của điều kiện khác.

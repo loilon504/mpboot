@@ -88,25 +88,35 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     mem->mxtips = mxtips;
     mem->width = width;
     mem->states = states;
-    mem->nodesPerTree = (size_t)(2 * mxtips + 1);  // slot 0 unused, nodes 1..2N
-    mem->parsVectPerTree = mem->nodesPerTree * (size_t)width * (size_t)states;
-    mem->parsScorePerTree = mem->nodesPerTree;
+    mem->nodesPerTree        = (size_t)(2 * mxtips + 1);
+    mem->parsVectPerTree     = mem->nodesPerTree * (size_t)width * (size_t)states;
+    mem->parsScorePerTree    = mem->nodesPerTree;
+    mem->siteWeightsPerTree  = (size_t)width;
 
-    const size_t parsVectBytes = (size_t)K * mem->parsVectPerTree * sizeof(parsimonyNumber);
-    const size_t parsScoreBytes = (size_t)K * mem->parsScorePerTree * sizeof(unsigned int);
-    const size_t topoBytes = (size_t)K * sizeof(GpuTopology);
+    const size_t parsVectBytes      = (size_t)K * mem->parsVectPerTree  * sizeof(parsimonyNumber);
+    const size_t parsScoreBytes     = (size_t)K * mem->parsScorePerTree  * sizeof(unsigned int);
+    const size_t topoBytes          = (size_t)K * sizeof(GpuTopology);
+    const size_t siteWeightsBytes   = (size_t)K * mem->siteWeightsPerTree * sizeof(unsigned int);
 
     printf("[GPU] Allocating parsimony memory for %d trees:\n", K);
     printf("  parsVect  : %.2f MB\n", parsVectBytes / 1048576.0);
     printf("  parsScore : %.2f MB\n", parsScoreBytes / 1048576.0);
     printf("  topologies: %.2f MB\n", topoBytes / 1048576.0);
 
-    CUDA_CHECK(cudaMalloc(&mem->d_parsVect, parsVectBytes));
-    CUDA_CHECK(cudaMalloc(&mem->d_parsScore, parsScoreBytes));
-    CUDA_CHECK(cudaMalloc(&mem->d_topos, topoBytes));
+    CUDA_CHECK(cudaMalloc(&mem->d_parsVect,    parsVectBytes));
+    CUDA_CHECK(cudaMalloc(&mem->d_parsScore,   parsScoreBytes));
+    CUDA_CHECK(cudaMalloc(&mem->d_topos,       topoBytes));
+    CUDA_CHECK(cudaMalloc(&mem->d_siteWeights, siteWeightsBytes));
 
-    CUDA_CHECK(cudaMemset(mem->d_parsVect, 0, parsVectBytes));
-    CUDA_CHECK(cudaMemset(mem->d_parsScore, 0, parsScoreBytes));
+    CUDA_CHECK(cudaMemset(mem->d_parsVect,    0, parsVectBytes));
+    CUDA_CHECK(cudaMemset(mem->d_parsScore,   0, parsScoreBytes));
+    // Init all site weights to 1 (normal, unweighted mode)
+    {
+        unsigned int* h_sw = new unsigned int[(size_t)K * width];
+        for (size_t i = 0; i < (size_t)K * width; ++i) h_sw[i] = 1u;
+        CUDA_CHECK(cudaMemcpy(mem->d_siteWeights, h_sw, siteWeightsBytes, cudaMemcpyHostToDevice));
+        delete[] h_sw;
+    }
 
     return mem;
 }
@@ -130,6 +140,10 @@ void gpuParsimonyMemFree(
     if (mem->d_topos)
     {
         cudaFree(mem->d_topos);
+    }
+    if (mem->d_siteWeights)
+    {
+        cudaFree(mem->d_siteWeights);
     }
     delete mem;
 }

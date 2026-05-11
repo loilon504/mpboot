@@ -29,19 +29,28 @@ Called from `IQTree::initCandidateTreesParsimony()` when `--use_gpu` is passed.
 - Tips 1..N: one vface each, `vf = num - 1`.
 - Inner nodes N+1..2N-1: three vfaces each, `vf = N + 3*(num-N-1) + face_idx`.
 - `face_idx`: GPU face[0], face[1], face[2]. Ring direction: **face[2]→face[1]→face[0]→face[2]**.
-- `nodepVf(num, N)` = canonical face for `tr->nodep[num]` = **GPU face[2]**.
+- `nodepVf(num, N)` = the fixed formula for face[2] of node num (used as default canonical).
+- `topo->nodep[num]` = DFS-canonical vface for node num, set by `gpuNodeRectifierPars`.
+  - Tips: `nodep[num] = num - 1` (fixed).
+  - Inner: DFS-encountered face; analogous to CPU `tr->nodep[num]`.
 - `back_vf[vf]` = the back-neighbor's vface (analogous to PLL's `p->back`).
 
+**Inner node boundary rules** (easy to confuse):
+- By **vface**: inner if `vf >= N` (tips have `vf = 0..N-1`).
+- By **node number**: inner if `num > N` (tips have `num = 1..N`).
+- Never use `vf > N` (misses face[0] of first inner node) or `num >= N` (includes tip N).
+
 **PLL vs GPU face mapping**:
-| PLL name | GPU vface |
-|----------|-----------|
-| `p` = `tr->nodep[i]` = face[0] | GPU face[2] (nodepVf) |
-| `p->next` = face[1] | GPU face[1] |
-| `p->next->next` = face[2] | GPU face[0] |
+| PLL pointer | GPU vface |
+|-------------|-----------|
+| `p` = `tr->nodep[i]` = face[0] | `topo->nodep[i]` (DFS-canonical, any face) |
+| `p->next` = face[1] | `vfNextFace(nodep[i], N)` |
+| `p->next->next` = face[2] | `vfNnxtFace(nodep[i], N)` |
+| `p->back` | `back_vf[nodep[i]]` |
 
 PLL ring direction: face[0]→face[1]→face[2]→face[0].
 GPU ring direction: face[2]→face[1]→face[0]→face[2].
-They agree on face[1]; face[0] and face[2] are swapped.
+Ring arithmetic works for any face p: `vfNextFace(vfNnxtFace(p)) = p`.
 
 **parsVect layout**: `pars_tree[node * width * states + block * states + state]`.
 `score_tree[node]` = accumulated Fitch parsimony for the entire subtree of `node` (from its
@@ -201,7 +210,7 @@ createTiAndEvaluateParsimony(pars_tree, score_tree, topo, sh, p, N, /*full=*/tru
 
 ---
 
-## 4. Current GPU Implementation Status (2026-05-07)
+## 4. Current GPU Implementation Status (2026-05-11)
 
 ### ✅ Fully working
 
@@ -212,9 +221,8 @@ one `__global__` function sharing `BuildShared` shared memory (≈24.8 KB on A10
 
 | K (trees) | Post-SPR best | ms/tree | Total kernel |
 |-----------|--------------|---------|--------------|
-| 99        | 6676         | 79.3 ms | 7.9 s        |
-| 199       | 6671         | 44.9 ms | 9.0 s        |
-| 499       | 6671         | 25.0 ms | 12.5 s       |
+| 100       | 6665         | ~79 ms  | ~7.9 s       |
+| 199       | 6671         | 44.9 ms | ~9.0 s       |
 | 999       | 6670         | 21.2 ms | 21.2 s       |
 | **9999**  | **6664**     | **16.3 ms** | **163 s** |
 | CPU ref (1 tree) | ~6668 | — | — |
@@ -226,42 +234,57 @@ ms/tree saturates at ~16 ms (A100 SM occupancy ceiling). Serial CPU equivalent: 
 
 `buildParsimonyTreesKernel(... sprDist ...)`:
 1. **Phase 0** (lane 0): Fisher-Yates shuffle → `sh.seed`, build 3-tip tree.
+   Init `topo->nodep[]`: tips `nodep[num] = num-1`; inner `nodep[num] = nodepVf(num, N)`.
 2. **Phase 1**: Stepwise addition for tips 4..N. Uses `sh.ti[]` + `computeTraversalInfoParsimony`
    + `newviewParsimony` (xPars-aware). After this, `sh.bestParsimony` = tree parsimony.
-3. **Phase 2**: Set `topo->start_vface = nodepVf(1, N)`.
+3. **Phase 2**: `gpuNodeRectifierPars` — DFS from `nodep[1]->back`, assigns `nodep[N+1..2N-1]`
+   in DFS order (exact face encountered). Sets `topo->start_vface = nodep[1]`.
 4. **Phase 3** (if `sprDist > 0`): SPR hill-climbing.
    - Init: `sh.randomMP = sh.bestParsimony` (from build phase — xPars already consistent).
    - **No `recomputeAllNodes` needed**: xPars flags from build are valid.
    - `do-while randomMP < startMP`:
-     - For i = 1..2N-2: `createTiAndEvaluateParsimony(p, full=true)` (line-2291 equivalent)
-     - P-branch: removeNode → doAddTraverse → restore → createTiAndNewview
-     - Q-branch: same with q
-     - Apply best move if improving
+     - `gpuNodeRectifierPars` — refresh `nodep[]` for current topology
+     - For i = 1..2N-2: `p = nodep[i]`, `q = back_vf[p]`
+       - `createTiAndEvaluateParsimony(p, full=false)` (line-2291 lazy refresh)
+       - P-branch (if p is inner): removeNode(p) → doAddTraverse → restore → newview(p)
+       - Q-branch (if q is inner with inner grandchild): same with q
+       - Apply best move if improving
+
+### `gpuNodeRectifierPars` semantics
+
+GPU equivalent of CPU `nodeRectifierPars + reorderNodes` (sprparsimony.cpp:2089):
+- DFS from `back_vf[nodep[1]]` using `sh.tiStack`
+- For each inner node M encountered via vface `m_vf`:
+  - `topo->nodep[count + N + 1] = m_vf` (exact DFS-encountered face)
+- Does NOT touch `xpars[]` or `back_vf[]` — pure nodep[] assignment
+- After call: `nodep[i]` ≡ CPU `tr->nodep[i]` — `back_vf[nodep[i]]` = DFS-parent direction
 
 ### Key design decisions
 
+- **`topo->nodep[]`** — stores DFS-canonical vface per node, mirrors CPU `tr->nodep[]`.
+  Before (old approach): `gpuNodeRectifierPars` permuted `back_vf[]` to force canonical = face[2].
+  After (new approach): stores whatever face DFS encountered, without touching `back_vf[]`.
 - **`SprShared` removed** — `BuildShared` now holds all fields for both phases.
-- **`sh.seed` shared** — build sets it via `sh.seed = d_seeds[k]`; SPR inherits it directly.
 - **`sh.randomMP` init** — set from `sh.bestParsimony` (last build insertion score) instead of
   calling `recomputeAllNodes`. Valid because xPars flags are already consistent after build.
-- **`sh.stack[]` reused** — build DFS stack reused as SPR addTraverse stackVf (sequential phases).
 - **`gpuSprKernel` removed** — `gpu_spr.cu` now contains only a no-op `gpuSprBuildTrees` stub.
 - **Pipeline steps [5]+[6] merged** → single call `gpuStepwiseBuildTrees(mem, seeds, sprDist, stream)`.
 
-### Fixed bugs
+### Fixed bugs (cumulative)
 
 | Bug | Status |
 |-----|--------|
 | #A `testInsert`: `vfNnxtFace(q,N)` → `vfNnxtFace(p,N)` (crash) | ✅ Fixed |
 | #B `sh.randomMP` uninitialized (wrong SPR threshold) | ✅ Fixed (use bestParsimony) |
 | #C Missing `__syncwarp()` in `createTiAndEvaluateParsimony` | ✅ Fixed |
+| #6 `__syncwarp;` missing `()` in SPR loop (race on nodep[]) | ✅ Fixed 2026-05-11 |
+| #7 `q_num >= N` in `doAddTraverse` (should be `> N`) | ✅ Fixed 2026-05-11 |
+| #8 `node_num >= N` in stepwise DFS (should be `> N`) | ✅ Fixed 2026-05-11 |
 
 ### Open issues
 
-- **Bug #C DFS off-by-one**: `recomputeAllNodes` (now unused) processed 293/294 nodes due to
-  last inner node having `back_vf = -1`. No longer blocks correctness because we don't use
-  `recomputeAllNodes` for SPR init. Root cause (last node of build not fully hookup'd) may
-  still exist but has no observable impact.
+- **Build DFS off-by-one**: last inner node (2N-1) may have `back_vf[face[0]] = -1` after build.
+  No observable impact because `gpuNodeRectifierPars` DFS stops at leaves (vf < N check).
 
 ---
 

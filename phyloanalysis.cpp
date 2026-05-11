@@ -1270,7 +1270,6 @@ int initCandidateTreeSet(Params &params, IQTree &iqtree, int numInitTrees) {
     int nni_count = 0;
     int nni_steps = 0;
     int numDup = 0;
-	numInitTrees = 100;
     cout << "Generating " << numInitTrees - 1 << " parsimony trees... ";
     cout.flush();
     double startTime = getCPUTime();
@@ -1750,12 +1749,6 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
     	iqtree.initializePLL(params);
     }
 
-	// /********************* Init constant data for PLL in Gpu *******************/
-	// if (params.use_gpu) {
-	// 	mpbootgpu::newviewGpuInit(iqtree.pllInst, iqtree.pllPartitions);
-	// }
-
-
     /********************* Compute pairwise distances *******************/
     if (params.start_tree == STT_BIONJ || params.iqp || params.leastSquareBranch) {
     	computeInitialDist(params, iqtree, dist_file);
@@ -1870,7 +1863,6 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
                 << getCPUTime() - initTime << endl << endl;
 	}
 	exit(0);
-
 
     if (params.leastSquareNNI) {
     	iqtree.computeSubtreeDists();

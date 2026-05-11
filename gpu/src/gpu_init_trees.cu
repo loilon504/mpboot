@@ -100,16 +100,25 @@ int gpuInitCandidateTrees(
         return ms;
     };
 
-    // ── [5+6] Joined kernel: stepwise-addition + SPR ─────────────────────────
+    // ── [5+6+7] Joined kernel: build + initial SPR + iterative NNI+SPR ─────────
+    // Phase 4 params
+    const int numNNI        = (mxtips > 4) ? (mxtips - 3) / 10 : 1;
+    const int numSearchIter = 100;
+    const int sprDist4      = min(3, params.sprDist);  // Opt 2: smaller radius for Phase 4
+    const int maxDoWhile    = 5;                       // Opt 3: cap do-while passes
+
     float build_ms = ev_time(
         [&]
         {
-            gpuStepwiseBuildTrees(mem, seeds.data(), params.sprDist, stream);
+            gpuStepwiseBuildTrees(mem, seeds.data(), params.sprDist, sprDist4,
+                                  numSearchIter, numNNI, maxDoWhile, stream);
         }
     );
     printf(
-        "[GPU]   [5+6] GPU kernel (build+SPR):     %.1f ms  (%d trees, %.2f ms/tree)\n",
-        (double)build_ms, K, K > 0 ? (double)build_ms / K : 0.0
+        "[GPU]   [5+6+7] GPU kernel (build+SPR+search): %.1f ms  (%d trees, %.2f ms/tree)"
+        "  [iters=%d NNI=%d sprDist4=%d maxDW=%d]\n",
+        (double)build_ms, K, K > 0 ? (double)build_ms / K : 0.0,
+        numSearchIter, numNNI, sprDist4, maxDoWhile
     );
 
     // ── [6b] Pre/post-SPR parsimony summary ──────────────────────────────────
@@ -121,14 +130,26 @@ int gpuInitCandidateTrees(
             GpuTopology h_topo_tmp;
             downloadTopology(mem, k, &h_topo_tmp, stream);
             cudaStreamSynchronize(stream);
-            if (h_topo_tmp.preSprParsimony < best_pre)  best_pre   = h_topo_tmp.preSprParsimony;
-            if (h_topo_tmp.preSprParsimony > worst_pre)  worst_pre  = h_topo_tmp.preSprParsimony;
-            if (h_topo_tmp.bestParsimony   < best_post)  best_post  = h_topo_tmp.bestParsimony;
-            if (h_topo_tmp.bestParsimony   > worst_post) worst_post = h_topo_tmp.bestParsimony;
+            if (h_topo_tmp.preSprParsimony < best_pre)
+            {
+                best_pre = h_topo_tmp.preSprParsimony;
+            }
+            if (h_topo_tmp.preSprParsimony > worst_pre)
+            {
+                worst_pre = h_topo_tmp.preSprParsimony;
+            }
+            if (h_topo_tmp.bestParsimony < best_post)
+            {
+                best_post = h_topo_tmp.bestParsimony;
+            }
+            if (h_topo_tmp.bestParsimony > worst_post)
+            {
+                worst_post = h_topo_tmp.bestParsimony;
+            }
         }
         if (params.sprDist > 0)
         {
-            printf("[GPU]   [6b] Pre-SPR  parsimony: best=%u  worst=%u\n", best_pre,  worst_pre);
+            printf("[GPU]   [6b] Pre-SPR  parsimony: best=%u  worst=%u\n", best_pre, worst_pre);
             printf("[GPU]   [6b] Post-SPR parsimony: best=%u  worst=%u\n", best_post, worst_post);
         }
         else

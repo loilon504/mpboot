@@ -1792,7 +1792,6 @@ double IQTree::doTreeSearch() {
 					curScore = pllInst->likelihood;
 					perturbScore = curScore;
 				} else {
-                    // cout << "   optimizeAllBranches\n";
 					initializeAllPartialLh();
 					clearAllPartialLH();
 					if (isSuperTree()) {

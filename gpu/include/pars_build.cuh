@@ -5,16 +5,20 @@
 namespace mpbootgpu
 {
 
-// Run stepwise-addition + SPR hill-climbing for all K trees in parallel.
-// seeds[k]  = PLL-compatible randomNumberSeed for tree k (also used as SPR RNG).
-// sprDist   = SPR radius; pass 0 to skip SPR (build only).
-// On return:
-//   mem->d_topos[k].bestParsimony    — post-SPR best parsimony
-//   mem->d_topos[k].preSprParsimony  — pre-SPR full-tree parsimony (set when sprDist>0)
+// Run stepwise-addition + SPR + iterative NNI+SPR search for all K trees.
+// sprDist      = SPR radius for Phase 3 (initial SPR after build)
+// sprDist4     = SPR radius for Phase 4 outer NNI+ratchet iterations (Opt 2: smaller)
+// numSearchIter = outer NNI+ratchet iterations (Phase 4)
+// numNNI       = NNI moves per odd outer iteration
+// maxDoWhile   = max do-while passes per SPR call (Opt 3: cap convergence)
 void gpuStepwiseBuildTrees(
     GpuParsimonyMem* mem,
-    const long*      seeds,   // host array [K]
+    const long*      seeds,
     int              sprDist,
+    int              sprDist4,
+    int              numSearchIter,
+    int              numNNI,
+    int              maxDoWhile,
     cudaStream_t     stream
 );
 

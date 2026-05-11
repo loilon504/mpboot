@@ -3358,41 +3358,6 @@ void _pllComputeRandomizedStepwiseAdditionParsimonyTree(pllInstance * tr, partit
 	doing_stepwise_addition = false;
 }
 
-// SPR hill-climbing only, on whatever topology is already in tr.
-// Allocates parsimony data internally; caller must NOT pre-allocate.
-void _pllSprOnCurrentTree(pllInstance * tr, partitionList * pr, int sprDist, IQTree *_iqtree)
-{
-	iqtree = _iqtree;
-	_allocateParsimonyDataStructures(tr, pr, PLL_FALSE);
-
-	nodeRectifierPars(tr);
-	tr->bestParsimony = evaluateParsimony(tr, pr, tr->start, PLL_TRUE, PLL_FALSE);
-
-	unsigned int randomMP = tr->bestParsimony;
-	unsigned int startMP;
-	unsigned int bestIterationScoreHits = 1;
-
-	do {
-		startMP = randomMP;
-		nodeRectifierPars(tr);
-		for (int i = 1; i <= tr->mxtips + tr->mxtips - 2; i++) {
-			tr->removeNode = tr->insertNode = NULL;
-			bestTreeScoreHits = 1;
-			rearrangeParsimony(tr, pr, tr->nodep[i], 1, sprDist, PLL_FALSE, PLL_FALSE);
-			if (tr->bestParsimony == randomMP) bestIterationScoreHits++;
-			if (tr->bestParsimony < randomMP)  bestIterationScoreHits = 1;
-			if (((tr->bestParsimony < randomMP) ||
-				 ((tr->bestParsimony == randomMP) &&
-				  (random_double() <= 1.0 / bestIterationScoreHits))) &&
-				tr->removeNode && tr->insertNode) {
-				restoreTreeRearrangeParsimony(tr, pr, PLL_FALSE);
-				randomMP = tr->bestParsimony;
-			}
-		}
-	} while (randomMP < startMP);
-
-	_pllFreeParsimonyDataStructures(tr, pr);
-}
 
 /**
  * DTH: optimize whatever tree is stored in tr by parsimony SPR
