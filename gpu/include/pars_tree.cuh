@@ -135,6 +135,12 @@ struct alignas(
     long long t_apply;       // Phase 3 SPR: applyMove
     int n_apply;             // number of moves applied
     int n_dowhile;           // number of do-while passes
+    // testInsert sub-timing (Phase 3 even iters, block 0 lane 0 only)
+    long long t_ti_newview;    // createTiAndNewviewParsimony inside testInsert
+    long long t_ti_eval;       // createTiAndEvaluateParsimony inside testInsert
+    int n_testInsert;          // total testInsert calls
+    int n_ti_newview_size;     // total nodes traversed in newview (tiSize/3)
+    int n_ti_eval_size;        // total nodes traversed in eval (tiSize/3)
 };
 
 // ─── Host API ─────────────────────────────────────────────────────────────────

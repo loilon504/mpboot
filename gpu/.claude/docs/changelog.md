@@ -781,3 +781,113 @@ CPU reference (1 tree, serial): best ≈ 6668
 
 5. **So với CPU**: GPU K=99 trees best=6662 tốt hơn CPU single-tree best≈6668 (seed=1).
 
+---
+
+## Optimization #1 — `testInsert` pre-refresh: loại bỏ Fitch step dư thừa cho remove node
+
+**Ngày**: 2026-05-12
+**Task**: Tối ưu hóa `testInsert` trong `gpu/src/pars_build.cu` (Phase 3 SPR hill-climbing)
+**File liên quan**: `gpu/src/pars_build.cu` (hàm `testInsert`, ~line 45-104)
+
+### Phân tích root cause
+
+Timing instrumentation (N=295, sprDist=3, K=99, 5 even iters) cho thấy:
+
+```
+[TIMING k=0] testInsert avg traversal: newview=2.51 nodes  eval=1.00 nodes
+```
+
+`testInsert` gọi hai bước liên tiếp:
+
+| Bước | Hàm | Mục đích | Cost |
+|------|-----|---------|------|
+| 1 | `createTiAndNewviewParsimony(p, face[2])` | (A) refresh q/r nếu stale; (B) tính parsVect[p] từ face[2] | 2.51 node/call |
+| 2 | `createTiAndEvaluateParsimony(face[0], lazy)` | tính parsVect[p] từ face[0] + evaluate tại edge | 1.00 node/call |
+
+**Lãng phí**: Bước 1 tính `parsVect[p_num]` từ face[2], nhưng bước 2 lập tức ghi đè bằng tính từ face[0].
+Một Fitch step (1.00 node) là hoàn toàn dư thừa — không được dùng đến.
+
+Trong 2.51 node trung bình của bước 1:
+- ~1.51 node: traverse subtree của cur_q và r (cần thiết — refresh xPars)
+- ~1.00 node: tính parsVect[p] từ face[2] (lãng phí)
+
+### Fix: Pre-refresh block thay thế bước 1
+
+Thay bước 1 bằng **pre-refresh block** chỉ refresh q, r_vf, và `tip_p = back_vf[p]` (3 children
+mà step 2 cần fresh), mà KHÔNG tính parsVect[p] từ face[2]:
+
+```cpp
+if (lane == 0) {
+    const int r_vf     = sh.bcast[0];
+    const int tip_p_vf = topo->back_vf[p];  // back của remove node, không đổi khi hookup
+    sh.tiSize = 3;
+    if (q >= N && !topo->xpars[q])          computeTraversalInfoParsimony(q);
+    if (r_vf >= N && !topo->xpars[r_vf])    computeTraversalInfoParsimony(r_vf);
+    if (tip_p_vf >= N && !topo->xpars[tip_p_vf]) computeTraversalInfoParsimony(tip_p_vf);
+}
+__syncwarp();
+if (sh.tiSize > 3) newviewParsimony(..., evaluate=false);
+if (lane == 0) {
+    topo->xpars[q] = 1;
+    topo->xpars[r_vf] = 1;
+    topo->xpars[tip_p_vf] = 1;
+    topo->xpars[vfNnxtFace(p, N)] = 0;  // buộc step 2 tính lại p từ face[0]
+}
+```
+
+### Bug tìm được trong quá trình fix: `tip_p` degradation
+
+**Triệu chứng**: Sau khi áp dụng pre-refresh (chỉ refresh q và r_vf, chưa có tip_p), eval_size tăng lên 1.72 thay vì 1.00 mong đợi.
+
+**Root cause**: Trong `createTiAndEvaluateParsimony(face0, lazy)` (step 2), face0 cần tính:
+```
+parsVect[p_num] = Fitch(parsVect[tip_p_num], parsVect[q_num])
+```
+`face0`'s children (theo vface ring) là:
+- `back_vf[vfNextFace(face0)]` = `back_vf[p_vf]` = **tip_p**
+- `back_vf[vfNnxtFace(face0)]` = **q** (sau hookup)
+
+Nếu `xpars[tip_p_vf] = 0` (stale), `computeTraversalInfoParsimony(face0)` sẽ push tip_p vào stack → traverse thêm một node → eval_size = 2.
+
+**Tại sao tip_p bị stale?** Code cũ (bước 1 = `createTiAndNewviewParsimony(p, face[2])`) vô tình duy trì xpars[tip_p] = 1 thông qua cơ chế xPars move: mỗi lần bước 1 chạy, nó traverse từ face[2] với children là cur_q và r_vf (sau hookup), và xPars move logic di chuyển xpars vào face[2], gián tiếp giữ xpars[tip_p] không bị degrade. Bỏ bước 1 mà không thêm refresh tip_p → tip_p dần degraded sau hàng nghìn calls.
+
+**Fix**: Thêm `tip_p_vf = back_vf[p]` vào pre-refresh block (refresh nếu stale, set xpars=1 sau đó).
+
+### Pitfall: `if (log)` gây regression 48%
+
+Khi cleanup debug code, cấu trúc step 2 được đổi thành:
+```cpp
+if (log) { /* inlined step 2 */ }
+else     { mp = createTiAndEvaluateParsimony(...); }
+```
+
+**Kết quả**: search time tăng từ 5.5B → 9.4B cyc (+48%). Dù `log` là warp-uniform (block 0 = true, các block khác = false), CUDA compiler vẫn sinh code cho CẢ HAI nhánh vì nó không biết giá trị runtime của `log`. Điều này gây:
+1. Tăng I-cache pressure do code lớn hơn
+2. Register allocation kém hơn do compiler cần giữ biến qua 2 nhánh
+
+**Fix**: Luôn dùng inline cho step 2 (không dùng `if/else` trên `log`); chỉ guard phần timing accumulation bằng `if (log)`.
+
+**Bài học**: Trong CUDA, `if (runtime_flag) { path_A } else { path_B }` — ngay cả khi `runtime_flag` uniform trong warp — vẫn có thể gây regression do compiler không biết tại compile time. Nếu cả hai nhánh làm cùng tính toán cơ bản (chỉ khác phần debug), luôn inline phần chung và guard phần debug.
+
+### Kết quả
+
+**Timing** (N=295, sprDist=3, K=99, 5 even iters Phase 3):
+
+| Metric | Trước (bước 1 cũ) | Sau (pre-refresh) | Δ |
+|--------|-------------------|-------------------|---|
+| newview nodes/call | 2.51 | **1.72** | −31% |
+| eval nodes/call | 1.00 | **1.00** ✓ | 0% |
+| Phase3 SPR search | 8.296B cyc | **~5.5B cyc** | **−34%** |
+
+**Correctness**: post-hc best parsimony = 6662 ✓ (không thay đổi, đúng với nhiều seeds).
+
+### Bài học / Ghi chú cho khóa luận
+
+1. **Xác định lãng phí bằng timing instrumentation**: Đo `n_ti_newview_size / n_testInsert` (avg newview traversal) và `n_ti_eval_size / n_testInsert` (avg eval traversal) cho thấy rõ 1.00 node dư thừa trong newview. Timing chi tiết per-step (t_ti_newview, t_ti_eval) xác nhận phân bổ chi phí.
+
+2. **xPars invariant phải maintained cho tất cả children của face cần evaluate**: Khi tối ưu bằng cách bỏ một bước, phải kiểm tra kỹ xem bước đó có "side-effect" nào duy trì invariant. Ở đây bước 1 vô tình duy trì xpars[tip_p]=1; bỏ nó mà không thêm refresh tip_p phá vỡ invariant.
+
+3. **CUDA compiler divergence với uniform boolean**: `if (uniform_flag)` vẫn có thể gây performance regression. Cách an toàn: inlining code chung, guard debug code bằng `if (flag)`.
+
+4. **Children của face[0] trong testInsert**: face0 = `vfNnxtFace(p, N)`. Children = `back_vf[vfNextFace(face0)]` = tip_p và `back_vf[vfNnxtFace(face0)]` = q. Cả hai phải fresh (xpars=1) trước khi step 2 chạy. Đây là điều kiện cần thiết để eval_size = 1.00.
+

@@ -27,7 +27,8 @@ __device__ void testInsert(
     int N,
     int width,
     int states,
-    int lane
+    int lane,
+    bool log = false
 )
 {
     if (lane == 0)
@@ -38,11 +39,69 @@ __device__ void testInsert(
     }
     __syncwarp();
 
-    createTiAndNewviewParsimony(pars_tree, score_tree, topo, sh, p, N, width, states, lane);
-    unsigned int mp = createTiAndEvaluateParsimony(
-        pars_tree, score_tree, topo, sh, vfNnxtFace(p, N), N, false, width, states
-    );
+    long long _t0 = 0LL, _t1 = 0LL;
+    if (log) _t0 = clock64();
+
+    // Pre-refresh: refresh q, r, and tip_p subtrees WITHOUT computing parsVect[p] from face[2].
+    // face0's children (for step 2) are tip_p and q — both must be fresh (xpars=1).
+    // Without tip_p refresh, it degrades to xpars=0 across iterations → extra eval traversal.
+    if (lane == 0)
+    {
+        const int r_vf     = sh.bcast[0];
+        const int tip_p_vf = topo->back_vf[p];   // back of remove node, unchanged by hookup
+        sh.tiSize = 3;
+        if (q >= N && !topo->xpars[q])
+            computeTraversalInfoParsimony(topo, sh, q, N, false);
+        if (r_vf >= N && !topo->xpars[r_vf])
+            computeTraversalInfoParsimony(topo, sh, r_vf, N, false);
+        if (tip_p_vf >= N && !topo->xpars[tip_p_vf])
+            computeTraversalInfoParsimony(topo, sh, tip_p_vf, N, false);
+    }
     __syncwarp();
+    if (sh.tiSize > 3)
+        newviewParsimony(pars_tree, score_tree, sh, false, width, states);
+    if (lane == 0)
+    {
+        if (q >= N)             topo->xpars[q]           = 1;
+        if (sh.bcast[0] >= N)   topo->xpars[sh.bcast[0]] = 1;
+        const int tip_p_vf = topo->back_vf[p];
+        if (tip_p_vf >= N)      topo->xpars[tip_p_vf]   = 1;
+        topo->xpars[vfNnxtFace(p, N)] = 0;  // force step 2 to recompute p from face0
+    }
+    __syncwarp();
+
+    if (log)
+    {
+        _t1 = clock64();
+        sh.t_ti_newview += _t1 - _t0;
+        sh.n_ti_newview_size += (sh.tiSize - 3) / 3;
+    }
+
+    // Step 2: evaluate parsimony at edge (face0, r). Always inlined to avoid if/else divergence.
+    const int face0_ev = vfNnxtFace(p, N);
+    unsigned int mp;
+    {
+        if (lane == 0)
+        {
+            const int r_vf_ev = topo->back_vf[face0_ev];
+            sh.tiSize = 3;
+            sh.ti[1] = vfToNum(face0_ev, N);
+            sh.ti[2] = vfToNum(r_vf_ev, N);
+            if (face0_ev >= N && !topo->xpars[face0_ev])
+                computeTraversalInfoParsimony(topo, sh, face0_ev, N, false);
+            if (r_vf_ev >= N && !topo->xpars[r_vf_ev])
+                computeTraversalInfoParsimony(topo, sh, r_vf_ev, N, false);
+        }
+        __syncwarp();
+        mp = newviewParsimony(pars_tree, score_tree, sh, true, width, states);
+    }
+
+    if (log)
+    {
+        sh.t_ti_eval += clock64() - _t1;
+        sh.n_ti_eval_size += (sh.tiSize - 3) / 3;
+        sh.n_testInsert++;
+    }
 
     if (lane == 0)
     {
@@ -78,7 +137,8 @@ __device__ void doAddTraverse(
     int N,
     int width,
     int states,
-    int lane
+    int lane,
+    bool log = false
 )
 {
     if (lane == 0)
@@ -105,7 +165,7 @@ __device__ void doAddTraverse(
 
         if (mint <= 0)
         {
-            testInsert(pars_tree, score_tree, topo, sh, p, cur_q, N, width, states, lane);
+            testInsert(pars_tree, score_tree, topo, sh, p, cur_q, N, width, states, lane, log);
         }
 
         if (q_num > N && maxt > 0)
@@ -281,22 +341,22 @@ __device__ void gpuSPRHillClimb(
                     {
                         doAddTraverse(
                             pars_tree, score_tree, topo, sh, p, back_vf[vfNextFace(p1, N)], 1,
-                            sprDist, N, width, states, lane
+                            sprDist, N, width, states, lane, log
                         );
                         doAddTraverse(
                             pars_tree, score_tree, topo, sh, p, back_vf[vfNnxtFace(p1, N)], 1,
-                            sprDist, N, width, states, lane
+                            sprDist, N, width, states, lane, log
                         );
                     }
                     if (p2 >= N)
                     {
                         doAddTraverse(
                             pars_tree, score_tree, topo, sh, p, back_vf[vfNextFace(p2, N)], 1,
-                            sprDist, N, width, states, lane
+                            sprDist, N, width, states, lane, log
                         );
                         doAddTraverse(
                             pars_tree, score_tree, topo, sh, p, back_vf[vfNnxtFace(p2, N)], 1,
-                            sprDist, N, width, states, lane
+                            sprDist, N, width, states, lane, log
                         );
                     }
                     if (log)
@@ -350,22 +410,22 @@ __device__ void gpuSPRHillClimb(
                     {
                         doAddTraverse(
                             pars_tree, score_tree, topo, sh, q, back_vf[vfNextFace(q1, N)], 2,
-                            sprDist, N, width, states, lane
+                            sprDist, N, width, states, lane, log
                         );
                         doAddTraverse(
                             pars_tree, score_tree, topo, sh, q, back_vf[vfNnxtFace(q1, N)], 2,
-                            sprDist, N, width, states, lane
+                            sprDist, N, width, states, lane, log
                         );
                     }
                     if (q2 >= N)
                     {
                         doAddTraverse(
                             pars_tree, score_tree, topo, sh, q, back_vf[vfNextFace(q2, N)], 2,
-                            sprDist, N, width, states, lane
+                            sprDist, N, width, states, lane, log
                         );
                         doAddTraverse(
                             pars_tree, score_tree, topo, sh, q, back_vf[vfNnxtFace(q2, N)], 2,
-                            sprDist, N, width, states, lane
+                            sprDist, N, width, states, lane, log
                         );
                     }
                     if (log)
@@ -558,6 +618,8 @@ __global__ void buildParsimonyTreesKernel(
         sh.t_apply = 0;
         sh.n_apply = 0;
         sh.n_dowhile = 0;
+        sh.t_ti_newview = sh.t_ti_eval = 0;
+        sh.n_testInsert = sh.n_ti_newview_size = sh.n_ti_eval_size = 0;
 
         for (int i = 1; i <= N; i++)
         {
@@ -733,6 +795,8 @@ __global__ void buildParsimonyTreesKernel(
         sh.t_p3_nni = sh.t_p3_nni_spr = sh.t_p3_ratchet = 0;
         sh.n_p3_even = sh.n_p3_odd = 0;
         sh.t_line2291 = sh.t_search = sh.t_apply = sh.n_apply = sh.n_dowhile = 0;
+        sh.t_ti_newview = sh.t_ti_eval = 0;
+        sh.n_testInsert = sh.n_ti_newview_size = sh.n_ti_eval_size = 0;
     }
     __syncwarp();
 
@@ -843,13 +907,17 @@ __global__ void buildParsimonyTreesKernel(
     if (k == 0 && lane == 0)
     {
         long long t_spr_total = sh.t_line2291 + sh.t_search + sh.t_apply;
+        long long t_ti_total = sh.t_ti_newview + sh.t_ti_eval;
         printf(
             "[TIMING k=0] Phase1 build=%lld cyc\n"
             "[TIMING k=0] Phase2 initial-SPR=%lld cyc\n"
             "[TIMING k=0] Phase3 NNI+SPR (%d iters): nni_setup=%lld cyc  spr=%lld cyc\n"
             "[TIMING k=0] Phase3 Ratchet  (%d iters): total=%lld cyc\n"
             "[TIMING k=0] Phase3 SPR breakdown: line2291=%lld (%.1f%%)  search=%lld (%.1f%%)"
-            "  apply=%lld (%.1f%%)  moves=%d  dowhile=%d\n",
+            "  apply=%lld (%.1f%%)  moves=%d  dowhile=%d\n"
+            "[TIMING k=0] testInsert (%d calls): newview=%lld (%.1f%%)  eval=%lld (%.1f%%)"
+            "  total_ti=%lld vs search=%lld\n"
+            "[TIMING k=0] testInsert avg traversal: newview=%.2f nodes  eval=%.2f nodes\n",
             sh.t_build,
             sh.t_phase2,
             sh.n_p3_even, sh.t_p3_nni, sh.t_p3_nni_spr,
@@ -857,7 +925,13 @@ __global__ void buildParsimonyTreesKernel(
             sh.t_line2291, t_spr_total > 0 ? 100.0 * sh.t_line2291 / t_spr_total : 0.0,
             sh.t_search,  t_spr_total > 0 ? 100.0 * sh.t_search  / t_spr_total : 0.0,
             sh.t_apply,   t_spr_total > 0 ? 100.0 * sh.t_apply   / t_spr_total : 0.0,
-            sh.n_apply, sh.n_dowhile
+            sh.n_apply, sh.n_dowhile,
+            sh.n_testInsert,
+            sh.t_ti_newview, t_ti_total > 0 ? 100.0 * sh.t_ti_newview / t_ti_total : 0.0,
+            sh.t_ti_eval,    t_ti_total > 0 ? 100.0 * sh.t_ti_eval    / t_ti_total : 0.0,
+            t_ti_total, sh.t_search,
+            sh.n_testInsert > 0 ? (float)sh.n_ti_newview_size / sh.n_testInsert : 0.0f,
+            sh.n_testInsert > 0 ? (float)sh.n_ti_eval_size    / sh.n_testInsert : 0.0f
         );
     }
 }

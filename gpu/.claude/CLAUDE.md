@@ -258,7 +258,7 @@ createTiAndEvaluateParsimony(pars_tree, score_tree, topo, sh, p, N, /*full=*/tru
 
 ---
 
-## 4. Current GPU Implementation Status (2026-05-11)
+## 4. Current GPU Implementation Status (2026-05-12)
 
 ### ✅ Fully working
 
@@ -277,6 +277,35 @@ one `__global__` function sharing `BuildShared` shared memory (≈24.8 KB on A10
 
 **K=9999: GPU best=6664 beats CPU reference 6668.** ✅
 ms/tree saturates at ~16 ms (A100 SM occupancy ceiling). Serial CPU equivalent: ~33 min → GPU speedup ~12×.
+
+### ✅ testInsert optimization (2026-05-12)
+
+**Optimization**: `testInsert` pre-refresh — eliminate redundant Fitch step for remove node `p`.
+
+**Root cause**: Old `testInsert` called `createTiAndNewviewParsimony(p, face[2])` then
+`createTiAndEvaluateParsimony(face[0])`. Step 1 computed `parsVect[p_num]` from face[2], which
+was immediately overwritten by step 2's computation from face[0]. That 1 Fitch step was pure waste.
+
+**Fix**: Replace step 1 with a pre-refresh that:
+- Refreshes q, r_vf, and `tip_p = back_vf[p]` subtrees if stale (these are face[0]'s children)
+- Does NOT compute parsVect[p] from face[2] (skips the wasted Fitch step)
+- Explicitly sets `xpars[q]=1`, `xpars[r_vf]=1`, `xpars[tip_p]=1` after refresh
+- Sets `xpars[face[0]]=0` to force step 2 to recompute p from face[0]
+
+**Bug found during fix**: `tip_p = back_vf[p]` (face0's child) degrades to `xpars=0` across
+many testInsert calls if not refreshed. Without it: eval_size=1.72 (extra traversal). With it: eval_size=1.00.
+
+**Pitfall**: Using `if (log) { inline } else { createTiAndEvaluateParsimony }` for step 2 caused
+a 48% regression. The compiler generates both branches even though `log` is warp-uniform at runtime.
+Fix: always use inline for step 2; only guard timing accumulation with `if (log)`.
+
+**Results** (N=295, sprDist=3, K=99, gpu_hc_iter=10, 5 even iters):
+
+| Metric | Before (old step 1) | After (pre-refresh) | Δ |
+|--------|---------------------|---------------------|---|
+| newview nodes/call | 2.51 | 1.72 | −31% |
+| eval nodes/call | 1.00 | 1.00 | 0% |
+| t_search (Phase3 NNI+SPR) | 8.296B cyc | ~5.5B cyc | **−34%** |
 
 ### Joined kernel structure (pars_build.cu)
 
