@@ -891,3 +891,143 @@ else     { mp = createTiAndEvaluateParsimony(...); }
 
 4. **Children của face[0] trong testInsert**: face0 = `vfNnxtFace(p, N)`. Children = `back_vf[vfNextFace(face0)]` = tip_p và `back_vf[vfNnxtFace(face0)]` = q. Cả hai phải fresh (xpars=1) trước khi step 2 chạy. Đây là điều kiện cần thiết để eval_size = 1.00.
 
+---
+
+## Bug #9 — `bestParsimony` báo score tốt hơn `Current best score` do topology drift
+
+**Ngày**: 2026-05-12
+**Task**: Benchmark 115 dataset → so sánh CPU/GPU → phát hiện discrepancy
+**File liên quan**: `gpu/src/pars_build.cu`, `gpu/src/gpu_init_trees.cu`, `gpu/include/pars_tree.cuh`
+
+### Triệu chứng
+
+Trong 14/115 dataset benchmark, log GPU in ra:
+```
+[GPU]   [6b] Post-Hillclimbing parsimony: best=2938  worst=3007
+Current best score: 2941 / CPU time: 5
+```
+`Post-Hillclimbing best` (2938) nhỏ hơn (tốt hơn) `Current best score` (2941). Delta: −1 đến −46 units.
+Hướng lệch luôn nhất quán: post-HC luôn tốt hơn hoặc bằng final score, không bao giờ ngược lại.
+
+### Root cause — Topology Drift
+
+Hai luồng dữ liệu hoàn toàn tách biệt:
+
+**1. `topo->bestParsimony` — historical minimum** (`pars_build.cu:899-901`):
+```cpp
+// Cuối mỗi Phase 3 iteration:
+if (lane == 0 && sh.randomMP < topo->bestParsimony)
+    topo->bestParsimony = sh.randomMP;  // lưu score tốt nhất từ trước đến nay
+```
+
+**2. `downloadTopology` — tải end-state** (`gpu_init_trees.cu:161`):
+```cpp
+downloadTopology(mem, i, &h_topo, stream);  // tải back_vf[] cuối iteration cuối cùng
+```
+
+**3. Bước `[6b]`** đọc `h_topo_tmp.bestParsimony` cho tất cả K trees → in "Post-Hillclimbing best=2938"
+(đây là minimum thực sự tìm được trong toàn bộ Phase 3).
+
+**4. CPU re-score end-state topology từ đầu** (`phyloanalysis.cpp:1295-1297`):
+```cpp
+iqtree.initializeAllPartialPars();
+iqtree.clearAllPartialLH();
+iqtree.curScore = -iqtree.computeParsimony();  // → 2941 (topology end-state)
+```
+
+**Tại sao topology bị drift?** Phase 3 loop có cấu trúc chẵn/lẻ:
+- **Iter chẵn**: NNI perturbation ngẫu nhiên → SPR hill-climb. NNI phá vỡ topology hiện tại trước.
+- **Iter lẻ**: Ratchet (trọng số SPR) → SPR thông thường.
+
+Topology đạt `bestParsimony` ở iteration k bị ghi đè khi iteration k+1 bắt đầu (NNI perturbation
+hoặc ratchet moves không lưu lại topology cũ). Sau nhiều iterations, cây cuối cùng (end-state)
+có thể khác — và tệ hơn — topology đã đạt `bestParsimony`.
+
+Đây là **quality loss thực sự**: GPU tìm được cây tốt nhưng không lưu lại, cuối cùng trả về
+cây kém hơn cho CPU.
+
+### Phân tích để tìm bug: dùng Agent debugger
+
+Bug được phát hiện qua pipeline:
+1. Chạy benchmark 115 dataset → so sánh `post_hc_best` vs `final_score` trong Python
+2. Phát hiện 14/115 dataset có discrepancy (luôn theo chiều post-HC tốt hơn)
+3. Spawn Agent debugger tìm code path: trace từ `bestParsimony` print → download → CPU re-score
+4. Agent xác định 3 write site của `bestParsimony` và vị trí download topology
+
+### Fix: Lưu `best_back_vf[]` mỗi khi `bestParsimony` cập nhật
+
+**Nguyên tắc**: khi tìm được score tốt hơn, lưu snapshot của `back_vf[]` (topology tại thời điểm đó).
+Khi download, dùng snapshot này thay vì end-state.
+
+**4 thay đổi trong 4 file:**
+
+**1. `pars_tree.cuh`** — thêm field vào `GpuTopology`:
+```cpp
+int back_vf[kMaxVFaces];       // topology hiện tại (end-state sau mỗi iteration)
+int best_back_vf[kMaxVFaces];  // snapshot back_vf[] khi bestParsimony được cập nhật
+```
+Memory overhead: +12.8 KB/tree. Với K=199: +2.5 MB GPU memory.
+
+**2. `pars_tree.cu`** — `cpuToGpuTopology`: khởi tạo `best_back_vf = back_vf`.
+
+**3. `pars_build.cu`** — copy `back_vf → best_back_vf` tại 3 điểm update `bestParsimony`:
+```cpp
+// End of Phase 1 (build):
+topo->bestParsimony = sh.bestParsimony;
+for (int vf = 0; vf < topo->num_vfaces; vf++)
+    topo->best_back_vf[vf] = topo->back_vf[vf];
+
+// End of Phase 2 (initial SPR):
+topo->bestParsimony = sh.randomMP;
+for (int vf = 0; vf < topo->num_vfaces; vf++)
+    topo->best_back_vf[vf] = topo->back_vf[vf];
+
+// Phase 3 per-iteration:
+if (lane == 0 && sh.randomMP < topo->bestParsimony) {
+    topo->bestParsimony = sh.randomMP;
+    for (int vf = 0; vf < topo->num_vfaces; vf++)
+        topo->best_back_vf[vf] = topo->back_vf[vf];
+}
+```
+
+**4. `gpu_init_trees.cu`** — bước [7] sau download, trước `gpuTopoToCpu`:
+```cpp
+// Restore best-seen topology (not end-state after last iteration)
+for (int vf = 0; vf < h_topo.num_vfaces; vf++)
+    h_topo.back_vf[vf] = h_topo.best_back_vf[vf];
+```
+Không cần thay đổi `gpuTopoToCpu` — chỉ swap `back_vf` ← `best_back_vf` trên CPU trước khi convert.
+
+### Kết quả
+
+**Test nhanh 5 dataset có discrepancy lớn nhất:**
+
+| Dataset | Post-HC best | Final (trước fix) | Final (sau fix) |
+|---------|-------------|-----------------|----------------|
+| dna_M8692_395_3583 | 2938 | 2941 (+3) | **2938** ✓ |
+| dna_M11113_344_9778 | 113713 | 113718 (+5) | **113713** ✓ |
+| dna_M3198_216_2578 | 35866 | 35870 (+4) | **35866** ✓ |
+| dna_M10933_229_2696 | 21854 | 21857 (+3) | **21854** ✓ |
+| dna_M7024_767_5814 | 95109 | 95155 (+46) | **95109** ✓ |
+
+Post-HC best = Final score ở tất cả 5 dataset. Full benchmark 115 dataset đang chạy.
+
+### Bài học / Ghi chú cho khóa luận
+
+1. **Score ≠ Topology**: Lưu score tốt nhất là không đủ — phải lưu kèm topology tương ứng.
+   Đây là lỗi kiến trúc: thiết kế ban đầu coi `bestParsimony` là điểm thống kê, không phải
+   pointer tới trạng thái tốt nhất. Khi thêm Phase 3 với NNI perturbation (có thể làm cây tệ
+   tạm thời), sự tách biệt này trở thành bug.
+
+2. **Phát hiện qua benchmark cross-validation**: Bug không xuất hiện ở test nhỏ (1 dataset),
+   chỉ lộ ra khi chạy 115 dataset và so sánh hai metric `post_hc_best` vs `final_score` bằng
+   script Python. Bài học: tổng hợp kết quả nhiều dataset giúp phát hiện bugs systematic.
+
+3. **Trade-off của Option A vs B vs C**: Fix đúng nhất (A) là lưu topology — tốn thêm bộ nhớ
+   nhưng không tốn thêm thời gian đáng kể (copy `num_vfaces` ints ≈ 4.7 KB, rất nhanh).
+   Option C (sửa log) chỉ ẩn bug không fix. Option B (thêm 1 pass HC cuối) tốn thêm 1 iteration
+   thời gian (~10% overhead) và không đảm bảo recover đúng topology tốt nhất.
+
+4. **Subtlety của copy loop**: Copy chỉ cần `num_vfaces` (= 4N-3) elements, không phải `kMaxVFaces`
+   (= 4×800 = 3200). Với N=295: num_vfaces=1177 ints = 4.7 KB — rất nhỏ, overhead không đáng kể.
+

@@ -45,11 +45,10 @@ void cpuToGpuTopology(
     for (int vf = 0; vf < num_vf; ++vf)
     {
         const nodeptr p = base + vf;
-        out->back_vf[vf] = vface_of(tr, p->back);
-        out->next_vf[vf] = vface_of(tr, p->next);
-        out->nnxt_vf[vf] = vface_of(tr, p->next->next);
-        out->number[vf] = p->number;
+        out->back_vf[vf]      = vface_of(tr, p->back);
+        out->best_back_vf[vf] = out->back_vf[vf];  // initialize best = current
         out->xpars[vf] = p->xPars;
+        // next_vf, nnxt_vf, number not stored — computed from arithmetic on download
     }
 }
 
@@ -64,11 +63,10 @@ void gpuTopoToCpu(
     for (int vf = 0; vf < num_vf; ++vf)
     {
         nodeptr p = base + vf;
-        p->back = (in->back_vf[vf] >= 0) ? (base + in->back_vf[vf]) : nullptr;
-        p->next = base + in->next_vf[vf];
-        // next->next is implicit via the ring, but we set it for safety
+        p->back  = (in->back_vf[vf] >= 0) ? (base + in->back_vf[vf]) : nullptr;
+        p->next  = base + vfNextFace(vf, in->mxtips);
         p->xPars = (char)in->xpars[vf];
-        // number is set once at init and never changes; leave it alone
+        // p->number and p->next->next are stable after PLL init — not stored on GPU
     }
 
     tr->ntips = in->ntips;

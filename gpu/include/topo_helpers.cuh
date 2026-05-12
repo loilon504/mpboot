@@ -50,7 +50,7 @@ __device__ __forceinline__ int nodepVf(
 }
 
 // Ring layout: face[2]→face[1]→face[0]→face[2]
-__device__ __forceinline__ int vfNextFace(
+__host__ __device__ __forceinline__ int vfNextFace(
     int vf, int N
 )
 {
@@ -64,7 +64,7 @@ __device__ __forceinline__ int vfNextFace(
     return base + nf;
 }
 
-__device__ __forceinline__ int vfNnxtFace(
+__host__ __device__ __forceinline__ int vfNnxtFace(
     int vf, int N
 )
 {

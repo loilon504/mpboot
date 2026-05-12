@@ -347,6 +347,29 @@ GPU equivalent of CPU `nodeRectifierPars + reorderNodes` (sprparsimony.cpp:2089)
 - **`gpuSprKernel` removed** — `gpu_spr.cu` now contains only a no-op `gpuSprBuildTrees` stub.
 - **Pipeline steps [5]+[6] merged** → single call `gpuStepwiseBuildTrees(mem, seeds, sprDist, stream)`.
 
+### ✅ GpuTopology struct shrink — Opt-D (2026-05-12)
+
+**Discovery**: `vfToNum`, `vfNextFace`, `vfNnxtFace` are pure arithmetic — kernel never reads
+`topo->number[]`, `topo->next_vf[]`, `topo->nnxt_vf[]`. Those arrays only served CPU-side
+`cpuToGpuTopology`/`gpuTopoToCpu`.
+
+**Fix**: Remove all three arrays from `GpuTopology`. In `gpuTopoToCpu`, replace
+`p->next = base + in->next_vf[vf]` with `p->next = base + vfNextFace(vf, in->mxtips)`.
+Added `__host__` to `vfNextFace`/`vfNnxtFace` in `topo_helpers.cuh`.
+
+**Struct size: 83,236 → 44,836 bytes (−37.5 KB)**. Layout after:
+```
+back_vf[0]       offset=0        HOT  12.8 KB
+xpars[0]         offset=12.8 KB  HOT  12.8 KB  (was 64 KB from back_vf!)
+scalars          offset=25.6 KB  36 bytes
+nodep[0]         offset=25.6 KB  MEDIUM 6.4 KB
+best_back_vf[0]  offset=32.0 KB  COLD
+```
+
+**Benchmark** (10 datasets, seed=1, numpars=200, gpu_hc_iter=10, sprdist=3):
+average **−8.7% ms/tree** across N=55..395. Range: −4% to −14%.
+Parsimony quality unchanged (2/10 differ by ±2 = stochasticity).
+
 ### Fixed bugs (cumulative)
 
 | Bug | Status |

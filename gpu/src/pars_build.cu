@@ -751,6 +751,8 @@ __global__ void buildParsimonyTreesKernel(
     if (lane == 0)
     {
         topo->bestParsimony = sh.bestParsimony;
+        for (int vf = 0; vf < topo->num_vfaces; vf++)
+            topo->best_back_vf[vf] = topo->back_vf[vf];
         if (k == 0) sh.t_build = clock64() - _t_build;
     }
     __syncwarp();
@@ -779,6 +781,8 @@ __global__ void buildParsimonyTreesKernel(
     {
         topo->postSprParsimony = sh.randomMP;
         topo->bestParsimony = sh.randomMP;
+        for (int vf = 0; vf < topo->num_vfaces; vf++)
+            topo->best_back_vf[vf] = topo->back_vf[vf];
         if (k == 0) sh.t_phase2 = clock64() - _t_phase2;
     }
     __syncwarp();
@@ -899,6 +903,8 @@ __global__ void buildParsimonyTreesKernel(
         if (lane == 0 && sh.randomMP < topo->bestParsimony)
         {
             topo->bestParsimony = sh.randomMP;
+            for (int vf = 0; vf < topo->num_vfaces; vf++)
+                topo->best_back_vf[vf] = topo->back_vf[vf];
         }
         __syncwarp();
     }
@@ -908,6 +914,7 @@ __global__ void buildParsimonyTreesKernel(
     {
         long long t_spr_total = sh.t_line2291 + sh.t_search + sh.t_apply;
         long long t_ti_total = sh.t_ti_newview + sh.t_ti_eval;
+        int n = sh.n_testInsert;
         printf(
             "[TIMING k=0] Phase1 build=%lld cyc\n"
             "[TIMING k=0] Phase2 initial-SPR=%lld cyc\n"
@@ -915,8 +922,8 @@ __global__ void buildParsimonyTreesKernel(
             "[TIMING k=0] Phase3 Ratchet  (%d iters): total=%lld cyc\n"
             "[TIMING k=0] Phase3 SPR breakdown: line2291=%lld (%.1f%%)  search=%lld (%.1f%%)"
             "  apply=%lld (%.1f%%)  moves=%d  dowhile=%d\n"
-            "[TIMING k=0] testInsert (%d calls): newview=%lld (%.1f%%)  eval=%lld (%.1f%%)"
-            "  total_ti=%lld vs search=%lld\n"
+            "[TIMING k=0] testInsert (%d calls): newview=%lld (%.1f%%)"
+            "  eval=%lld (%.1f%%)  total_ti=%lld vs search=%lld\n"
             "[TIMING k=0] testInsert avg traversal: newview=%.2f nodes  eval=%.2f nodes\n",
             sh.t_build,
             sh.t_phase2,
@@ -926,12 +933,12 @@ __global__ void buildParsimonyTreesKernel(
             sh.t_search,  t_spr_total > 0 ? 100.0 * sh.t_search  / t_spr_total : 0.0,
             sh.t_apply,   t_spr_total > 0 ? 100.0 * sh.t_apply   / t_spr_total : 0.0,
             sh.n_apply, sh.n_dowhile,
-            sh.n_testInsert,
+            n,
             sh.t_ti_newview, t_ti_total > 0 ? 100.0 * sh.t_ti_newview / t_ti_total : 0.0,
             sh.t_ti_eval,    t_ti_total > 0 ? 100.0 * sh.t_ti_eval    / t_ti_total : 0.0,
             t_ti_total, sh.t_search,
-            sh.n_testInsert > 0 ? (float)sh.n_ti_newview_size / sh.n_testInsert : 0.0f,
-            sh.n_testInsert > 0 ? (float)sh.n_ti_eval_size    / sh.n_testInsert : 0.0f
+            n > 0 ? (float)sh.n_ti_newview_size / n : 0.0f,
+            n > 0 ? (float)sh.n_ti_eval_size    / n : 0.0f
         );
     }
 }

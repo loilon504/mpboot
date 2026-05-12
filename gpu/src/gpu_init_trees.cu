@@ -159,6 +159,9 @@ int gpuInitCandidateTrees(
         auto ti = std::chrono::high_resolution_clock::now();
         GpuTopology h_topo;
         downloadTopology(mem, i, &h_topo, stream);
+        // Restore the best-seen topology (not the end-state after last iteration)
+        for (int vf = 0; vf < h_topo.num_vfaces; vf++)
+            h_topo.back_vf[vf] = h_topo.best_back_vf[vf];
         t_download += msSince(ti);
 
         ti = std::chrono::high_resolution_clock::now();

@@ -31,13 +31,11 @@ static constexpr int kWarpSize = 32;
 // parsVect is indexed by node NUMBER (1..2N-1), not by vface.
 struct GpuTopology
 {
-    int back_vf[kMaxVFaces];  // back neighbor's vface (-1 = NULL)
-    int next_vf[kMaxVFaces];  // next face in ring (self for tips)
-    int nnxt_vf[kMaxVFaces];  // next->next face in ring (self for tips)
-    int number[kMaxVFaces];   // node->number  (parsVect index)
-    int xpars[kMaxVFaces];    // xPars flag (0 or 1)
+    // HOT: random-access in every testInsert / doAddTraverse call
+    int back_vf[kMaxVFaces];       // back neighbor's vface (-1 = NULL) — current topology
+    int xpars[kMaxVFaces];         // xPars flag (0 or 1)
 
-    // Scalars
+    // Scalars (read a few times per SPR iteration)
     int mxtips;
     int ntips;
     int nextnode;  // next inner node slot to allocate
@@ -47,8 +45,15 @@ struct GpuTopology
     int insert_vface;              // insertNode as vface (-1 = NULL)
     int start_vface;               // tr->start as vface
     int num_vfaces;                // = mxtips + 3*(mxtips-1)
+
+    // MEDIUM: sequential access in SPR outer loop (gpuNodeRectifierPars + per-node lookup)
     int nodep[kMaxNodes];          // DFS-canonical vface per node (like CPU tr->nodep[])
                                    // tips: nodep[num] = num-1; inner: set by gpuNodeRectifierPars
+
+    // COLD: only on bestParsimony update + topology download
+    int best_back_vf[kMaxVFaces];  // back_vf[] snapshot at the time bestParsimony was achieved
+    // NOTE: number[], next_vf[], nnxt_vf[] removed — kernel uses pure arithmetic
+    //   (vfToNum, vfNextFace, vfNnxtFace) and CPU-side p->number/p->next are stable after init.
 };
 
 // ─── Parsimony memory for K trees ─────────────────────────────────────────────
@@ -138,7 +143,7 @@ struct alignas(
     // testInsert sub-timing (Phase 3 even iters, block 0 lane 0 only)
     long long t_ti_newview;    // createTiAndNewviewParsimony inside testInsert
     long long t_ti_eval;       // createTiAndEvaluateParsimony inside testInsert
-    int n_testInsert;          // total testInsert calls
+    int n_testInsert;          // testInsert calls
     int n_ti_newview_size;     // total nodes traversed in newview (tiSize/3)
     int n_ti_eval_size;        // total nodes traversed in eval (tiSize/3)
 };
