@@ -11,7 +11,7 @@ namespace mpbootgpu
 {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-static constexpr int kMaxTaxa = 700;
+static constexpr int kMaxTaxa = 800;
 // Each tip: 1 noderec. Each inner node: 3 noderecs.
 // Total noderecs = N + 3*(N-1) = 4N-3, but we index up to 4*N-2 to be safe.
 static constexpr int kMaxVFaces = 4 * kMaxTaxa;  // vface IDs = offsets into nodeBaseAddress
@@ -42,7 +42,8 @@ struct GpuTopology
     int ntips;
     int nextnode;  // next inner node slot to allocate
     unsigned int bestParsimony;
-    unsigned int preSprParsimony;  // full-tree parsimony before SPR (set by gpuSprKernel init)
+    unsigned int preSprParsimony;   // parsimony after stepwise addition (before initial SPR)
+    unsigned int postSprParsimony;  // parsimony after initial SPR (before hill-climbing)
     int insert_vface;              // insertNode as vface (-1 = NULL)
     int start_vface;               // tr->start as vface
     int num_vfaces;                // = mxtips + 3*(mxtips-1)
@@ -122,11 +123,18 @@ struct alignas(
     // ── Ratchet site weights (Phase 2b) ──────────────────────────────────────
     const unsigned int* site_weights;  // nullptr = uniform weight 1
     // ── Timing accumulators (block 0 lane 0 only) ─────────────────────────────
-    long long t_line2291;  // createTiAndEvaluateParsimony (line-2291 equivalent)
-    long long t_search;    // doAddTraverse (SPR candidate search)
-    long long t_apply;     // applyMove
-    int n_apply;           // number of moves applied
-    int n_dowhile;         // number of do-while passes
+    long long t_build;       // Phase 1: stepwise addition (clock cycles)
+    long long t_phase2;      // Phase 2: initial SPR (clock cycles)
+    long long t_p3_nni;      // Phase 3 even iters: NNI+setup accumulated
+    long long t_p3_nni_spr;  // Phase 3 even iters: SPR accumulated
+    long long t_p3_ratchet;  // Phase 3 odd iters: total accumulated
+    int n_p3_even;           // count of even Phase 3 iterations
+    int n_p3_odd;            // count of odd Phase 3 iterations
+    long long t_line2291;    // Phase 3 SPR: createTiAndEvaluateParsimony (line-2291)
+    long long t_search;      // Phase 3 SPR: doAddTraverse (candidate search)
+    long long t_apply;       // Phase 3 SPR: applyMove
+    int n_apply;             // number of moves applied
+    int n_dowhile;           // number of do-while passes
 };
 
 // ─── Host API ─────────────────────────────────────────────────────────────────

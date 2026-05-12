@@ -680,3 +680,104 @@ Thay `if (node_num >= N && score_tree[node_num] > 0)` thành
 Dù bug bị che khuất bởi guard condition khác, cần sửa để code đúng về mặt semantic và tránh
 phụ thuộc vào điều kiện vô tình "che" lỗi. Code đúng phải đúng từ nguyên tắc, không chỉ đúng
 vì side effect của điều kiện khác.
+---
+
+## Refactor #3 — Thống nhất `sprDist` + thêm `postSprParsimony` + timing breakdown (2026-05-11)
+
+**Ngày**: 2026-05-11
+**Task**: Clean up API, thêm metric, thêm timing instrumentation vào kernel
+**File liên quan**: `gpu/include/pars_tree.cuh`, `gpu/include/pars_build.cuh`, `gpu/src/pars_build.cu`, `gpu/src/gpu_init_trees.cu`
+
+### Thay đổi
+
+**1. Thống nhất `sprDist`** — xóa `sprDist4` / `-gpu_hc_spr_dist`: tất cả 3 phase (build SPR, NNI+SPR, Ratchet) dùng chung `params.sprDist` (CLI: `-sprdist`). Hàm `gpuStepwiseBuildTrees` không còn nhận `int sprDist4`.
+
+**2. Thêm `GpuTopology::postSprParsimony`** — lưu điểm parsimony sau Phase 2 (initial SPR) và trước Phase 3 (hill-climbing). Ba metric riêng biệt:
+- `preSprParsimony` — sau stepwise addition (build)
+- `postSprParsimony` — sau Phase 2 SPR
+- `bestParsimony` — sau Phase 3 NNI+ratchet
+
+**3. Thêm timing breakdown per-phase vào `BuildShared`** (block 0 only, clock cycles):
+
+| Field | Ý nghĩa |
+|-------|---------|
+| `t_build` | Phase 1: stepwise addition |
+| `t_phase2` | Phase 2: initial SPR |
+| `t_p3_nni` | Phase 3 even iters: NNI+setup |
+| `t_p3_nni_spr` | Phase 3 even iters: SPR |
+| `t_p3_ratchet` | Phase 3 odd iters: tổng ratchet |
+| `n_p3_even` / `n_p3_odd` | số lần lặp mỗi loại |
+| `t_line2291`, `t_search`, `t_apply` | nội bộ SPR (đã có) |
+
+Output in ra từ kernel (block 0, lane 0):
+```
+[TIMING k=0] Phase1 build=XXX cyc
+[TIMING k=0] Phase2 initial-SPR=XXX cyc
+[TIMING k=0] Phase3 NNI+SPR (5 iters): nni_setup=XXX cyc  spr=XXX cyc
+[TIMING k=0] Phase3 Ratchet  (5 iters): total=XXX cyc
+[TIMING k=0] Phase3 SPR breakdown: line2291=XXX (11.2%)  search=XXX (88.7%)  apply=XXX (0.0%)  moves=336  dowhile=3
+```
+
+### Kết quả timing điển hình (N=295, K=199, sprDist=3, gpu_hc_iter=10)
+
+| Phase | Clock cycles | Ghi chú |
+|-------|-------------|---------|
+| Phase 1 build | 2.376B | stepwise addition N=295 |
+| Phase 2 initial-SPR | 1.871B | 1 lần SPR hill-climb |
+| Phase 3 NNI+SPR (5 iters) — setup | 22.5M | NNI nhỏ so với SPR |
+| Phase 3 NNI+SPR (5 iters) — SPR | 9.539B | mỗi iter ~1.9B |
+| Phase 3 Ratchet (5 iters) | 13.237B | 2 SPR calls → ~2× so với 1 |
+| SPR breakdown: search | 88.7% | `doAddTraverse` = bottleneck chính |
+| SPR breakdown: line2291 | 11.2% | lazy refresh overhead |
+| SPR breakdown: apply | 0.05% | `applyMove` không đáng kể |
+
+### Bài học / Ghi chú cho khóa luận
+
+`doAddTraverse` (candidate edge search) chiếm gần 90% thời gian SPR. Đây là phần cần tối ưu trước tiên nếu muốn tăng tốc SPR. Phần `applyMove` (chỉ 0.05%) gần như free — bottleneck không phải là số lần apply move mà là số lần evaluate candidate.
+
+---
+
+## Experiment Log — Phase 3 Hill-Climbing Benchmark (2026-05-11)
+
+**Dataset**: `data_debug/tree1.phy` (N=295 taxa, 1140 sites)
+**Settings**: `-seed 1 -numpars 100` (K=99 trees), Phase 2 `sprDist=6`
+**GPU**: A100-SXM4-80GB
+
+### Baseline
+
+| Config | best | worst | ms/tree | Total |
+|--------|------|-------|---------|-------|
+| Phase 2 only (sprDist=6, no Phase 3) | 6665 | — | 79 ms | 7.9s |
+
+### Phase 3 experiments (`-gpu_hc_iter` × `-gpu_hc_spr_dist`)
+
+| gpu_hc_iter | gpu_hc_spr_dist | best | worst | ms/tree | Total | moves |
+|-------------|-----------------|------|-------|---------|-------|-------|
+| 10 | 4 | 6662 | 6684 | 881 ms | 90s | 384 |
+| 10 | 6 | 6662 | 6685 | 1426 ms | 145s | 356 |
+| 20 | 4 | 6662 | 6684 | 1385 ms | 140s | 704 |
+| 20 | 6 | 6662 | 6683 | 2144 ms | 215s | 687 |
+| 50 | 4 | 6662 | 6680 | 2370 ms | 238s | 1590 |
+| **50** | **6** | **6662** | **6666** | **3282 ms** | **330s** | **1654** |
+| 100 | 3 | 6662 | 6681 | 1254 ms | 124s | 2827 |
+
+CPU reference (1 tree, serial): best ≈ 6668
+
+### Quan sát
+
+1. **`best` hội tụ sớm**: mọi cấu hình đều cho `best=6662`, từ 10 đến 100 iterations.
+   Phase 3 cải thiện 3 điểm so với Phase 2 (6665→6662), nhưng tăng thêm iter không cải thiện `best`.
+
+2. **`worst` giảm dần theo iter và sprDist**: tăng iter từ 10→50 và sprDist từ 4→6
+   cải thiện worst-case đáng kể (6685 → 6666). Với `iter=50, spr=6`, worst=6666 gần bằng best=6662
+   → phân phối chất lượng cây rất đồng đều.
+
+3. **Trade-off thời gian**: sprDist=6 tốn ~50-60% thêm thời gian so với sprDist=4 cùng iter.
+   Iter tỉ lệ tuyến tính với thời gian.
+
+4. **Khuyến nghị**: `iter=10, spr=4` (880 ms/tree) nếu ưu tiên tốc độ;
+   `iter=50, spr=6` (3282 ms/tree) nếu muốn worst-case tốt nhất.
+   `best` không thay đổi theo cấu hình nào trong số này.
+
+5. **So với CPU**: GPU K=99 trees best=6662 tốt hơn CPU single-tree best≈6668 (seed=1).
+

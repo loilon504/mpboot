@@ -1695,7 +1695,6 @@ double IQTree::doTreeSearch() {
 //		long tmp_num_ratchet_bootcands = treels.size();
         if(params->ratchet_iter >= 0){
         	if(params->ratchet_iter == ratchet_iter_count){
-                PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/PerturbAlignment");
                 // cout << "Iteration " << curIt << ", perturb alignment\n";
 //				string candidateTree = candidateTrees.getRandCandVecTree(); // Diep: to pick from vector-stored candidates
 				string candidateTree = candidateTrees.getRandCandTree();
@@ -1726,7 +1725,6 @@ double IQTree::doTreeSearch() {
     	 *---------------------------------------*/
 		double perturbScore;
 		if(!on_ratchet_hclimb1){
-            PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/PerturbTree");
             // cout << "Iteration " << curIt << ", perturb tree\n";
             // cout << "REACH " << 1725 << " iqtree.cpp: what is this\n";
 			if (iqp_assess_quartet == IQP_BOOTSTRAP) {
@@ -1808,10 +1806,7 @@ double IQTree::doTreeSearch() {
         int nni_count = 0;
         int nni_steps = 0;
 
-        {
-            PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/doNNISearch");
-		    imd_tree = doNNISearch(nni_count, nni_steps);
-        }
+        imd_tree = doNNISearch(nni_count, nni_steps);
 
         if (iqp_assess_quartet == IQP_BOOTSTRAP) {
             // restore alignment
@@ -1829,7 +1824,6 @@ double IQTree::doTreeSearch() {
          * PARSIMONY RATCHET-LIKE IDEA
          * -------------------------------------------------------------------------*/
         if(on_ratchet_hclimb1){
-            PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/on_ratchet_hclimb1");
             // cout << "Iteration " << curIt << ", on_ratchet_hclimb1 = true\n";
 			ratchet_iter_count = 0;
 

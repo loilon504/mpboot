@@ -1682,6 +1682,8 @@ struct Params {
      * Loi: To use gpu
      */
     bool use_gpu;
+    int gpu_hc_iter;      // hill-climbing iterations per tree in GPU Phase 3 (0 = disabled)
+    int gpu_hc_spr_dist;  // SPR radius for GPU Phase 3 hill-climbing
 };
 
 /**

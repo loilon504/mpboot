@@ -826,6 +826,8 @@ void parseArg(int argc, char *argv[], Params &params) {
     params.write_local_optimal_trees = false;
 
 	params.use_gpu = false;
+	params.gpu_hc_iter = 100;
+	params.gpu_hc_spr_dist = 6;
 
 	if (params.nni5) {
 	    params.nni_type = NNI5;
@@ -2700,6 +2702,14 @@ void parseArg(int argc, char *argv[], Params &params) {
 			}
 			if (strcmp(argv[cnt], "-use_gpu") == 0) {
 				params.use_gpu = true;
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_hc_iter") == 0) {
+				params.gpu_hc_iter = convert_int(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_hc_spr_dist") == 0) {
+				params.gpu_hc_spr_dist = convert_int(argv[++cnt]);
 				continue;
 			}
 			if (argv[cnt][0] == '-') {

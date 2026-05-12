@@ -1136,7 +1136,6 @@ int PhyloTree::computeParsimonyBranch(PhyloNeighbor *dad_branch, PhyloNode *dad,
 }
 
 int PhyloTree::computeParsimony() {
-    PROFILE_SCOPE("computeParsimony");
     assert(root->isLeaf());
     PhyloNeighbor *nei = ((PhyloNeighbor*) root->neighbors[0]);
     current_it = nei;

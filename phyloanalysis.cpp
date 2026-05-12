@@ -1721,7 +1721,6 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 
     /***************** Initialization for PLL and sNNI ******************/
     if (params.start_tree == STT_PLL_PARSIMONY || params.pll) {
-		PROFILE_SCOPE("runTreeReconstruction/initializePLL");
 		cout << "--REACH 1687 phyloanalysis.cpp: initialize PLL_IQtree\n";
         /* Initialized all data structure for PLL*/
 //        cout << "WHAT'S GOING ON HERE?" << endl;
@@ -1737,10 +1736,7 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
     /********************** CREATE INITIAL TREE(S) **********************/
     int numInitTrees;
     string initTree;
-	{
-		PROFILE_SCOPE("runTreeReconstruction/computeInitialTree");
-	    computeInitialTree(params, iqtree, dist_file, numInitTrees, initTree);
-	}
+	computeInitialTree(params, iqtree, dist_file, numInitTrees, initTree);
 
     /*************** SET UP PARAMETERS and model testing ****************/
 
@@ -1805,7 +1801,6 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 		cout << "--REACH 1769 phyloanalysis.cpp: min_iterations = " << params.min_iterations << '\n';
 
         if (!params.user_file && (params.start_tree == STT_PARSIMONY || params.start_tree == STT_PLL_PARSIMONY)) {
-			PROFILE_SCOPE("runTreeReconstruction/initCandidateTreeSet");
         	int numDup = initCandidateTreeSet(params, iqtree, numInitTrees);
         	assert(iqtree.candidateTrees.size() != 0);
         	cout << "Finish initializing candidate tree set. ";
@@ -1842,7 +1837,10 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
         cout << "Current best score: " << (params.maximum_parsimony ? -iqtree.bestScore : iqtree.bestScore) << " / CPU time: "
                 << getCPUTime() - initTime << endl << endl;
 	}
-	exit(0);	exit(0);
+	if (params.use_gpu)
+	{
+		exit(0);
+	}
 
 
     if (params.leastSquareNNI) {
@@ -1869,7 +1867,6 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 
 	/****************** Do tree search ***************************/
 	if (params.min_iterations > 1) {
-		PROFILE_SCOPE("runTreeReconstruction/doTreeSearch");
 		cout << "--REACH 1839 phyloanalysis.cpp, min_iterations = " << params.min_iterations << '\n';
 		iqtree.readTreeString(iqtree.bestTreeString);
 		iqtree.doTreeSearch();
@@ -2288,7 +2285,6 @@ void runPhyloAnalysis(Params &params) {
         // Diep: Relocate the call to optimizeAlignment HERE 
         // to not interfere with other utilities (such as standard bootstrap)
         if(params.maximum_parsimony){
-			PROFILE_SCOPE("optimizeAlignment");
             optimizeAlignment(tree, params);// Diep: this is to rearrange columns for better speed in REPS
         }
                     
@@ -2304,10 +2300,8 @@ void runPhyloAnalysis(Params &params) {
 			tree->removedTaxons = removed_seqs;
 		}
 		// call main tree reconstruction
-		{
-			PROFILE_SCOPE("runTreeReconstruction");
-			runTreeReconstruction(params, original_model, *tree, model_info);
-		}
+		runTreeReconstruction(params, original_model, *tree, model_info);
+		
 		if (params.gbo_replicates && params.online_bootstrap) {
 			if (params.print_ufboot_trees)
 				tree->writeUFBootTrees(params, removed_seqs, twin_seqs);

@@ -1,5 +1,53 @@
 # GPU Parsimony – Developer Context
 
+## 0. Quick Reference — Common Commands
+
+Working directory: `mpboot-gpu/build/`  (created by `mkdir build && cd build`)
+
+### Build
+```bash
+# Configure (run once from build/)
+cmake ../mpboot -DIQTREE_FLAGS=avx -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_CXX_STANDARD=14 -DUSE_GPU=ON
+
+# Build
+make -j4
+```
+
+### Run CPU
+```bash
+make -j4 && /usr/bin/time -v ./mpboot-avx \
+    -s ../data_debug/tree1.phy -seed 1 \
+    > tree2.txt 2>&1
+```
+
+### Run GPU
+```bash
+make -j4 && /usr/bin/time -v ./mpboot-avx \
+    -s ../data_debug/tree1.phy -use_gpu -seed 1 \
+    -numpars 200 -gpu_hc_iter 10 -sprdist 3 \
+    > tree2.txt 2>&1
+```
+
+### Benchmark scripts (run from `build/`)
+```bash
+bash bench_cpu.sh                          # all datasets → output/cpu/*.log
+bash bench_gpu.sh                          # all datasets → output/gpu/*.log
+bash bench_cpu.sh path/to/file.phy         # single file
+python3 ../output/summarize.py             # → output/results.xlsx
+```
+
+### Key CLI flags
+| Flag | Default | Ý nghĩa |
+|------|---------|---------|
+| `-sprdist N` | 6 | SPR radius cho mọi phase |
+| `-numpars K` | 100 | số cây GPU (thực tế K-1 trees) |
+| `-gpu_hc_iter N` | 0 | số Phase 3 iterations (NNI+SPR + ratchet pairs) |
+| `-seed N` | random | RNG seed |
+| `-use_gpu` | off | bật GPU mode |
+
+---
+
 ## 1. Pipeline Overview: Porting MPBoot to GPU
 
 MPBoot's candidate-tree generation (`makeParsimonyTreeFast` in `sprparsimony.cpp`) builds

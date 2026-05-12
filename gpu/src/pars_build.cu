@@ -148,7 +148,9 @@ __device__ void gpuNodeRectifierPars(
     {
         int m_vf = sh.tiStack[top--];
         if (m_vf < N)
+        {
             continue;  // null or tip
+        }
 
         // CPU: tr->nodep[count + N + 1] = p  (the exact face encountered in DFS)
         topo->nodep[count + N + 1] = m_vf;
@@ -159,9 +161,13 @@ __device__ void gpuNodeRectifierPars(
         int child1 = topo->back_vf[vfNextFace(m_vf, N)];
         int child2 = topo->back_vf[vfNnxtFace(m_vf, N)];
         if (child2 >= N)
+        {
             sh.tiStack[++top] = child2;
+        }
         if (child1 >= N)
+        {
             sh.tiStack[++top] = child1;
+        }
     }
 }
 
@@ -196,10 +202,6 @@ __device__ void applyMove(
     __syncwarp();
 }
 
-// ─── gpuSPRHillClimb ─────────────────────────────────────────────────────────
-// Opt 1: full=false (requires gpuInvalidateXparsAll after each applyMove)
-// Opt 3: maxDoWhile caps the do-while iterations
-// Timing: accumulates cycle counts in sh.t_* (block 0 only)
 __device__ void gpuSPRHillClimb(
     parsimonyNumber* __restrict__ pars_tree,
     unsigned int* __restrict__ score_tree,
@@ -210,6 +212,7 @@ __device__ void gpuSPRHillClimb(
     int width,
     int states,
     int lane,
+    int maxDoWhile = INT_MAX,
     bool do_timing = false
 )
 {
@@ -217,9 +220,11 @@ __device__ void gpuSPRHillClimb(
     const bool log = do_timing && (blockIdx.x == 0) && (lane == 0);
 
     unsigned int startMP;
+    int dowhile_count = 0;
     do
     {
         startMP = sh.randomMP;
+        dowhile_count++;
         if (lane == 0)
         {
             gpuNodeRectifierPars(topo, sh, N);
@@ -430,7 +435,11 @@ __device__ void gpuSPRHillClimb(
             }
         }  // end for i
 
-    } while (sh.randomMP < startMP);
+    } while (sh.randomMP < startMP && dowhile_count < maxDoWhile);
+    if (log)
+    {
+        sh.n_dowhile = dowhile_count;
+    }
 }
 
 // ─── gpuRandomNNIs ───────────────────────────────────────────────────────────
@@ -517,8 +526,7 @@ __global__ void buildParsimonyTreesKernel(
     const long* __restrict__ d_seeds,
     int width,
     int states,
-    int sprDist,   // Phase 3 SPR radius
-    int sprDist4,  // Opt 2: Phase 4 SPR radius (smaller)
+    int sprDist,
     int numSearchIter,
     int numNNI,
     int maxDoWhile,  // Opt 3: cap do-while iterations per SPR call
@@ -543,6 +551,8 @@ __global__ void buildParsimonyTreesKernel(
     {
         sh.seed = d_seeds[k];
         sh.site_weights = nullptr;
+        sh.t_build = sh.t_phase2 = sh.t_p3_nni = sh.t_p3_nni_spr = sh.t_p3_ratchet = 0;
+        sh.n_p3_even = sh.n_p3_odd = 0;
         sh.t_line2291 = 0;
         sh.t_search = 0;
         sh.t_apply = 0;
@@ -574,7 +584,9 @@ __global__ void buildParsimonyTreesKernel(
 
         // Init nodep[] — inner nodes overwritten by gpuNodeRectifierPars in Phase 3
         for (int num = 1; num <= N; num++)
+        {
             topo->nodep[num] = num - 1;
+        }
         for (int num = N + 1; num <= 2 * N - 1; num++)
         {
             int p = nodepVf(num, N);
@@ -582,7 +594,6 @@ __global__ void buildParsimonyTreesKernel(
             topo->xpars[p] = 1;
             topo->xpars[p - 1] = 0;
             topo->xpars[p - 2] = 0;
-            
         }
     }
     __syncwarp();
@@ -591,6 +602,9 @@ __global__ void buildParsimonyTreesKernel(
     __syncwarp();
 
     // ── Phase 1: stepwise addition ────────────────────────────────────────────
+    long long _t_build = 0LL;
+    if (k == 0 && lane == 0) _t_build = clock64();
+
     for (int nextsp = 4; nextsp <= N; nextsp++)
     {
         if (lane == 0)
@@ -675,6 +689,7 @@ __global__ void buildParsimonyTreesKernel(
     if (lane == 0)
     {
         topo->bestParsimony = sh.bestParsimony;
+        if (k == 0) sh.t_build = clock64() - _t_build;
     }
     __syncwarp();
 
@@ -684,6 +699,9 @@ __global__ void buildParsimonyTreesKernel(
         return;
     }
 
+    long long _t_phase2 = 0LL;
+    if (k == 0 && lane == 0) _t_phase2 = clock64();
+
     if (lane == 0)
     {
         gpuNodeRectifierPars(topo, sh, N);
@@ -692,85 +710,154 @@ __global__ void buildParsimonyTreesKernel(
         topo->preSprParsimony = sh.bestParsimony;
     }
     __syncwarp();
-    
+
     gpuSPRHillClimb(pars_tree, score_tree, topo, sh, N, sprDist, width, states, lane);
-    
+
     if (lane == 0)
     {
+        topo->postSprParsimony = sh.randomMP;
         topo->bestParsimony = sh.randomMP;
-        // printf("Post-SPR score: %d\n", topo->bestParsimony);
+        if (k == 0) sh.t_phase2 = clock64() - _t_phase2;
     }
     __syncwarp();
 
-    // ── Phase 3: iterative NNI + SPR×1 (odd) / ratchet + SPR×2 (even) ───────
-    // if (numSearchIter <= 0) return;
+    // ── Phase 3: iterative NNI + SPR×1 (even) / ratchet + SPR×2 (odd) ────────
+    if (numSearchIter <= 0)
+    {
+        return;
+    }
 
-    // // Init timing
-    // if (lane == 0 && k == 0)
-    //     sh.t_line2291 = sh.t_search = sh.t_apply = sh.n_apply = sh.n_dowhile = 0;
-    // __syncwarp();
+    // Reset Phase 3 timing accumulators
+    if (lane == 0 && k == 0)
+    {
+        sh.t_p3_nni = sh.t_p3_nni_spr = sh.t_p3_ratchet = 0;
+        sh.n_p3_even = sh.n_p3_odd = 0;
+        sh.t_line2291 = sh.t_search = sh.t_apply = sh.n_apply = sh.n_dowhile = 0;
+    }
+    __syncwarp();
 
-    // for (int outer = 0; outer < numSearchIter; outer++)
-    // {
-    //     if (outer % 2 == 0)
-    //     {
-    //         // ── NNI perturbation + SPR (Opt 1: full=false, Opt 2: sprDist4) ──
-    //         gpuRandomNNIs(topo, sh, N, numNNI, lane);
+    for (int outer = 0; outer < numSearchIter; outer++)
+    {
+        if (outer % 2 == 0)
+        {
+            // ── NNI perturbation + SPR ────────────────────────────────────────
+            long long _t0 = 0LL;
+            if (k == 0 && lane == 0) _t0 = clock64();
 
-    //         unsigned int pm = createTiAndEvaluateParsimony(
-    //             pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width, states);
-    //         if (lane == 0) { sh.randomMP = pm;  sh.randomMPHits = 1; }
-    //         __syncwarp();
+            gpuRandomNNIs(topo, sh, N, numNNI, lane);
 
-    //         gpuSPRHillClimb(pars_tree, score_tree, topo, sh, N, sprDist4,
-    //                         width, states, lane, maxDoWhile, /*timing=*/(k==0));
-    //     }
-    //     else
-    //     {
-    //         // ── Ratchet: weighted SPR (hclimb1) + normal SPR (hclimb2) ───────
-    //         if (lane == 0)
-    //         {
-    //             for (int b = 0; b < width; b++)
-    //                 sw_k[b] = (gpuRandum(&sh.seed) < 0.5) ? 2u : 1u;
-    //             sh.site_weights = sw_k;
-    //         }
-    //         __syncwarp();
+            if (lane == 0)
+            {
+                gpuNodeRectifierPars(topo, sh, N);
+            }
+            __syncwarp();
+            unsigned int pm = createTiAndEvaluateParsimony(
+                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width, states
+            );
+            if (lane == 0)
+            {
+                sh.randomMP = pm;
+                sh.randomMPHits = 1;
+            }
+            __syncwarp();
 
-    //         unsigned int pm1 = createTiAndEvaluateParsimony(
-    //             pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width, states);
-    //         if (lane == 0) { sh.randomMP = pm1;  sh.randomMPHits = 1; }
-    //         __syncwarp();
+            long long _t1 = 0LL;
+            if (k == 0 && lane == 0) { sh.t_p3_nni += (_t1 = clock64()) - _t0; }
 
-    //         gpuSPRHillClimb(pars_tree, score_tree, topo, sh, N, sprDist4,
-    //                         width, states, lane, maxDoWhile, false);
+            gpuSPRHillClimb(
+                pars_tree, score_tree, topo, sh, N, sprDist, width, states, lane, maxDoWhile,
+                /*timing=*/(k == 0)
+            );
 
-    //         if (lane == 0) sh.site_weights = nullptr;
-    //         __syncwarp();
+            if (k == 0 && lane == 0)
+            {
+                sh.t_p3_nni_spr += clock64() - _t1;
+                sh.n_p3_even++;
+            }
+        }
+        else
+        {
+            // ── Ratchet: weighted SPR (hclimb1) + normal SPR (hclimb2) ───────
+            long long _t0 = 0LL;
+            if (k == 0 && lane == 0) _t0 = clock64();
 
-    //         unsigned int pm2 = createTiAndEvaluateParsimony(
-    //             pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width, states);
-    //         if (lane == 0) { sh.randomMP = pm2;  sh.randomMPHits = 1; }
-    //         __syncwarp();
+            if (lane == 0)
+            {
+                for (int b = 0; b < width; b++)
+                {
+                    sw_k[b] = (gpuRandum(&sh.seed) < 0.5) ? 2u : 1u;
+                }
+                sh.site_weights = sw_k;
+            }
+            __syncwarp();
 
-    //         gpuSPRHillClimb(pars_tree, score_tree, topo, sh, N, sprDist4,
-    //                         width, states, lane, maxDoWhile, false);
-    //     }
+            unsigned int pm1 = createTiAndEvaluateParsimony(
+                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width, states
+            );
+            if (lane == 0)
+            {
+                sh.randomMP = pm1;
+                sh.randomMPHits = 1;
+            }
+            __syncwarp();
 
-    //     if (lane == 0 && sh.randomMP < topo->bestParsimony)
-    //         topo->bestParsimony = sh.randomMP;
-    //     __syncwarp();
-    // }
+            gpuSPRHillClimb(
+                pars_tree, score_tree, topo, sh, N, sprDist, width, states, lane, maxDoWhile, false
+            );
+
+            if (lane == 0)
+            {
+                sh.site_weights = nullptr;
+            }
+            __syncwarp();
+
+            unsigned int pm2 = createTiAndEvaluateParsimony(
+                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width, states
+            );
+            if (lane == 0)
+            {
+                sh.randomMP = pm2;
+                sh.randomMPHits = 1;
+            }
+            __syncwarp();
+
+            gpuSPRHillClimb(
+                pars_tree, score_tree, topo, sh, N, sprDist, width, states, lane, maxDoWhile, false
+            );
+
+            if (k == 0 && lane == 0)
+            {
+                sh.t_p3_ratchet += clock64() - _t0;
+                sh.n_p3_odd++;
+            }
+        }
+
+        if (lane == 0 && sh.randomMP < topo->bestParsimony)
+        {
+            topo->bestParsimony = sh.randomMP;
+        }
+        __syncwarp();
+    }
 
     // Print timing for block 0
     if (k == 0 && lane == 0)
     {
-        long long t_total = sh.t_line2291 + sh.t_search + sh.t_apply;
+        long long t_spr_total = sh.t_line2291 + sh.t_search + sh.t_apply;
         printf(
-            "[TIMING k=0 Phase4] line2291=%lld (%.1f%%)  search=%lld (%.1f%%)  apply=%lld (%.1f%%)"
-            "  moves=%d  dowhile_passes=%d\n",
-            sh.t_line2291, t_total > 0 ? 100.0 * sh.t_line2291 / t_total : 0.0, sh.t_search,
-            t_total > 0 ? 100.0 * sh.t_search / t_total : 0.0, sh.t_apply,
-            t_total > 0 ? 100.0 * sh.t_apply / t_total : 0.0, sh.n_apply, sh.n_dowhile
+            "[TIMING k=0] Phase1 build=%lld cyc\n"
+            "[TIMING k=0] Phase2 initial-SPR=%lld cyc\n"
+            "[TIMING k=0] Phase3 NNI+SPR (%d iters): nni_setup=%lld cyc  spr=%lld cyc\n"
+            "[TIMING k=0] Phase3 Ratchet  (%d iters): total=%lld cyc\n"
+            "[TIMING k=0] Phase3 SPR breakdown: line2291=%lld (%.1f%%)  search=%lld (%.1f%%)"
+            "  apply=%lld (%.1f%%)  moves=%d  dowhile=%d\n",
+            sh.t_build,
+            sh.t_phase2,
+            sh.n_p3_even, sh.t_p3_nni, sh.t_p3_nni_spr,
+            sh.n_p3_odd, sh.t_p3_ratchet,
+            sh.t_line2291, t_spr_total > 0 ? 100.0 * sh.t_line2291 / t_spr_total : 0.0,
+            sh.t_search,  t_spr_total > 0 ? 100.0 * sh.t_search  / t_spr_total : 0.0,
+            sh.t_apply,   t_spr_total > 0 ? 100.0 * sh.t_apply   / t_spr_total : 0.0,
+            sh.n_apply, sh.n_dowhile
         );
     }
 }
@@ -780,7 +867,6 @@ void gpuStepwiseBuildTrees(
     GpuParsimonyMem* mem,
     const long* seeds,
     int sprDist,
-    int sprDist4,
     int numSearchIter,
     int numNNI,
     int maxDoWhile,
@@ -798,14 +884,14 @@ void gpuStepwiseBuildTrees(
 
     const size_t sharedBytes = sizeof(BuildShared);
     printf(
-        "[GPU] buildParsimonyTreesKernel: K=%d  sprDist=%d  sprDist4=%d"
+        "[GPU] buildParsimonyTreesKernel: K=%d  sprDist=%d"
         "  numSearchIter=%d  numNNI=%d  maxDoWhile=%d  shared=%.1f KB\n",
-        mem->K, sprDist, sprDist4, numSearchIter, numNNI, maxDoWhile, sharedBytes / 1024.0
+        mem->K, sprDist, numSearchIter, numNNI, maxDoWhile, sharedBytes / 1024.0
     );
 
     buildParsimonyTreesKernel<<<dim3(mem->K), dim3(kWarpSize), sharedBytes, stream>>>(
         mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, d_seeds, mem->width,
-        mem->states, sprDist, sprDist4, numSearchIter, numNNI, maxDoWhile, mem->parsVectPerTree,
+        mem->states, sprDist, numSearchIter, numNNI, maxDoWhile, mem->parsVectPerTree,
         mem->parsScorePerTree
     );
 

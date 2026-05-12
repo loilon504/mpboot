@@ -3366,7 +3366,6 @@ void _pllComputeRandomizedStepwiseAdditionParsimonyTree(pllInstance * tr, partit
  * @return best parsimony score found
  */
 int pllOptimizeSprParsimony(pllInstance * tr, partitionList * pr, int mintrav, int maxtrav, IQTree *_iqtree){
-  PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/doNNISearch/pllOptimizeSprParsimony");
 	int perSiteScores = globalParam->gbo_replicates > 0;
 
 	iqtree = _iqtree; // update pointer to IQTree
