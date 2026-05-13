@@ -11,20 +11,13 @@
 | Opt-G | Selective Phase 3 atomicMin margin | −22–50% tùy dataset |
 | Opt-G2 | Selective Phase 3 two-kernel exact top-X% | −44% trên N=295 |
 | Opt-I | NNI strength configurable (gpu_nni_strength) | Baseline alignment |
+| Opt-K | gpu_stop default 2 → 4 | Quality tốt hơn trên N≥295 |
+| Opt-B | Subtree prune trong SPR DFS (per-edge lb check) | ~22% prune rate, avg 1.31× speedup |
+| Opt-B+ | Tighter lb: thêm score_tree[tip_p] | **~30% prune rate, avg 1.49× speedup, 10/10 faster** |
 
 ---
 
 ## Còn lại — theo độ khó và rủi ro
-
-### 🟢 Dễ, rủi ro thấp
-
-#### Opt-B: Subtree prune trong SPR DFS
-**Ý tưởng**: Trong `doAddTraverse` (`pars_build.cu`), trước khi DFS vào subtree q: nếu `score_tree[q_num] + score_tree[back_of_q]` ≥ `sh.randomMP` → không thể improve → skip toàn bộ subtree.
-
-**Lý thuyết**: Lower bound cho parsimony của bất kỳ insertion nào vào subtree q.  
-**File**: `pars_build.cu` — `doAddTraverse`, ~5 dòng.  
-**Rủi ro thấp**: Nếu prune rate thấp (như Opt-A với 0.2%), không có hại.  
-**Effort**: 1-2 giờ.
 
 ---
 

@@ -177,6 +177,10 @@ __device__ void doAddTraverse(
     }
     __syncwarp();
 
+    // Opt-B+: tighter lower bound — add score_tree[tip_p] (computed once per call).
+    // mp >= score_tree[tip_p] + score_tree[q_cand] + score_tree[r] (all cross terms >= 0).
+    const unsigned int score_tip_p = score_tree[vfToNum(topo->back_vf[p], N)];
+
     while (sh.stackTop > 0)
     {
         if (lane == 0)
@@ -192,15 +196,28 @@ __device__ void doAddTraverse(
 
         if (mint <= 0)
         {
-            testInsert(pars_tree, score_tree, topo, sh, p, cur_q, N, width, states, lane, log);
+            // Opt-B: lower bound prune — mp >= score_tree[cur_q] + score_tree[r] always.
+            // If lb >= sh.randomMP, testInsert cannot improve → skip safely.
+            const unsigned int lb = score_tip_p + score_tree[q_num]
+                                  + score_tree[vfToNum(topo->back_vf[cur_q], N)];
+            if (log && lane == 0)
+            {
+                sh.n_optb_checked++;
+                if (lb >= sh.randomMP) sh.n_optb_pruned++;
+            }
+            if (lb < sh.randomMP)
+            {
+                testInsert(pars_tree, score_tree, topo, sh, p, cur_q, N, width, states, lane, log);
+            }
         }
 
         if (q_num > N && maxt > 0)
         {
             if (lane == 0)
             {
-                int qn = topo->back_vf[vfNextFace(cur_q, N)];
+                int qn  = topo->back_vf[vfNextFace(cur_q, N)];
                 int qnn = topo->back_vf[vfNnxtFace(cur_q, N)];
+
                 sh.stack[sh.stackTop] = qnn;
                 sh.stackMint[sh.stackTop] = mint - 1;
                 sh.stackMaxt[sh.stackTop] = maxt - 1;
@@ -626,6 +643,7 @@ __device__ void runPhase3(
         sh.t_line2291 = sh.t_search = sh.t_apply = sh.n_apply = sh.n_dowhile = 0;
         sh.t_ti_newview = sh.t_ti_eval = 0;
         sh.n_testInsert = sh.n_ti_newview_size = sh.n_ti_eval_size = 0;
+        sh.n_optb_pruned = sh.n_optb_checked = 0;
     }
     __syncwarp();
 
@@ -1050,7 +1068,8 @@ __global__ void buildParsimonyTreesKernel(
             "  apply=%lld (%.1f%%)  moves=%d  dowhile=%d\n"
             "[TIMING k=0] testInsert (%d calls): newview=%lld (%.1f%%)"
             "  eval=%lld (%.1f%%)  total_ti=%lld vs search=%lld\n"
-            "[TIMING k=0] testInsert avg traversal: newview=%.2f nodes  eval=%.2f nodes\n",
+            "[TIMING k=0] testInsert avg traversal: newview=%.2f nodes  eval=%.2f nodes\n"
+            "[TIMING k=0] Opt-B prune: %d/%d edges pruned (%.2f%%)\n",
             sh.t_build, sh.t_phase2, sh.n_p3_even, sh.t_p3_nni, sh.t_p3_nni_spr, sh.n_p3_odd,
             sh.t_p3_ratchet, sh.t_line2291,
             t_spr_total > 0 ? 100.0 * sh.t_line2291 / t_spr_total : 0.0, sh.t_search,
@@ -1059,7 +1078,9 @@ __global__ void buildParsimonyTreesKernel(
             sh.t_ti_newview, t_ti_total > 0 ? 100.0 * sh.t_ti_newview / t_ti_total : 0.0,
             sh.t_ti_eval, t_ti_total > 0 ? 100.0 * sh.t_ti_eval / t_ti_total : 0.0, t_ti_total,
             sh.t_search, n > 0 ? (float)sh.n_ti_newview_size / n : 0.0f,
-            n > 0 ? (float)sh.n_ti_eval_size / n : 0.0f
+            n > 0 ? (float)sh.n_ti_eval_size / n : 0.0f,
+            sh.n_optb_pruned, sh.n_optb_checked,
+            sh.n_optb_checked > 0 ? 100.0f * sh.n_optb_pruned / sh.n_optb_checked : 0.0f
         );
     }
 }

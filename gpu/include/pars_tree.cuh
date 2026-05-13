@@ -149,6 +149,8 @@ struct alignas(
     int n_testInsert;          // testInsert calls
     int n_ti_newview_size;     // total nodes traversed in newview (tiSize/3)
     int n_ti_eval_size;        // total nodes traversed in eval (tiSize/3)
+    int n_optb_pruned;         // Opt-B: testInsert calls skipped by lb prune
+    int n_optb_checked;        // Opt-B: total edges checked (mint<=0)
 };
 
 // ─── Host API ─────────────────────────────────────────────────────────────────
