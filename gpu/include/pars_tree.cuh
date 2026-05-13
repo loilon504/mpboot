@@ -71,6 +71,7 @@ struct GpuParsimonyMem
     unsigned int* d_parsScore;    // [K][2N+1]
     GpuTopology* d_topos;         // [K] topology per tree (global mem)
     unsigned int* d_siteWeights;  // [K][width] per-block weights; 1=normal, 2=ratchet-doubled
+    unsigned int* d_globalBest;   // [1] running atomicMin of postSprParsimony across blocks (Opt-G)
 
     int K;  // number of trees
     int mxtips;

@@ -102,22 +102,29 @@ int gpuInitCandidateTrees(
 
     // ── [5+6+7] Joined kernel: build + initial SPR + iterative NNI+SPR ─────────
     // Phase 4 params
-    const int numNNI        = (mxtips > 4) ? (mxtips - 3) / 10 : 1;
-    const int numSearchIter = params.gpu_hc_iter;
-    const int maxDoWhile    = 5;
+    const int numNNI          = (mxtips > 4) ? max(1, (int)(params.gpu_nni_strength * (mxtips - 3))) : 1;
+    const int numSearchIter   = params.gpu_hc_iter;
+    const int stopNoImprove   = params.gpu_stop;
+    // gpu_phase3_margin is in percent (supports fractional e.g. 0.1).
+    // Internally stored as tenths-of-percent (1 = 0.1%, 10 = 1.0%, 50 = 5.0%).
+    const unsigned int margin = (params.gpu_phase3_margin < 0.0f)
+                                    ? 0xFFFFFFFFu
+                                    : (unsigned int)(params.gpu_phase3_margin * 10.0f + 0.5f);
 
     float build_ms = ev_time(
         [&]
         {
             gpuStepwiseBuildTrees(mem, seeds.data(), params.sprDist,
-                                  numSearchIter, numNNI, maxDoWhile, stream);
+                                  numSearchIter, numNNI, stopNoImprove, margin, stream);
         }
     );
     printf(
         "[GPU]   [5+6+7] GPU kernel (build+SPR+search): %.1f ms  (%d trees, %.2f ms/tree)"
-        "  [iters=%d NNI=%d sprDist=%d maxDW=%d]\n",
+        "  [iters=%d NNI=%d(%.2f) sprDist=%d stop=%d margin=%s]\n",
         (double)build_ms, K, K > 0 ? (double)build_ms / K : 0.0,
-        numSearchIter, numNNI, params.sprDist, maxDoWhile
+        numSearchIter, numNNI, params.gpu_nni_strength, params.sprDist, stopNoImprove,
+        margin == 0xFFFFFFFFu ? "off"
+            : (std::to_string(margin / 10) + "." + std::to_string(margin % 10) + "%").c_str()
     );
 
     // ── [6b] Pre/post-SPR parsimony summary ──────────────────────────────────

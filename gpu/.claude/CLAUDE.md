@@ -25,7 +25,7 @@ make -j4 && /usr/bin/time -v ./mpboot-avx \
 ```bash
 make -j4 && /usr/bin/time -v ./mpboot-avx \
     -s ../data_debug/tree1.phy -use_gpu -seed 1 \
-    -numpars 200 -gpu_hc_iter 10 -sprdist 3 \
+    -numpars 200 -sprdist 3 \
     > tree2.txt 2>&1
 ```
 
@@ -38,13 +38,40 @@ python3 ../output/summarize.py             # → output/results.xlsx
 ```
 
 ### Key CLI flags
+
+#### User-facing (CLI)
 | Flag | Default | Ý nghĩa |
 |------|---------|---------|
-| `-sprdist N` | 6 | SPR radius cho mọi phase |
-| `-numpars K` | 100 | số cây GPU (thực tế K-1 trees) |
-| `-gpu_hc_iter N` | 0 | số Phase 3 iterations (NNI+SPR + ratchet pairs) |
-| `-seed N` | random | RNG seed |
-| `-use_gpu` | off | bật GPU mode |
+| `-use_gpu` | off | Bật GPU mode — gọi `gpuInitCandidateTrees()` thay vì CPU stepwise |
+| `-numpars K` | 100 | Số cây parsimony ban đầu. GPU dùng **K−1 blocks** (tree index 1..K-1) |
+| `-sprdist N` | 6¹ | SPR radius dùng cho Phase 2 (initial SPR) và Phase 3 (NNI+SPR) |
+| `-gpu_hc_iter N` | **30** | Safety cap cho số vòng lặp tối đa của Phase 3. Primary stopping là `-gpu_stop`; 30 là "4× max observed" — đủ headroom |
+| `-gpu_stop N` | 2 | Early stopping: dừng Phase 3 sau N iterations liên tiếp không cải thiện. **Primary stopping mechanism.** 0 = tắt |
+| `-gpu_phase3_margin X` | -1 | Opt-G: bỏ qua Phase 3 nếu postSprParsimony > globalBest×(1+X/100). X là % (hỗ trợ thập phân, e.g. 0.1). -1 = tắt |
+| `-gpu_nni_strength X` | **0.1** | Strength NNI perturbation trong Phase 3: `numNNI = X×(N−3)`. 0.1 matching CPU's /10 heuristic, benchmark-optimal |
+| `-seed N` | random | RNG seed cho tất cả K trees |
+
+¹ Default thực tế phụ thuộc vào context; benchmark GPU thường dùng `-sprdist 3`.
+
+#### Derived / internal (không phải CLI)
+| Parameter | Source | Ý nghĩa |
+|-----------|--------|---------|
+| `numNNI` | `max(1, gpu_nni_strength×(N−3))` | Số NNI perturbation mỗi even iteration của Phase 3. `gpu_init_trees.cu` |
+| `K` | `numpars − 1` | Số CUDA blocks = số trees thực sự build. `gpu_init_trees.cu:34` |
+| `margin` (internal) | `gpu_phase3_margin × 10` | Tenths-of-percent (1=0.1%, 10=1.0%). `UINT_MAX` = disabled |
+
+#### Recommended benchmark command
+```bash
+./mpboot-avx -s <dataset> -use_gpu -seed 42 \
+    -numpars 400 -sprdist 3 -gpu_stop 4
+# gpu_hc_iter=30 và gpu_nni_strength=0.1 dùng default
+```
+
+#### Thông tin kernel (in lúc chạy)
+```
+[GPU]   [5+6+7] GPU kernel (build+SPR+search): 20527.9 ms  (199 trees, 103.16 ms/tree)
+        [iters=10 NNI=29(0.10) sprDist=3 stop=4 margin=off]
+```
 
 ---
 
@@ -369,6 +396,20 @@ best_back_vf[0]  offset=32.0 KB  COLD
 **Benchmark** (10 datasets, seed=1, numpars=200, gpu_hc_iter=10, sprdist=3):
 average **−8.7% ms/tree** across N=55..395. Range: −4% to −14%.
 Parsimony quality unchanged (2/10 differ by ±2 = stochasticity).
+
+### ✅ Early stopping Phase 3 — Opt-H (2026-05-12)
+
+**Insight**: Most trees converge well before `numSearchIter` (e.g. 10) iterations. Running extra iterations wastes compute when no improvement is found.
+
+**Fix**: Add `no_improve_count` counter in Phase 3 for-loop. At end of each iteration, if `sh.randomMP >= best_before` (no improvement vs start of this iteration) → increment; else reset. When `no_improve_count >= 2`: lane 0 sets `sh.bcast[0] = 1`, `__syncwarp()`, all lanes `break`.
+
+**Key invariant**: `topo->best_back_vf[]` is always saved on any improvement (line 910-913), so early-exit doesn't affect downloaded topology quality.
+
+**Benchmark** (10 datasets, seed=1, numpars=200, gpu_hc_iter=10, sprdist=3):
+average **−32.4% ms/tree** across N=55..395. Range: −17% to −57%.
+Actual iterations used: 2–8 (vs 10 hardcoded). Quality: 9/10 same or better.
+
+**File**: `gpu/src/pars_build.cu` — Phase 3 for-loop (~10 lines added).
 
 ### Fixed bugs (cumulative)
 
