@@ -1686,7 +1686,8 @@ struct Params {
     int gpu_hc_spr_dist;    // SPR radius for GPU Phase 3 hill-climbing
     int gpu_stop;           // early stopping: stop Phase 3 after this many consecutive no-improve iters (default 2)
     float gpu_phase3_margin;  // Opt-G: skip Phase 3 if postSprParsimony > globalBest*(1+margin/100); -1=disabled (supports fractional, e.g. 0.1)
-    float gpu_nni_strength;   // Phase 3 NNI perturbation: numNNI = strength*(N-3), min 1; default=0.5 matches CPU initPerStrength
+    float gpu_nni_strength;   // Phase 3 NNI perturbation: numNNI = strength*(N-3), min 1; default=0.1
+    float gpu_phase3_top_pct; // Opt-G2 two-kernel: only top X% trees (lowest postSprParsimony) do Phase 3; -1=disabled
 };
 
 /**

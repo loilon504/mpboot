@@ -42,6 +42,7 @@ struct GpuTopology
     unsigned int bestParsimony;
     unsigned int preSprParsimony;   // parsimony after stepwise addition (before initial SPR)
     unsigned int postSprParsimony;  // parsimony after initial SPR (before hill-climbing)
+    long savedSeed;                  // RNG state saved at end of Phase 2; restored by buildPhase3Kernel
     int insert_vface;              // insertNode as vface (-1 = NULL)
     int start_vface;               // tr->start as vface
     int num_vfaces;                // = mxtips + 3*(mxtips-1)
@@ -72,6 +73,7 @@ struct GpuParsimonyMem
     GpuTopology* d_topos;         // [K] topology per tree (global mem)
     unsigned int* d_siteWeights;  // [K][width] per-block weights; 1=normal, 2=ratchet-doubled
     unsigned int* d_globalBest;   // [1] running atomicMin of postSprParsimony across blocks (Opt-G)
+    unsigned int* d_postSprScores; // [K] postSprParsimony scores, filled by Phase 2; used by Opt-G2 two-kernel
 
     int K;  // number of trees
     int mxtips;

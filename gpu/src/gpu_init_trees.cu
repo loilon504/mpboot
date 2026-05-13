@@ -111,20 +111,23 @@ int gpuInitCandidateTrees(
                                     ? 0xFFFFFFFFu
                                     : (unsigned int)(params.gpu_phase3_margin * 10.0f + 0.5f);
 
+    const float top_pct = params.gpu_phase3_top_pct;  // Opt-G2: -1=disabled
+
     float build_ms = ev_time(
         [&]
         {
             gpuStepwiseBuildTrees(mem, seeds.data(), params.sprDist,
-                                  numSearchIter, numNNI, stopNoImprove, margin, stream);
+                                  numSearchIter, numNNI, stopNoImprove, margin, top_pct, stream);
         }
     );
     printf(
         "[GPU]   [5+6+7] GPU kernel (build+SPR+search): %.1f ms  (%d trees, %.2f ms/tree)"
-        "  [iters=%d NNI=%d(%.2f) sprDist=%d stop=%d margin=%s]\n",
+        "  [iters=%d NNI=%d(%.2f) sprDist=%d stop=%d margin=%s top_pct=%s]\n",
         (double)build_ms, K, K > 0 ? (double)build_ms / K : 0.0,
         numSearchIter, numNNI, params.gpu_nni_strength, params.sprDist, stopNoImprove,
         margin == 0xFFFFFFFFu ? "off"
-            : (std::to_string(margin / 10) + "." + std::to_string(margin % 10) + "%").c_str()
+            : (std::to_string(margin / 10) + "." + std::to_string(margin % 10) + "%").c_str(),
+        top_pct <= 0.0f ? "off" : (std::to_string((int)(top_pct * 100 + 0.5f)) + "%").c_str()
     );
 
     // ── [6b] Pre/post-SPR parsimony summary ──────────────────────────────────

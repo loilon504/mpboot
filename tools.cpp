@@ -828,9 +828,10 @@ void parseArg(int argc, char *argv[], Params &params) {
 	params.use_gpu = false;
 	params.gpu_hc_iter = 30;
 	params.gpu_hc_spr_dist = 6;
-	params.gpu_stop = 2;
+	params.gpu_stop = 4;
 	params.gpu_phase3_margin = -1.0f;
-	params.gpu_nni_strength  = 0.1f;
+	params.gpu_nni_strength   = 0.1f;
+	params.gpu_phase3_top_pct = 0.1f;
 
 	if (params.nni5) {
 	    params.nni_type = NNI5;
@@ -2725,6 +2726,10 @@ void parseArg(int argc, char *argv[], Params &params) {
 			}
 			if (strcmp(argv[cnt], "-gpu_nni_strength") == 0) {
 				params.gpu_nni_strength = (float)atof(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_phase3_top_pct") == 0) {
+				params.gpu_phase3_top_pct = (float)atof(argv[++cnt]);
 				continue;
 			}
 			if (argv[cnt][0] == '-') {

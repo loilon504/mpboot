@@ -105,7 +105,8 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     CUDA_CHECK(cudaMalloc(&mem->d_parsScore,   parsScoreBytes));
     CUDA_CHECK(cudaMalloc(&mem->d_topos,       topoBytes));
     CUDA_CHECK(cudaMalloc(&mem->d_siteWeights, siteWeightsBytes));
-    CUDA_CHECK(cudaMalloc(&mem->d_globalBest,  sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&mem->d_globalBest,    sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&mem->d_postSprScores, (size_t)K * sizeof(unsigned int)));
 
     CUDA_CHECK(cudaMemset(mem->d_parsVect,    0, parsVectBytes));
     CUDA_CHECK(cudaMemset(mem->d_parsScore,   0, parsScoreBytes));
@@ -147,6 +148,10 @@ void gpuParsimonyMemFree(
     if (mem->d_globalBest)
     {
         cudaFree(mem->d_globalBest);
+    }
+    if (mem->d_postSprScores)
+    {
+        cudaFree(mem->d_postSprScores);
     }
     delete mem;
 }
