@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <type_traits>
 #include <vector>
 
 #include "gpu/include/pars_build.cuh"
@@ -20,16 +21,16 @@ __device__ __forceinline__ void gpuHookup(
 }
 
 // ─── testInsert ───────────────────────────────────────────────────────────────
+template<int STATES, typename SharedT>
 __device__ void testInsert(
     parsimonyNumber* __restrict__ pars_tree,
     unsigned int* __restrict__ score_tree,
     GpuTopology* topo,
-    BuildShared& sh,
+    SharedT& sh,
     int p,
     int q,
     int N,
     int width,
-    int states,
     int lane,
     bool log = false
 )
@@ -72,7 +73,7 @@ __device__ void testInsert(
     __syncwarp();
     if (sh.tiSize > 3)
     {
-        newviewParsimony(pars_tree, score_tree, sh, false, width, states);
+        newviewParsimony<SharedT, STATES>(pars_tree, score_tree, sh, false, width);
     }
     if (lane == 0)
     {
@@ -120,7 +121,7 @@ __device__ void testInsert(
             }
         }
         __syncwarp();
-        mp = newviewParsimony(pars_tree, score_tree, sh, true, width, states);
+        mp = newviewParsimony<SharedT, STATES>(pars_tree, score_tree, sh, true, width);
     }
 
     if (log)
@@ -152,18 +153,18 @@ __device__ void testInsert(
 }
 
 // ─── doAddTraverse ────────────────────────────────────────────────────────────
+template<int STATES, typename SharedT>
 __device__ void doAddTraverse(
     parsimonyNumber* __restrict__ pars_tree,
     unsigned int* __restrict__ score_tree,
     GpuTopology* topo,
-    BuildShared& sh,
+    SharedT& sh,
     int p,
     int q,
     int mintrav,
     int maxtrav,
     int N,
     int width,
-    int states,
     int lane,
     bool log = false
 )
@@ -207,7 +208,7 @@ __device__ void doAddTraverse(
             }
             if (lb < sh.randomMP)
             {
-                testInsert(pars_tree, score_tree, topo, sh, p, cur_q, N, width, states, lane, log);
+                testInsert<STATES>(pars_tree, score_tree, topo, sh, p, cur_q, N, width, lane, log);
             }
         }
 
@@ -236,8 +237,9 @@ __device__ void doAddTraverse(
 // GPU equivalent of CPU nodeRectifierPars + reorderNodes (sprparsimony.cpp:2089).
 // DFS from nodep[1]->back; reassigns nodep[N+1..2N-1] in DFS order without
 // touching xpars or back_vf. Lane 0 only.
+template<typename SharedT>
 __device__ void gpuNodeRectifierPars(
-    GpuTopology* topo, BuildShared& sh, int N
+    GpuTopology* topo, SharedT& sh, int N
 )
 {
     // Mirrors CPU nodeRectifierPars + reorderNodes (sprparsimony.cpp:2089).
@@ -276,24 +278,23 @@ __device__ void gpuNodeRectifierPars(
 }
 
 // ─── applyMove ────────────────────────────────────────────────────────────────
+template<int STATES, typename SharedT>
 __device__ void applyMove(
     parsimonyNumber* __restrict__ pars_tree,
     unsigned int* __restrict__ score_tree,
     GpuTopology* topo,
-    BuildShared& sh,
+    SharedT& sh,
     int rm,
     int ins,
     int N,
     int width,
-    int states,
     int lane
 )
 {
     if (lane == 0)
     {
         int pn = vfNextFace(rm, N), pnn = vfNnxtFace(rm, N);
-        int p1 = topo->back_vf[pn], p2 = topo->back_vf[pnn];
-        gpuHookup(topo->back_vf, p1, p2);
+        gpuHookup(topo->back_vf, topo->back_vf[pn], topo->back_vf[pnn]);
         topo->back_vf[pn] = -1;
         topo->back_vf[pnn] = -1;
 
@@ -302,19 +303,19 @@ __device__ void applyMove(
         gpuHookup(topo->back_vf, pnn, r);
     }
     __syncwarp();
-    createTiAndNewviewParsimony(pars_tree, score_tree, topo, sh, rm, N, width, states, lane);
+    createTiAndNewviewParsimony<SharedT, STATES>(pars_tree, score_tree, topo, sh, rm, N, width, lane);
     __syncwarp();
 }
 
+template<int STATES, typename SharedT>
 __device__ void gpuSPRHillClimb(
     parsimonyNumber* __restrict__ pars_tree,
     unsigned int* __restrict__ score_tree,
     GpuTopology* topo,
-    BuildShared& sh,
+    SharedT& sh,
     int N,
     int sprDist,
     int width,
-    int states,
     int lane,
     bool do_timing = false
 )
@@ -351,8 +352,8 @@ __device__ void gpuSPRHillClimb(
             const int p = sh.bcast[4], q = sh.bcast[5];
 
             long long t0 = log ? clock64() : 0;
-            createTiAndEvaluateParsimony(
-                pars_tree, score_tree, topo, sh, p, N, false, width, states
+            createTiAndEvaluateParsimony<SharedT, STATES>(
+                pars_tree, score_tree, topo, sh, p, N, false, width
             );
             if (log)
             {
@@ -384,24 +385,24 @@ __device__ void gpuSPRHillClimb(
                     long long t1 = log ? clock64() : 0;
                     if (p1 >= N)
                     {
-                        doAddTraverse(
+                        doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, p, back_vf[vfNextFace(p1, N)], 1,
-                            sprDist, N, width, states, lane, log
+                            sprDist, N, width, lane, log
                         );
-                        doAddTraverse(
+                        doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, p, back_vf[vfNnxtFace(p1, N)], 1,
-                            sprDist, N, width, states, lane, log
+                            sprDist, N, width, lane, log
                         );
                     }
                     if (p2 >= N)
                     {
-                        doAddTraverse(
+                        doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, p, back_vf[vfNextFace(p2, N)], 1,
-                            sprDist, N, width, states, lane, log
+                            sprDist, N, width, lane, log
                         );
-                        doAddTraverse(
+                        doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, p, back_vf[vfNnxtFace(p2, N)], 1,
-                            sprDist, N, width, states, lane, log
+                            sprDist, N, width, lane, log
                         );
                     }
                     if (log)
@@ -415,8 +416,8 @@ __device__ void gpuSPRHillClimb(
                         gpuHookup(back_vf, vfNnxtFace(p, N), p2);
                     }
                     __syncwarp();
-                    createTiAndNewviewParsimony(
-                        pars_tree, score_tree, topo, sh, p, N, width, states, lane
+                    createTiAndNewviewParsimony<SharedT, STATES>(
+                        pars_tree, score_tree, topo, sh, p, N, width, lane
                     );
                     __syncwarp();
                 }
@@ -453,24 +454,24 @@ __device__ void gpuSPRHillClimb(
                     long long t2 = log ? clock64() : 0;
                     if (q1 >= N)
                     {
-                        doAddTraverse(
+                        doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, q, back_vf[vfNextFace(q1, N)], 2,
-                            sprDist, N, width, states, lane, log
+                            sprDist, N, width, lane, log
                         );
-                        doAddTraverse(
+                        doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, q, back_vf[vfNnxtFace(q1, N)], 2,
-                            sprDist, N, width, states, lane, log
+                            sprDist, N, width, lane, log
                         );
                     }
                     if (q2 >= N)
                     {
-                        doAddTraverse(
+                        doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, q, back_vf[vfNextFace(q2, N)], 2,
-                            sprDist, N, width, states, lane, log
+                            sprDist, N, width, lane, log
                         );
-                        doAddTraverse(
+                        doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, q, back_vf[vfNnxtFace(q2, N)], 2,
-                            sprDist, N, width, states, lane, log
+                            sprDist, N, width, lane, log
                         );
                     }
                     if (log)
@@ -484,8 +485,8 @@ __device__ void gpuSPRHillClimb(
                         gpuHookup(back_vf, vfNnxtFace(q, N), q2);
                     }
                     __syncwarp();
-                    createTiAndNewviewParsimony(
-                        pars_tree, score_tree, topo, sh, q, N, width, states, lane
+                    createTiAndNewviewParsimony<SharedT, STATES>(
+                        pars_tree, score_tree, topo, sh, q, N, width, lane
                     );
                     __syncwarp();
                 }
@@ -519,9 +520,8 @@ __device__ void gpuSPRHillClimb(
             if (sh.bcast[9] >= 0)
             {
                 long long t3 = log ? clock64() : 0;
-                applyMove(
-                    pars_tree, score_tree, topo, sh, sh.bcast[9], sh.bcast[10], N, width, states,
-                    lane
+                applyMove<STATES>(
+                    pars_tree, score_tree, topo, sh, sh.bcast[9], sh.bcast[10], N, width, lane
                 );
                 // Update nodep[] for new topology (CPU: nodeRectifierPars after each SPR move)
                 // if (lane == 0)
@@ -544,8 +544,9 @@ __device__ void gpuSPRHillClimb(
 }
 
 // ─── gpuRandomNNIs ───────────────────────────────────────────────────────────
+template<typename SharedT>
 __device__ void gpuRandomNNIs(
-    GpuTopology* topo, BuildShared& sh, int N, int numNNI, int lane
+    GpuTopology* topo, SharedT& sh, int N, int numNNI, int lane
 )
 {
     if (lane != 0)
@@ -619,11 +620,12 @@ __device__ void gpuRandomNNIs(
 }
 
 // ─── Phase 3 device helper (shared by buildParsimonyTreesKernel + buildPhase3Kernel) ──
+template<int STATES, typename SharedT>
 __device__ void runPhase3(
     parsimonyNumber* pars_tree,
     unsigned int* score_tree,
     GpuTopology* topo,
-    BuildShared& sh,
+    SharedT& sh,
     unsigned int* sw_k,
     int N,
     int sprDist,
@@ -632,8 +634,7 @@ __device__ void runPhase3(
     int stopNoImprove,
     int lane,
     int k,
-    int width,
-    int states
+    int width
 )
 {
     if (lane == 0 && k == 0)
@@ -672,8 +673,8 @@ __device__ void runPhase3(
             }
             __syncwarp();
 
-            unsigned int pm = createTiAndEvaluateParsimony(
-                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width, states
+            unsigned int pm = createTiAndEvaluateParsimony<SharedT, STATES>(
+                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width
             );
             if (lane == 0)
             {
@@ -688,8 +689,8 @@ __device__ void runPhase3(
                 sh.t_p3_nni += (_t1 = clock64()) - _t0;
             }
 
-            gpuSPRHillClimb(
-                pars_tree, score_tree, topo, sh, N, sprDist, width, states, lane, (k == 0)
+            gpuSPRHillClimb<STATES>(
+                pars_tree, score_tree, topo, sh, N, sprDist, width, lane, (k == 0)
             );
 
             if (k == 0 && lane == 0)
@@ -716,8 +717,8 @@ __device__ void runPhase3(
             }
             __syncwarp();
 
-            unsigned int pm1 = createTiAndEvaluateParsimony(
-                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width, states
+            unsigned int pm1 = createTiAndEvaluateParsimony<SharedT, STATES>(
+                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width
             );
             if (lane == 0)
             {
@@ -726,8 +727,8 @@ __device__ void runPhase3(
             }
             __syncwarp();
 
-            gpuSPRHillClimb(
-                pars_tree, score_tree, topo, sh, N, sprDist, width, states, lane, false
+            gpuSPRHillClimb<STATES>(
+                pars_tree, score_tree, topo, sh, N, sprDist, width, lane, false
             );
 
             if (lane == 0)
@@ -736,8 +737,8 @@ __device__ void runPhase3(
             }
             __syncwarp();
 
-            unsigned int pm2 = createTiAndEvaluateParsimony(
-                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width, states
+            unsigned int pm2 = createTiAndEvaluateParsimony<SharedT, STATES>(
+                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width
             );
             if (lane == 0)
             {
@@ -746,8 +747,8 @@ __device__ void runPhase3(
             }
             __syncwarp();
 
-            gpuSPRHillClimb(
-                pars_tree, score_tree, topo, sh, N, sprDist, width, states, lane, false
+            gpuSPRHillClimb<STATES>(
+                pars_tree, score_tree, topo, sh, N, sprDist, width, lane, false
             );
 
             if (k == 0 && lane == 0)
@@ -757,24 +758,22 @@ __device__ void runPhase3(
             }
         }
 
-        if (lane == 0 && sh.randomMP < topo->bestParsimony)
-        {
-            topo->bestParsimony = sh.randomMP;
-            for (int vf = 0; vf < topo->num_vfaces; vf++)
-            {
-                topo->best_back_vf[vf] = topo->back_vf[vf];
-            }
-        }
         if (lane == 0)
         {
-            if (sh.randomMP >= best_before)
+            // Track per-phase effectiveness (all trees)
+            if (outer % 2 == 0) topo->n_total_even++;
+            else                  topo->n_total_odd++;
+
+            if (sh.randomMP < topo->bestParsimony)
             {
-                no_improve_count++;
+                topo->bestParsimony = sh.randomMP;
+                if (outer % 2 == 0) topo->n_improved_even++;
+                else                  topo->n_improved_odd++;
+                for (int vf = 0; vf < topo->num_vfaces; vf++)
+                    topo->best_back_vf[vf] = topo->back_vf[vf];
             }
-            else
-            {
-                no_improve_count = 0;
-            }
+            if (sh.randomMP >= best_before) no_improve_count++;
+            else                             no_improve_count = 0;
             sh.bcast[0] = (stopNoImprove > 0 && no_improve_count >= stopNoImprove) ? 1 : 0;
         }
         __syncwarp();
@@ -786,6 +785,7 @@ __device__ void runPhase3(
 }
 
 // ─── Kernel ───────────────────────────────────────────────────────────────────
+template<int STATES, int NTAXA>
 __global__ void buildParsimonyTreesKernel(
     parsimonyNumber* __restrict__ d_parsVect,
     unsigned int* __restrict__ d_parsScore,
@@ -793,22 +793,17 @@ __global__ void buildParsimonyTreesKernel(
     unsigned int* __restrict__ d_siteWeights,
     const long* __restrict__ d_seeds,
     int width,
-    int states,
     int sprDist,
     int numSearchIter,
     int numNNI,
-    int stopNoImprove,  // early stopping: stop Phase 3 after this many consecutive no-improve iters
-    unsigned int phase3Margin,      // Opt-G: skip Phase 3 if postSprParsimony >
-                                    // globalBest*(1+margin/100); UINT_MAX=disabled
-    unsigned int* d_globalBest,     // Opt-G: global atomicMin target (1 element)
-    unsigned int* d_postSprScores,  // Opt-G2: write postSprParsimony[k] here for host-side sort;
-                                    // nullptr=disabled
+    int stopNoImprove,
+    unsigned int* d_postSprScores,  // Opt-G2: write postSprParsimony[k] here; nullptr=disabled
     size_t parsVectPerTree,
     size_t parsScorePerTree
 )
 {
-    extern __shared__ BuildShared sh_arr[];
-    BuildShared& sh = sh_arr[0];
+    __shared__ BuildSharedT<NTAXA> sh;
+    using SharedT = BuildSharedT<NTAXA>;
 
     const int k = blockIdx.x;
     const int lane = threadIdx.x;
@@ -873,7 +868,7 @@ __global__ void buildParsimonyTreesKernel(
     }
     __syncwarp();
 
-    createTiAndNewviewParsimony(pars_tree, score_tree, topo, sh, N + 2, N, width, states, lane);
+    createTiAndNewviewParsimony<SharedT, STATES>(pars_tree, score_tree, topo, sh, N + 2, N, width, lane);
     __syncwarp();
 
     // ── Phase 1: stepwise addition ────────────────────────────────────────────
@@ -926,7 +921,7 @@ __global__ void buildParsimonyTreesKernel(
                 sh.ti[1] = vfToNum(q_f2, N);
                 sh.ti[2] = vfToNum(topo->back_vf[q_f2], N);
             }
-            unsigned int mp = newviewParsimony(pars_tree, score_tree, sh, true, width, states);
+            unsigned int mp = newviewParsimony<SharedT, STATES>(pars_tree, score_tree, sh, true, width);
             __syncwarp();
 
             if (lane == 0)
@@ -960,7 +955,7 @@ __global__ void buildParsimonyTreesKernel(
             sh.tiSize = 3;
             computeTraversalInfoParsimony(topo, sh, q_f2, N, false);
         }
-        newviewParsimony(pars_tree, score_tree, sh, false, width, states);
+        newviewParsimony<SharedT, STATES>(pars_tree, score_tree, sh, false, width);
         __syncwarp();
     }
 
@@ -999,7 +994,7 @@ __global__ void buildParsimonyTreesKernel(
     }
     __syncwarp();
 
-    gpuSPRHillClimb(pars_tree, score_tree, topo, sh, N, sprDist, width, states, lane);
+    gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
 
     if (lane == 0)
     {
@@ -1022,35 +1017,15 @@ __global__ void buildParsimonyTreesKernel(
     }
     __syncwarp();
 
-    // ── Opt-G: Selective Phase 3 — atomicMin + immediate threshold check ────────
-    // No barrier needed: d_globalBest can only decrease, so if my score exceeds
-    // the partial threshold it will also exceed the final threshold → safe to skip.
-    // phase3Margin is in tenths-of-percent (e.g. 1 = 0.1%, 10 = 1.0%, 50 = 5.0%).
-    if (phase3Margin < 0xFFFFFFFFu)
-    {
-        if (lane == 0)
-        {
-            atomicMin(d_globalBest, topo->postSprParsimony);
-        }
-        __syncwarp();
-        unsigned int cur_best = *d_globalBest;
-        unsigned long long thr = (unsigned long long)cur_best * (1000u + phase3Margin) / 1000u;
-        unsigned int threshold = (thr > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (unsigned int)thr;
-        if (topo->postSprParsimony > threshold)
-        {
-            return;
-        }
-    }
-
     // ── Phase 3: iterative NNI + SPR×1 (even) / ratchet + SPR×2 (odd) ────────
     if (numSearchIter <= 0)
     {
         return;
     }
 
-    runPhase3(
+    runPhase3<STATES>(
         pars_tree, score_tree, topo, sh, sw_k, N, sprDist, numSearchIter, numNNI, stopNoImprove,
-        lane, k, width, states
+        lane, k, width
     );
 
     // Print timing for block 0
@@ -1086,13 +1061,13 @@ __global__ void buildParsimonyTreesKernel(
 }
 
 // ─── Opt-G2: Phase 3 only kernel (two-kernel selective Phase 3) ───────────────
+template<int STATES, int NTAXA>
 __global__ void buildPhase3Kernel(
     parsimonyNumber* __restrict__ d_parsVect,
     unsigned int* __restrict__ d_parsScore,
     GpuTopology* d_topos,
     unsigned int* __restrict__ d_siteWeights,
     int width,
-    int states,
     int sprDist,
     int numSearchIter,
     int numNNI,
@@ -1102,8 +1077,8 @@ __global__ void buildPhase3Kernel(
     size_t parsScorePerTree
 )
 {
-    extern __shared__ BuildShared sh_arr[];
-    BuildShared& sh = sh_arr[0];
+    __shared__ BuildSharedT<NTAXA> sh;
+    using SharedT = BuildSharedT<NTAXA>;
 
     const int k = blockIdx.x;
     const int lane = threadIdx.x;
@@ -1133,9 +1108,9 @@ __global__ void buildPhase3Kernel(
     }
     __syncwarp();
 
-    runPhase3(
+    runPhase3<STATES>(
         pars_tree, score_tree, topo, sh, sw_k, N, sprDist, numSearchIter, numNNI, stopNoImprove,
-        lane, k, width, states
+        lane, k, width
     );
 }
 
@@ -1147,8 +1122,7 @@ void gpuStepwiseBuildTrees(
     int numSearchIter,
     int numNNI,
     int stopNoImprove,
-    unsigned int phase3Margin,
-    float phase3TopPct,
+    float topPct,
     cudaStream_t stream
 )
 {
@@ -1162,92 +1136,103 @@ void gpuStepwiseBuildTrees(
         mem->d_parsScore, 0, (size_t)K * mem->parsScorePerTree * sizeof(unsigned int), stream
     ));
 
-    const size_t sharedBytes = sizeof(BuildShared);
+    const int states = mem->states;
+    const int mxtips = mem->mxtips;
 
-    if (phase3TopPct > 0.0f)
-    {
-        // ── Opt-G2: Two-kernel mode — exact top-X% selection ─────────────────
-        printf(
-            "[GPU] buildParsimonyTreesKernel (Phase 0-2): K=%d  sprDist=%d"
-            "  top_pct=%.0f%%  shared=%.1f KB\n",
-            K, sprDist, phase3TopPct * 100.0f, sharedBytes / 1024.0
-        );
+    // Dispatch kernels by compile-time STATES × NTAXA (Opt-P Layer 3)
+    // STATES: 2=binary, 4=DNA, 20=protein, 32=fallback
+    // NTAXA buckets: ≤128, ≤256, ≤384, ≤512, ≤800 (=kMaxTaxa)
+    auto launch = [&](auto states_tag, auto ntaxa_tag) {
+        constexpr int S  = decltype(states_tag)::value;
+        constexpr int NT = decltype(ntaxa_tag)::value;
+        const size_t sharedBytes = sizeof(BuildSharedT<NT>);
 
-        // Kernel A: Phase 0-2 only (numSearchIter=0, phase3Margin=UINT_MAX disabled)
-        buildParsimonyTreesKernel<<<dim3(K), dim3(kWarpSize), sharedBytes, stream>>>(
-            mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, d_seeds,
-            mem->width, mem->states, sprDist,
-            /*numSearchIter=*/0, numNNI, stopNoImprove,
-            /*phase3Margin=*/0xFFFFFFFFu, mem->d_globalBest, mem->d_postSprScores,
-            mem->parsVectPerTree, mem->parsScorePerTree
-        );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        // Host: download scores, sort, compute threshold
-        std::vector<unsigned int> scores(K);
-        CUDA_CHECK(cudaMemcpy(
-            scores.data(), mem->d_postSprScores, (size_t)K * sizeof(unsigned int),
-            cudaMemcpyDeviceToHost
-        ));
-        std::sort(scores.begin(), scores.end());
-        int top_k = max(1, (int)ceil((double)K * phase3TopPct));
-        unsigned int threshold = scores[top_k - 1];
-
-        // Count actual trees entering Phase 3 (score <= threshold, including ties)
-        int actual_phase3 = 0;
-        for (int i = 0; i < K; i++)
+        if (topPct > 0.0f)
         {
-            if (scores[i] <= threshold)
-            {
-                actual_phase3++;
-            }
+            // ── Opt-G2: Two-kernel mode ───────────────────────────────────────
+            printf(
+                "[GPU] buildParsimonyTreesKernel<STATES=%d,NTAXA=%d> (Phase 0-2): K=%d  sprDist=%d"
+                "  top_pct=%.0f%%  shared=%.1f KB\n",
+                S, NT, K, sprDist, topPct * 100.0f, sharedBytes / 1024.0
+            );
+
+            buildParsimonyTreesKernel<S, NT><<<dim3(K), dim3(kWarpSize), 0, stream>>>(
+                mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, d_seeds,
+                mem->width, sprDist,
+                /*numSearchIter=*/0, numNNI, stopNoImprove,
+                mem->d_postSprScores,
+                mem->parsVectPerTree, mem->parsScorePerTree
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            std::vector<unsigned int> scores(K);
+            CUDA_CHECK(cudaMemcpy(
+                scores.data(), mem->d_postSprScores, (size_t)K * sizeof(unsigned int),
+                cudaMemcpyDeviceToHost
+            ));
+            std::sort(scores.begin(), scores.end());
+            int top_k = max(1, (int)ceil((double)K * topPct));
+            unsigned int threshold = scores[top_k - 1];
+
+            int actual_phase3 = 0;
+            for (int i = 0; i < K; i++)
+                if (scores[i] <= threshold) actual_phase3++;
+
+            printf(
+                "[GPU] buildPhase3Kernel<STATES=%d,NTAXA=%d> (Phase 3): top_k=%d/%d  threshold=%u"
+                "  actual_phase3=%d (%.1f%%)  score_range=[%u, %u]\n",
+                S, NT, top_k, K, threshold, actual_phase3, 100.0 * actual_phase3 / K,
+                scores[0], scores[K - 1]
+            );
+
+            buildPhase3Kernel<S, NT><<<dim3(K), dim3(kWarpSize), 0, stream>>>(
+                mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights,
+                mem->width, sprDist, numSearchIter, numNNI, stopNoImprove, threshold,
+                mem->parsVectPerTree, mem->parsScorePerTree
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(stream));
         }
+        else
+        {
+            // ── Single-kernel mode ────────────────────────────────────────────
+            printf(
+                "[GPU] buildParsimonyTreesKernel<STATES=%d,NTAXA=%d>: K=%d  sprDist=%d"
+                "  numSearchIter=%d  numNNI=%d  stop=%d  shared=%.1f KB\n",
+                S, NT, K, sprDist, numSearchIter, numNNI, stopNoImprove,
+                sharedBytes / 1024.0
+            );
 
-        printf(
-            "[GPU] buildPhase3Kernel (Phase 3): top_k=%d/%d  threshold=%u"
-            "  actual_phase3=%d (%.1f%%)"
-            "  score_range=[%u, %u]\n",
-            top_k, K, threshold, actual_phase3, 100.0 * actual_phase3 / K, scores[0], scores[K - 1]
-        );
+            buildParsimonyTreesKernel<S, NT><<<dim3(K), dim3(kWarpSize), 0, stream>>>(
+                mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, d_seeds,
+                mem->width, sprDist, numSearchIter, numNNI, stopNoImprove,
+                /*d_postSprScores=*/nullptr,
+                mem->parsVectPerTree, mem->parsScorePerTree
+            );
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+    };
 
-        // Kernel B: Phase 3 only, exact threshold
-        buildPhase3Kernel<<<dim3(K), dim3(kWarpSize), sharedBytes, stream>>>(
-            mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, mem->width,
-            mem->states, sprDist, numSearchIter, numNNI, stopNoImprove, threshold,
-            mem->parsVectPerTree, mem->parsScorePerTree
-        );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
-    else
-    {
-        // ── Single-kernel mode (existing: Opt-G atomicMin or no selective Phase 3) ──
-        printf(
-            "[GPU] buildParsimonyTreesKernel: K=%d  sprDist=%d"
-            "  numSearchIter=%d  numNNI=%d  stop=%d  margin=%s  shared=%.1f KB\n",
-            K, sprDist, numSearchIter, numNNI, stopNoImprove,
-            phase3Margin == 0xFFFFFFFFu ? "off"
-                                        : (std::to_string(phase3Margin / 10) + "."
-                                           + std::to_string(phase3Margin % 10) + "%")
-                                              .c_str(),
-            sharedBytes / 1024.0
-        );
+    // Dispatch on NTAXA bucket (Opt-P L3) then STATES.
+    // GPU_NTAXA_TEMPLATE=ON  → 4 buckets (128/256/512/800), slow build, full speedup.
+    // GPU_NTAXA_TEMPLATE=OFF → 800 only, fast build, no NTAXA speedup.
+    auto dispatch_ntaxa = [&](auto states_tag) {
+#ifdef GPU_NTAXA_TEMPLATE
+        if      (mxtips <= 128) launch(states_tag, std::integral_constant<int,128>{});
+        else if (mxtips <= 256) launch(states_tag, std::integral_constant<int,256>{});
+        else if (mxtips <= 512) launch(states_tag, std::integral_constant<int,512>{});
+        else                    launch(states_tag, std::integral_constant<int,800>{});
+#else
+        launch(states_tag, std::integral_constant<int,800>{});
+#endif
+    };
 
-        unsigned int umax = 0xFFFFFFFFu;
-        CUDA_CHECK(cudaMemcpyAsync(
-            mem->d_globalBest, &umax, sizeof(unsigned int), cudaMemcpyHostToDevice, stream
-        ));
-
-        buildParsimonyTreesKernel<<<dim3(K), dim3(kWarpSize), sharedBytes, stream>>>(
-            mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, d_seeds,
-            mem->width, mem->states, sprDist, numSearchIter, numNNI, stopNoImprove, phase3Margin,
-            mem->d_globalBest, /*d_postSprScores=*/nullptr, mem->parsVectPerTree,
-            mem->parsScorePerTree
-        );
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-    }
+    // Only DNA (4) and protein (20) — covers all real datasets.
+    // Binary (2) and 32-state fallback removed to halve build time.
+    if (states == 20) dispatch_ntaxa(std::integral_constant<int,20>{});
+    else              dispatch_ntaxa(std::integral_constant<int, 4>{});
 
     CUDA_CHECK(cudaFree(d_seeds));
 }

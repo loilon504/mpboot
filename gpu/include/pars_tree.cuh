@@ -19,6 +19,9 @@ static constexpr int kMaxVFaces = 4 * kMaxTaxa;  // vface IDs = offsets into nod
 static constexpr int kMaxNodes = 2 * kMaxTaxa;
 static constexpr int kMaxStates = 32;  // DNA
 static constexpr int kWarpSize = 32;
+// Opt-P: reduced stack for SPR doAddTraverse + NNI bitset
+// NNI bitset needs ceil(2*kMaxTaxa/32)+1 = 51 words; SPR stack depth ≤ 2*sprDist ≈ 12
+static constexpr int kMaxSprStack = 64;  // >> max(51 bitset words, 12 SPR entries)
 
 // ─── GPU Topology ─────────────────────────────────────────────────────────────
 // Mirrors PLL's node rings as plain integer arrays.
@@ -51,6 +54,12 @@ struct GpuTopology
     int nodep[kMaxNodes];          // DFS-canonical vface per node (like CPU tr->nodep[])
                                    // tips: nodep[num] = num-1; inner: set by gpuNodeRectifierPars
 
+    // Phase 3 effectiveness counters (per-tree, written by kernel, read on host)
+    int n_improved_even;  // iterations where even (NNI+SPR) improved bestParsimony
+    int n_improved_odd;   // iterations where odd (Ratchet) improved bestParsimony
+    int n_total_even;     // total even iterations run
+    int n_total_odd;      // total odd iterations run
+
     // COLD: only on bestParsimony update + topology download
     int best_back_vf[kMaxVFaces];  // back_vf[] snapshot at the time bestParsimony was achieved
     // NOTE: number[], next_vf[], nnxt_vf[] removed — kernel uses pure arithmetic
@@ -72,7 +81,6 @@ struct GpuParsimonyMem
     unsigned int* d_parsScore;    // [K][2N+1]
     GpuTopology* d_topos;         // [K] topology per tree (global mem)
     unsigned int* d_siteWeights;  // [K][width] per-block weights; 1=normal, 2=ratchet-doubled
-    unsigned int* d_globalBest;   // [1] running atomicMin of postSprParsimony across blocks (Opt-G)
     unsigned int* d_postSprScores; // [K] postSprParsimony scores, filled by Phase 2; used by Opt-G2 two-kernel
 
     int K;  // number of trees
@@ -87,71 +95,89 @@ struct GpuParsimonyMem
 };
 
 // ─── Shared memory per block ──────────────────────────────────────────────────
-// Single struct shared by build phase AND SPR phase (executed sequentially).
-// Total ≈ 25 KB — within A100's 48 KB default shared memory.
-struct alignas(
-    16
-) BuildShared
+// Opt-P Layer 3: Templated on NTAXA so array sizes track actual taxa count.
+// Dispatch buckets: N≤128→128, N≤256→256, N≤384→384, N≤512→512, N>512→800.
+// Using static __shared__ so size is compile-time; no dynamic shared mem needed.
+// Layout: HOT int16_t arrays first (no padding between them) → int scalars → COLD timing.
+// Grouping same-type arrays eliminates int16_t/int alignment padding.
+// int16_t: values bounded by N (≤800) or ±sprDist — all fit in 16 bits.
+// stackMaxt stays int: NNI bitset uses (1u<<pb) with pb=0..31, needs full 32 bits.
+template<int NTAXA>
+struct alignas(16) BuildSharedT
 {
-    // ── Build-phase arrays ────────────────────────────────────────────────────
-    int perm[kMaxTaxa + 2];  // permutation 1..N                       (~2.8 KB)
-    // ── DFS stack: build uses as node-pair DFS; SPR reuses as stackVf ────────
-    int stack[kMaxTaxa * 2];  // build DFS / SPR addTraverse stackVf    (~5.6 KB)
-    // ── SPR addTraverse auxiliary stacks ─────────────────────────────────────
-    int stackMint[kMaxTaxa];  // mintrav per entry / child_idx (recompute) (~2.8 KB)
-    int stackMaxt[kMaxTaxa];  // maxtrav per entry              (~2.8 KB)
+    // ── [HOT int16_t] Traversal info — accessed every newview/eval call ───────
+    // node numbers 1..2N-1 ≤ 1599; vface IDs 0..4N-3 ≤ 3197 → fit int16_t
+    int16_t ti[NTAXA * 3];   // (p_num, q_num, r_num) tuples; max entries = 3*N
+    int16_t tiStack[NTAXA];  // DFS stack for computeTraversalInfo; worst case = N
+
+    // ── [HOT int16_t] DFS / SPR addTraverse stack ────────────────────────────
+    int16_t stack[NTAXA * 2];  // Phase 1: node-pair DFS; Phase 2-3: addTraverse stackVf
+                               // Phase 3 NNI: edge list (p_vf, q_vf) pairs
+
+    // ── [MEDIUM int16_t] Build/SPR mint stack (Opt-P L1: union saves 3.2 KB) ─
+    // perm Phase 0-1 ONLY; stackMint Phase 2-3 ONLY → never overlap → safe
+    union {
+        int16_t perm[NTAXA + 2];  // Phase 0-1: Fisher-Yates permutation 1..N
+        int16_t stackMint[NTAXA]; // Phase 2-3: mintrav per doAddTraverse stack entry
+    };
+
+    // ── [int] SPR maxtrav + NNI bitset (Opt-P L1: reduced kMaxTaxa→64) ───────
+    // 32-bit required: NNI bitset sets individual bits via (1u << pb), pb=0..31
+    int stackMaxt[kMaxSprStack];
     int stackTop;
-    // ── Traversal info (both phases) ─────────────────────────────────────────
-    int ti[kMaxTaxa * 3];   // (p_num, q_num, r_num) tuples            (~8.4 KB)
-    int tiStack[kMaxTaxa];  // DFS stack for computeTraversalInfo       (~2.8 KB)
     int tiSize;
-    // ── Build-phase scalars ───────────────────────────────────────────────────
-    int insertVf;       // best insert vface found this stepwise-addition round
-    int startVf;        // tr->start vface = nodepVf(min(perm[1..3]))
-    int qnum;           // inner node being inserted (build)
-    int tipnum;         // tip being inserted (build)
-    int qf0, qf1, qf2;  // vfaces of qnum (build)
-    // ── Shared best parsimony (both phases use same fields) ──────────────────
-    unsigned int bestParsimony;  // best parsimony found (build: per-edge; SPR: per-rearrangement)
-    unsigned int bestHits;       // tie-breaking counter
-    // ── SPR-phase scalars ─────────────────────────────────────────────────────
-    long seed;                  // RNG seed (set from build, carried into SPR)
-    unsigned int randomMP;      // global best parsimony for this tree (SPR do-while threshold)
-    unsigned int randomMPHits;  // tie-breaking across outer SPR iterations
-    int bestRemoveVf;           // best move: pruned node vface
-    int bestInsertVf;           // best move: insertion edge vface
-    // ── Broadcast slots (SPR phase) ──────────────────────────────────────────
+
+    // ── [HOT int] SPR scalars — checked every testInsert / outer iteration ────
     // [0]   testInsert: r = back_vf[q]
-    // [1-3] doAddTraverse: vf, mint, maxt
-    // [4-5] SPR rearrange loop: p, q (vfaces)
+    // [1-3] doAddTraverse: stackVf, mint, maxt popped per step
+    // [4-5] SPR rearrange loop: p, q vfaces
     // [7-8] P/Q branch children: p1(q1), p2(q2)
-    // [9]   apply-move sentinel (-1 = no move) / bestRemoveVf
+    // [9]   apply-move sentinel (-1 = no move)
     // [10]  apply-move bestInsertVf
     int bcast[11];
-    // ── Ratchet site weights (Phase 2b) ──────────────────────────────────────
+    unsigned int bestParsimony;  // best parsimony this rearrangement scan
+    unsigned int bestHits;       // tie-breaking counter
+    unsigned int randomMP;       // do-while threshold (tree's current best parsimony)
+    unsigned int randomMPHits;
+    int bestRemoveVf;
+    int bestInsertVf;
+    long seed;                   // RNG state for gpuRandum
+
+    // ── [MEDIUM] Ratchet / site weights ──────────────────────────────────────
     const unsigned int* site_weights;  // nullptr = uniform weight 1
-    // ── Timing accumulators (block 0 lane 0 only) ─────────────────────────────
-    long long t_build;       // Phase 1: stepwise addition (clock cycles)
-    long long t_phase2;      // Phase 2: initial SPR (clock cycles)
-    long long t_p3_nni;      // Phase 3 even iters: NNI+setup accumulated
-    long long t_p3_nni_spr;  // Phase 3 even iters: SPR accumulated
-    long long t_p3_ratchet;  // Phase 3 odd iters: total accumulated
-    int n_p3_even;           // count of even Phase 3 iterations
-    int n_p3_odd;            // count of odd Phase 3 iterations
-    long long t_line2291;    // Phase 3 SPR: createTiAndEvaluateParsimony (line-2291)
-    long long t_search;      // Phase 3 SPR: doAddTraverse (candidate search)
-    long long t_apply;       // Phase 3 SPR: applyMove
-    int n_apply;             // number of moves applied
-    int n_dowhile;           // number of do-while passes
-    // testInsert sub-timing (Phase 3 even iters, block 0 lane 0 only)
-    long long t_ti_newview;    // createTiAndNewviewParsimony inside testInsert
-    long long t_ti_eval;       // createTiAndEvaluateParsimony inside testInsert
-    int n_testInsert;          // testInsert calls
-    int n_ti_newview_size;     // total nodes traversed in newview (tiSize/3)
-    int n_ti_eval_size;        // total nodes traversed in eval (tiSize/3)
-    int n_optb_pruned;         // Opt-B: testInsert calls skipped by lb prune
-    int n_optb_checked;        // Opt-B: total edges checked (mint<=0)
+
+    // ── [BUILD-ONLY] Phase 0-1 scalars (not touched during SPR) ─────────────
+    int insertVf;
+    int startVf;
+    int qnum;
+    int tipnum;
+    int qf0, qf1, qf2;
+
+    // ── [COLD] Timing accumulators (block 0 lane 0 only) ─────────────────────
+    long long t_build;
+    long long t_phase2;
+    long long t_p3_nni;
+    long long t_p3_nni_spr;
+    long long t_p3_ratchet;
+    int n_p3_even;
+    int n_p3_odd;
+    long long t_line2291;
+    long long t_search;
+    long long t_apply;
+    int n_apply;
+    int n_dowhile;
+    long long t_ti_newview;
+    long long t_ti_eval;
+    int n_testInsert;
+    int n_ti_newview_size;
+    int n_ti_eval_size;
+    int n_optb_pruned;
+    int n_optb_checked;
 };
+
+// Default alias (NTAXA=kMaxTaxa=800): used as BuildShared throughout non-templated code
+using BuildShared = BuildSharedT<kMaxTaxa>;
+
 
 // ─── Host API ─────────────────────────────────────────────────────────────────
 
@@ -265,14 +291,13 @@ __device__ __forceinline__ void computeTraversalInfoParsimony(
     }
 }
 
-template <typename SharedT>
+template <typename SharedT, int STATES>
 __device__ __forceinline__ unsigned int newviewParsimony(
     parsimonyNumber* __restrict__ pars_tree,
     unsigned int* __restrict__ score_tree,
     SharedT& sh,
     bool evaluate,
-    int width,
-    int states
+    int width
 )
 {
     int lane = threadIdx.x & 31;
@@ -296,28 +321,30 @@ __device__ __forceinline__ unsigned int newviewParsimony(
 
         unsigned int score = 0;
 
-        parsimonyNumber* p_base = pars_tree + (size_t)p_num * width * states;
-        parsimonyNumber* q_base = pars_tree + (size_t)q_num * width * states;
-        parsimonyNumber* r_base = pars_tree + (size_t)r_num * width * states;
+        parsimonyNumber* p_base = pars_tree + (size_t)p_num * width * STATES;
+        parsimonyNumber* q_base = pars_tree + (size_t)q_num * width * STATES;
+        parsimonyNumber* r_base = pars_tree + (size_t)r_num * width * STATES;
 
         for (int b = lane; b < width; b += kWarpSize)
         {
             parsimonyNumber t_N = 0;
-            parsimonyNumber t_A[kMaxStates], o_A[kMaxStates];
+            parsimonyNumber t_A[STATES], o_A[STATES];
 
-            for (int s = 0; s < states; ++s)
+            #pragma unroll
+            for (int s = 0; s < STATES; ++s)
             {
-                parsimonyNumber lv = q_base[b * states + s];
-                parsimonyNumber rv = r_base[b * states + s];
+                parsimonyNumber lv = q_base[b * STATES + s];
+                parsimonyNumber rv = r_base[b * STATES + s];
                 t_A[s] = lv & rv;
                 o_A[s] = lv | rv;
                 t_N |= t_A[s];
             }
             t_N = ~t_N;
 
-            for (int s = 0; s < states; ++s)
+            #pragma unroll
+            for (int s = 0; s < STATES; ++s)
             {
-                p_base[b * states + s] = t_A[s] | (t_N & o_A[s]);
+                p_base[b * STATES + s] = t_A[s] | (t_N & o_A[s]);
             }
 
             score += sw ? sw[b] * __popc(t_N) : __popc(t_N);
@@ -339,18 +366,19 @@ __device__ __forceinline__ unsigned int newviewParsimony(
 
     unsigned int score = 0;
 
-    parsimonyNumber* q_base = pars_tree + (size_t)q_num * width * states;
-    parsimonyNumber* r_base = pars_tree + (size_t)r_num * width * states;
+    parsimonyNumber* q_base = pars_tree + (size_t)q_num * width * STATES;
+    parsimonyNumber* r_base = pars_tree + (size_t)r_num * width * STATES;
 
     for (int b = lane; b < width; b += kWarpSize)
     {
         parsimonyNumber t_N = 0;
-        parsimonyNumber t_A[kMaxStates], o_A[kMaxStates];
+        parsimonyNumber t_A[STATES], o_A[STATES];
 
-        for (int s = 0; s < states; ++s)
+        #pragma unroll
+        for (int s = 0; s < STATES; ++s)
         {
-            parsimonyNumber lv = q_base[b * states + s];
-            parsimonyNumber rv = r_base[b * states + s];
+            parsimonyNumber lv = q_base[b * STATES + s];
+            parsimonyNumber rv = r_base[b * STATES + s];
             t_A[s] = lv & rv;
             o_A[s] = lv | rv;
             t_N |= t_A[s];
@@ -367,7 +395,7 @@ __device__ __forceinline__ unsigned int newviewParsimony(
     }
 }
 
-template <typename SharedT>
+template <typename SharedT, int STATES>
 __device__ __forceinline__ void createTiAndNewviewParsimony(
     parsimonyNumber* __restrict__ pars_tree,
     unsigned int* __restrict__ score_tree,
@@ -376,7 +404,6 @@ __device__ __forceinline__ void createTiAndNewviewParsimony(
     int p,
     int N,
     int width,
-    int states,
     int lane
 )
 {
@@ -391,10 +418,10 @@ __device__ __forceinline__ void createTiAndNewviewParsimony(
         computeTraversalInfoParsimony(topo, sh, p, N, false);
     }
     __syncwarp();
-    newviewParsimony(pars_tree, score_tree, sh, false, width, states);
+    newviewParsimony<SharedT, STATES>(pars_tree, score_tree, sh, false, width);
 }
 
-template <typename SharedT>
+template <typename SharedT, int STATES>
 __device__ __forceinline__ unsigned int createTiAndEvaluateParsimony(
     parsimonyNumber* __restrict__ pars_tree,
     unsigned int* __restrict__ score_tree,
@@ -403,8 +430,7 @@ __device__ __forceinline__ unsigned int createTiAndEvaluateParsimony(
     int p,
     int N,
     bool full,
-    int width,
-    int states
+    int width
 )
 {
     int q = topo->back_vf[p];
@@ -441,7 +467,7 @@ __device__ __forceinline__ unsigned int createTiAndEvaluateParsimony(
     }
     __syncwarp();  // ensure lane 0's ti[] writes are visible to all lanes before newviewParsimony
 
-    return newviewParsimony(pars_tree, score_tree, sh, true, width, states);
+    return newviewParsimony<SharedT, STATES>(pars_tree, score_tree, sh, true, width);
 }
 
 }  // namespace mpbootgpu

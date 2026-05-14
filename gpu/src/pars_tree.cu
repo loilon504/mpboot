@@ -40,6 +40,8 @@ void cpuToGpuTopology(
     out->start_vface = vface_of(tr, tr->start);
     out->insert_vface = vface_of(tr, tr->insertNode);
     out->num_vfaces = num_vf;
+    out->n_improved_even = out->n_improved_odd = 0;
+    out->n_total_even    = out->n_total_odd    = 0;
 
     const nodeptr base = tr->nodeBaseAddress;
     for (int vf = 0; vf < num_vf; ++vf)
@@ -105,7 +107,6 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     CUDA_CHECK(cudaMalloc(&mem->d_parsScore,   parsScoreBytes));
     CUDA_CHECK(cudaMalloc(&mem->d_topos,       topoBytes));
     CUDA_CHECK(cudaMalloc(&mem->d_siteWeights, siteWeightsBytes));
-    CUDA_CHECK(cudaMalloc(&mem->d_globalBest,    sizeof(unsigned int)));
     CUDA_CHECK(cudaMalloc(&mem->d_postSprScores, (size_t)K * sizeof(unsigned int)));
 
     CUDA_CHECK(cudaMemset(mem->d_parsVect,    0, parsVectBytes));
@@ -144,10 +145,6 @@ void gpuParsimonyMemFree(
     if (mem->d_siteWeights)
     {
         cudaFree(mem->d_siteWeights);
-    }
-    if (mem->d_globalBest)
-    {
-        cudaFree(mem->d_globalBest);
     }
     if (mem->d_postSprScores)
     {

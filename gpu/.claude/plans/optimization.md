@@ -14,72 +14,62 @@
 | Opt-K | gpu_stop default 2 → 4 | Quality tốt hơn trên N≥295 |
 | Opt-B | Subtree prune trong SPR DFS (per-edge lb check) | ~22% prune rate, avg 1.31× speedup |
 | Opt-B+ | Tighter lb: thêm score_tree[tip_p] | **~30% prune rate, avg 1.49× speedup, 10/10 faster** |
+| Opt-M | Template specialization newviewParsimony<STATES> | **avg 2.16× ms/tree (np=200, 50 datasets)** |
+
+---
+
+## Profiling Findings (2026-05-13)
+
+**Method**: ptxas compile-time analysis (`--ptxas-options=-v`)
+
+| Kernel | STATES | Registers/thread | Spills |
+|--------|--------|-----------------|--------|
+| buildParsimonyTreesKernel | 32 | 173 | 0 |
+| buildParsimonyTreesKernel | 20 | 158 | 0 |
+| buildPhase3Kernel | 32 | 166 | 0 |
+| buildPhase3Kernel | 20 | 134 | 0 |
+| buildPhase3Kernel | 4 | 148 | 0 |
+
+**Occupancy**: `BuildShared = 28.4 KB` là bottleneck → **5 blocks/SM** (164 KB ÷ 28.4 KB) → **7.8% theoretical occupancy** (5/64 warps).  
+Register limit = 11–15 blocks/SM — NOT the bottleneck.  
+**Opt-M speedup đến từ ILP/loop unrolling, KHÔNG từ occupancy.**
+
+→ Full analysis: [benchmark/profile_results_postOptM.md](../benchmark/profile_results_postOptM.md)
 
 ---
 
 ## Còn lại — theo độ khó và rủi ro
 
+### 🟢 Dễ, rủi ro thấp
+
+#### ✅ Opt-P Layer 1: BuildShared Shrink — Tăng Occupancy (DONE 2026-05-13)
+
+**Thay đổi**:
+- `perm[kMaxTaxa+2]` union với `stackMint[kMaxTaxa]` (Phase 0-1 vs Phase 2-3, non-overlapping) → saves 3.2 KB
+- `stackMaxt[kMaxTaxa=800]` → `stackMaxt[kMaxSprStack=64]` (NNI bitset ≤51 words, SPR stack ≤12) → saves 2.9 KB
+- BuildShared: 28.4 KB → **22.4 KB** → blocks/SM: 5 → **7** (+40% occupancy)
+
+**Kết quả** (50 datasets, numpars=200, sprdist=3, gpu_stop=4):
+- Average speedup vs Opt-M: **+1.197x** (N≥80: 1.18–1.52x; N≤65: ~1.0x noise)
+- Quality: **0/50 regression** ✅
+
+**File**: `gpu/include/pars_tree.cuh`
+
+---
+
+#### Opt-P Layer 3: NTAXA Templating (planned)
+
+**Ý tưởng**: Template `BuildShared` theo NTAXA bucket (128, 256, 384, 512, 800) để array sizes thu nhỏ theo N thực tế. Dataset N≤128 có thể đạt 41 blocks/SM (64% occupancy).
+
+**Buckets**: N≤128 → NTAXA=128; N≤256 → 256; N≤384 → 384; N≤512 → 512; N>512 → 800.  
+**Expected savings** (NTAXA=128): BuildShared ~4 KB → 41 blocks/SM!
+
+**File**: `gpu/include/pars_tree.cuh` (BuildSharedT<NTAXA> template), `gpu/src/pars_build.cu` (dispatch), `gpu/src/gpu_init_trees.cu` (NTAXA dispatch added to STATES dispatch).  
+**Effort**: 1–2 ngày.
+
 ---
 
 ### 🟡 Trung bình, rủi ro vừa
-
-#### Opt-M: Template specialization + loop unrolling cho `newviewParsimony`
-
-**Vấn đề hiện tại** (`pars_tree.cuh:304`):
-```cpp
-parsimonyNumber t_A[kMaxStates], o_A[kMaxStates];  // kMaxStates = 32 HARDCODED
-for (int s = 0; s < states; ++s) { ... }            // states là runtime variable
-```
-
-- `t_A[32]` và `o_A[32]` luôn chiếm **64 register slots** per lane, bất kể actual states
-- Với DNA (states=4): **28/32 slots bị waste**
-- Với Protein (states=20): **12/32 slots bị waste**  
-- Inner loop `for s in [0, states)` với `states` là runtime → compiler không unroll được
-
-**`newviewParsimony` được gọi rất thường xuyên**: mỗi `testInsert` (step 2), mỗi `createTiAndEvaluateParsimony`, mỗi `createTiAndNewviewParsimony` → đây là **hot path** quan trọng nhất.
-
-**Fix**: Template specialization với `states` là compile-time constant:
-
-```cpp
-template<int STATES>
-__device__ __forceinline__ void warpFitchStep(
-    parsimonyNumber* p_base, const parsimonyNumber* q_base,
-    const parsimonyNumber* r_base, int b, unsigned int& score
-) {
-    parsimonyNumber t_N = 0;
-    parsimonyNumber t_A[STATES], o_A[STATES];  // STATES known at compile time → exact registers
-
-    #pragma unroll
-    for (int s = 0; s < STATES; ++s) { ... }  // compiler fully unrolls
-
-    #pragma unroll
-    for (int s = 0; s < STATES; ++s) { ... }
-    score += __popc(~t_N);
-}
-```
-
-Gọi từ kernel launch site: detect states at host, instantiate template:
-```cpp
-if (states == 4)       buildParsimonyTreesKernel<4><<<...>>>(...)
-else if (states == 20) buildParsimonyTreesKernel<20><<<...>>>(...)
-```
-
-**Với DNA (states=4)**:
-- t_A[4], o_A[4] → chỉ 8 register slots (vs 64 hiện tại) → **−56 registers per lane**
-- Loop unrolled → ILP tốt hơn, compiler có thể pipeline load/compute
-- Ước tính: **10–20% speedup** trên DNA
-
-**Với Protein (states=20)**:
-- t_A[20], o_A[20] → 40 register slots (vs 64 hiện tại) → **−24 registers per lane**
-- `warpNewviewStep` nặng hơn DNA (5× nhiều operations) → register pressure là bottleneck chính
-- Ít lanes hơn per SM nếu registers bị spill → với kMaxStates=32, protein đã bị ảnh hưởng
-- Với STATES=20: ít registers hơn → **có thể giữ occupancy cao hơn** → speedup protein
-
-**File**: `pars_tree.cuh` (template thêm vào `newviewParsimony`), `pars_build.cu` (kernel template), `pars_build.cuh`, `gpu_init_trees.cu` (dispatch dựa theo states).
-
-**Effort**: 1-2 ngày.
-
----
 
 #### Opt-N: Thread coarsening — xử lý nhiều parsimony blocks per lane
 
@@ -110,8 +100,7 @@ Giảm occupancy, phức tạp, rủi ro chưa rõ benefit vượt chi phí.
 
 ## Thứ tự ưu tiên đề xuất
 
-1. **Opt-K** (gpu_stop 2→4): 5 phút, confirmed
-2. **Opt-B** (subtree prune): 2 giờ, safe
-3. **Opt-M** (template specialization): 1-2 ngày, **highest expected benefit** (~10–20%)
-4. Profile Nsight sau Opt-M để xác nhận bottleneck tiếp
-5. **Opt-E** khi tất cả opt nhỏ xong
+1. ~~Opt-K~~ ✅  2. ~~Opt-B / Opt-B+~~ ✅  3. ~~Opt-M~~ ✅
+4. Profile Nsight để xác nhận bottleneck tiếp theo
+5. **Opt-N** (thread coarsening): thử nếu profile cho thấy memory-bound
+6. **Opt-E** (sub-warp parallel): khi tất cả opt nhỏ xong

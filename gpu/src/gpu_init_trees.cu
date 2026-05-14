@@ -105,36 +105,32 @@ int gpuInitCandidateTrees(
     const int numNNI          = (mxtips > 4) ? max(1, (int)(params.gpu_nni_strength * (mxtips - 3))) : 1;
     const int numSearchIter   = params.gpu_hc_iter;
     const int stopNoImprove   = params.gpu_stop;
-    // gpu_phase3_margin is in percent (supports fractional e.g. 0.1).
-    // Internally stored as tenths-of-percent (1 = 0.1%, 10 = 1.0%, 50 = 5.0%).
-    const unsigned int margin = (params.gpu_phase3_margin < 0.0f)
-                                    ? 0xFFFFFFFFu
-                                    : (unsigned int)(params.gpu_phase3_margin * 10.0f + 0.5f);
-
-    const float top_pct = params.gpu_phase3_top_pct;  // Opt-G2: -1=disabled
+    const float top_pct       = params.gpu_top_pct;  // Opt-G2: ≤0=disabled
 
     float build_ms = ev_time(
         [&]
         {
             gpuStepwiseBuildTrees(mem, seeds.data(), params.sprDist,
-                                  numSearchIter, numNNI, stopNoImprove, margin, top_pct, stream);
+                                  numSearchIter, numNNI, stopNoImprove, top_pct, stream);
         }
     );
     printf(
         "[GPU]   [5+6+7] GPU kernel (build+SPR+search): %.1f ms  (%d trees, %.2f ms/tree)"
-        "  [iters=%d NNI=%d(%.2f) sprDist=%d stop=%d margin=%s top_pct=%s]\n",
+        "  [iters=%d NNI=%d(%.2f) sprDist=%d stop=%d top_pct=%s]\n",
         (double)build_ms, K, K > 0 ? (double)build_ms / K : 0.0,
         numSearchIter, numNNI, params.gpu_nni_strength, params.sprDist, stopNoImprove,
-        margin == 0xFFFFFFFFu ? "off"
-            : (std::to_string(margin / 10) + "." + std::to_string(margin % 10) + "%").c_str(),
         top_pct <= 0.0f ? "off" : (std::to_string((int)(top_pct * 100 + 0.5f)) + "%").c_str()
     );
 
-    // ── [6b] Pre/post-SPR parsimony summary ──────────────────────────────────
+    // ── [6b] Pre/post-SPR parsimony summary + phase effectiveness ───────────
     {
         unsigned int best_pre = UINT_MAX, worst_pre = 0;
         unsigned int best_spr = UINT_MAX, worst_spr = 0;
         unsigned int best_hc  = UINT_MAX, worst_hc  = 0;
+        // Phase 3 per-phase counters (aggregated across all K trees)
+        int sum_improved_even = 0, sum_total_even = 0;
+        int sum_improved_odd  = 0, sum_total_odd  = 0;
+
         for (int k = 0; k < K; ++k)
         {
             GpuTopology h_topo_tmp;
@@ -146,13 +142,26 @@ int gpuInitCandidateTrees(
             if (h_topo_tmp.postSprParsimony > worst_spr) worst_spr = h_topo_tmp.postSprParsimony;
             if (h_topo_tmp.bestParsimony < best_hc)      best_hc = h_topo_tmp.bestParsimony;
             if (h_topo_tmp.bestParsimony > worst_hc)     worst_hc = h_topo_tmp.bestParsimony;
+
+            sum_improved_even += h_topo_tmp.n_improved_even;
+            sum_total_even    += h_topo_tmp.n_total_even;
+            sum_improved_odd  += h_topo_tmp.n_improved_odd;
+            sum_total_odd     += h_topo_tmp.n_total_odd;
         }
         if (params.sprDist > 0)
         {
             printf("[GPU]   [6b] Pre-SPR          parsimony: best=%u  worst=%u\n", best_pre, worst_pre);
             printf("[GPU]   [6b] Post-SPR         parsimony: best=%u  worst=%u\n", best_spr, worst_spr);
             if (numSearchIter > 0)
+            {
                 printf("[GPU]   [6b] Post-Hillclimbing parsimony: best=%u  worst=%u\n", best_hc, worst_hc);
+                printf("[GPU]   [6b] Phase3 NNI+SPR (even): %d/%d iters improved (%.1f%%) across %d trees\n",
+                       sum_improved_even, sum_total_even,
+                       sum_total_even > 0 ? 100.0 * sum_improved_even / sum_total_even : 0.0, K);
+                printf("[GPU]   [6b] Phase3 Ratchet (odd):  %d/%d iters improved (%.1f%%) across %d trees\n",
+                       sum_improved_odd, sum_total_odd,
+                       sum_total_odd > 0 ? 100.0 * sum_improved_odd / sum_total_odd : 0.0, K);
+            }
         }
         else
         {

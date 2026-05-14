@@ -1,4 +1,5 @@
 option(USE_OPENMP "Enable OpenMP acceleration for CPU-side loops" OFF)
+option(GPU_NTAXA_TEMPLATE "Compile all NTAXA buckets (128/256/512/800) for Opt-P Layer 3; OFF=800 only (fast build)" OFF)
 
 if(USE_OPENMP)
     find_package(OpenMP QUIET COMPONENTS CXX)
@@ -31,6 +32,12 @@ if(USE_GPU)
     #     endforeach()
     # endif()
     target_compile_definitions(mpboot_compile_flags INTERFACE USE_GPU)
+    if(GPU_NTAXA_TEMPLATE)
+        target_compile_definitions(mpboot_compile_flags INTERFACE GPU_NTAXA_TEMPLATE)
+        message(STATUS "GPU_NTAXA_TEMPLATE=ON: all NTAXA buckets (128/256/512/800) — slow build")
+    else()
+        message(STATUS "GPU_NTAXA_TEMPLATE=OFF: NTAXA=800 only — fast build")
+    endif()
 endif()
 
 add_library(MPBOOTlib INTERFACE)
