@@ -37,8 +37,9 @@ int gpuInitCandidateTrees(
     partitionList* pr = iqtree.pllPartitions;
     const int mxtips = tr->mxtips;
 
+    CUDA_CHECK(cudaSetDevice(params.gpu_device));
     printf("\n[GPU] ── gpuInitCandidateTrees ─────────────────────────────\n");
-    printf("[GPU]   K=%d  N=%d\n", K, mxtips);
+    printf("[GPU]   K=%d  N=%d  device=%d\n", K, mxtips, params.gpu_device);
 
     // ── [1] Allocate CPU parsVect & read metadata ─────────────────────────────
     auto t0 = std::chrono::high_resolution_clock::now();

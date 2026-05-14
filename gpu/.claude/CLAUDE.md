@@ -43,12 +43,13 @@ python3 ../output/summarize.py             # → output/results.xlsx
 | Flag | Default | Ý nghĩa |
 |------|---------|---------|
 | `-use_gpu` | off | Bật GPU mode — gọi `gpuInitCandidateTrees()` thay vì CPU stepwise |
+| `-gpu_device N` | **1** | CUDA device ID sử dụng. `cudaSetDevice(N)` được gọi tại đầu `gpuInitCandidateTrees` |
 | `-numpars K` | 100 | Số cây parsimony ban đầu. GPU dùng **K−1 blocks** (tree index 1..K-1) |
 | `-sprdist N` | 6¹ | SPR radius dùng cho Phase 2 (initial SPR) và Phase 3 (NNI+SPR) |
 | `-gpu_hc_iter N` | **30** | Safety cap cho số vòng lặp tối đa của Phase 3. Primary stopping là `-gpu_stop`; 30 là "4× max observed" — đủ headroom |
-| `-gpu_stop N` | 2 | Early stopping: dừng Phase 3 sau N iterations liên tiếp không cải thiện. **Primary stopping mechanism.** 0 = tắt |
-| `-gpu_phase3_margin X` | -1 | Opt-G: bỏ qua Phase 3 nếu postSprParsimony > globalBest×(1+X/100). X là % (hỗ trợ thập phân, e.g. 0.1). -1 = tắt |
-| `-gpu_nni_strength X` | **0.1** | Strength NNI perturbation trong Phase 3: `numNNI = X×(N−3)`. 0.1 matching CPU's /10 heuristic, benchmark-optimal |
+| `-gpu_stop N` | **4** | Early stopping: dừng Phase 3 sau N iterations liên tiếp không cải thiện. **Primary stopping mechanism.** 0 = tắt |
+| `-gpu_nni_strength X` | **0.1** | Strength NNI perturbation trong Phase 3: `numNNI = X×(N−3)`, min=1. Even iterations của Phase 3 |
+| `-gpu_top_pct X` | **0.1** | Opt-G2 two-kernel: chỉ top X% cây (postSprParsimony thấp nhất) mới chạy Phase 3. ≤0 = tắt (single-kernel) |
 | `-seed N` | random | RNG seed cho tất cả K trees |
 
 ¹ Default thực tế phụ thuộc vào context; benchmark GPU thường dùng `-sprdist 3`.
@@ -58,13 +59,12 @@ python3 ../output/summarize.py             # → output/results.xlsx
 |-----------|--------|---------|
 | `numNNI` | `max(1, gpu_nni_strength×(N−3))` | Số NNI perturbation mỗi even iteration của Phase 3. `gpu_init_trees.cu` |
 | `K` | `numpars − 1` | Số CUDA blocks = số trees thực sự build. `gpu_init_trees.cu:34` |
-| `margin` (internal) | `gpu_phase3_margin × 10` | Tenths-of-percent (1=0.1%, 10=1.0%). `UINT_MAX` = disabled |
 
 #### Recommended benchmark command
 ```bash
 ./mpboot-avx -s <dataset> -use_gpu -seed 42 \
     -numpars 400 -sprdist 3 -gpu_stop 4
-# gpu_hc_iter=30 và gpu_nni_strength=0.1 dùng default
+# gpu_device=1, gpu_hc_iter=30, gpu_nni_strength=0.1, gpu_top_pct=0.1 dùng default
 ```
 
 #### Thông tin kernel (in lúc chạy)

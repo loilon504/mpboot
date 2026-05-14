@@ -831,6 +831,7 @@ void parseArg(int argc, char *argv[], Params &params) {
 	params.gpu_stop = 4;
 	params.gpu_nni_strength   = 0.1f;
 	params.gpu_top_pct = 0.1f;
+	params.gpu_device = 1;
 
 	if (params.nni5) {
 	    params.nni_type = NNI5;
@@ -2725,6 +2726,10 @@ void parseArg(int argc, char *argv[], Params &params) {
 			}
 			if (strcmp(argv[cnt], "-gpu_top_pct") == 0) {
 				params.gpu_top_pct = (float)atof(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_device") == 0) {
+				params.gpu_device = atoi(argv[++cnt]);
 				continue;
 			}
 			if (argv[cnt][0] == '-') {

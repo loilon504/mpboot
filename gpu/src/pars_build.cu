@@ -323,19 +323,20 @@ __device__ void gpuSPRHillClimb(
     int* const back_vf = topo->back_vf;
     const bool log = do_timing && (blockIdx.x == 0) && (lane == 0);
 
+    // Skip gpuNodeRectifierPars on the first do-while iteration:
+    // nodep[] is guaranteed fresh by the caller (runPhase3 calls it before gpuSPRHillClimb).
+    bool first_iter = true;
     unsigned int startMP;
     do
     {
         startMP = sh.randomMP;
-        if (lane == 0)
+        if (lane == 0) sh.n_dowhile++;
+        if (!first_iter)
         {
-            sh.n_dowhile++;
+            if (lane == 0) gpuNodeRectifierPars(topo, sh, N);
+            __syncwarp();
         }
-        if (lane == 0)
-        {
-            gpuNodeRectifierPars(topo, sh, N);
-        }
-        __syncwarp();
+        first_iter = false;
 
         for (int i = 1; i <= 2 * N - 2; i++)
         {
@@ -523,9 +524,6 @@ __device__ void gpuSPRHillClimb(
                 applyMove<STATES>(
                     pars_tree, score_tree, topo, sh, sh.bcast[9], sh.bcast[10], N, width, lane
                 );
-                // Update nodep[] for new topology (CPU: nodeRectifierPars after each SPR move)
-                // if (lane == 0)
-                //     gpuNodeRectifierPars(topo, sh, N);
                 __syncwarp();
                 if (lane == 0)
                 {
@@ -659,6 +657,12 @@ __device__ void runPhase3(
 
         if (outer % 2 == 0)
         {
+            // Restore best-seen topology before NNI perturbation (warp-parallel).
+            // Ensures each NNI starts from the best known tree, not the drift end-state.
+            for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
+                topo->back_vf[vf] = topo->best_back_vf[vf];
+            __syncwarp();
+
             long long _t0 = 0LL;
             if (k == 0 && lane == 0)
             {
@@ -701,6 +705,11 @@ __device__ void runPhase3(
         }
         else
         {
+            // Restore best-seen topology before Ratchet perturbation (warp-parallel).
+            for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
+                topo->back_vf[vf] = topo->best_back_vf[vf];
+            __syncwarp();
+
             long long _t0 = 0LL;
             if (k == 0 && lane == 0)
             {

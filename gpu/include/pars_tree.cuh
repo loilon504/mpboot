@@ -305,14 +305,6 @@ __device__ __forceinline__ unsigned int newviewParsimony(
     // Pointer is uniform across all lanes — no warp divergence on the check.
     const unsigned int* sw = sh.site_weights;
 
-    if (lane == 0)
-    {
-        for (int i = 3; i < sh.tiSize; i += 3)
-        {
-            score_tree[sh.ti[i]] = 0;
-        }
-    }
-
     for (int i = sh.tiSize - 3; i >= 3; i -= 3)
     {
         int p_num = sh.ti[i];
