@@ -276,3 +276,48 @@ Rectify vẫn được gọi ở iter 2+ (khi topology thực sự thay đổi s
 8. **Opt-N** (thread coarsening UNROLL=2 cho STATES=4): estimate +10-20% cho DNA datasets
 9. ~~Opt-O~~ — hủy: applyMove chiếm <0.1% thời gian, không đáng optimize
 10. ~~Opt-E~~ — hủy: không khả thi, redesign quá lớn
+
+---
+
+## Phase 3 Algorithm Experiments (2026-05-14 → 2026-05-15)
+
+### Strategy 0: Remove hot-loop timing fields
+- Removed fine-grained timing vars from `BuildSharedT` (t_line2291, t_search, etc.)
+- Result: 148 → **136 regs** → 15 blocks/SM (was 13)
+- **File**: `gpu/include/pars_tree.cuh`, `gpu/src/pars_build.cu`
+
+### Phase 3 Variants Explored
+
+| Variant | Description | Result |
+|---------|-------------|--------|
+| Opt-C | Stagnation detection: hash post-Ratchet topology, conditional restore | **Best for sprdist=3** |
+| Symmetric Adaptive | NNI/Ratchet switching with restore-on-switch | Best for sprdist≥4 |
+| Combined v2 | Opt-C@sprdist=3, Symmetric@sprdist>3 (runtime switch) | **CURRENT DEFAULT** |
+
+### Combined v2 Benchmark (115 datasets, seed=1, numpars=400, top_pct=0.1)
+
+| Config | Wor | AvgΔ | Total | Tot spd |
+|--------|-----|------|-------|---------|
+| d3 s4 p0.1 (Opt-C auto) | 16 | +0.27 | ~21m | 5.20× |
+| d5 s6 p0.1 (Sym auto) | **2** | +3.64 | 37m | 2.93× |
+| d6 s4 p0.1 (Sym auto) | 5 | +3.88 | 39m | 2.78× |
+
+→ Details: `/gpu/.claude/benchmark/phase3_variants_comparison.md`
+
+### Current Defaults (2026-05-15)
+- `gpu_hc_iter = 100` (was 30)
+- `gpu_stop = 6` (was 4)
+- `gpu_top_pct = 0.1`
+
+### Output Formatting (2026-05-15)
+- Kernel times now in **seconds** (%.3f s) instead of ms
+- Individual timing for buildTreesKernel + hillClimbingKernel
+- Aligned columns, `═══` borders
+- `setbuf(stdout, NULL)` for immediate flush in GPU section
+
+### Next: Hybrid CPU-GPU
+- Plan: `/gpu/.claude/plans/hybrid_cpu_gpu.md`
+- CPU builds trees in parallel with GPU Kernel 1 (using idle CPU time)
+- After Kernel 1 sync: merge CPU+GPU trees, upload top CPU trees to GPU
+- GPU Kernel 2 + CPU SPR hill-climbing run in parallel
+- Callback pattern: `AfterK1Callback` injected into `gpuStepwiseBuildTrees`

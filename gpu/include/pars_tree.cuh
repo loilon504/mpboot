@@ -64,6 +64,10 @@ struct GpuTopology
     int best_back_vf[kMaxVFaces];  // back_vf[] snapshot at the time bestParsimony was achieved
     // NOTE: number[], next_vf[], nnxt_vf[] removed — kernel uses pure arithmetic
     //   (vfToNum, vfNextFace, vfNnxtFace) and CPU-side p->number/p->next are stable after init.
+
+    // Hybrid CPU-GPU: set to 1 when a CPU-built tree is uploaded into this slot.
+    // buildPhase3Kernel recomputes parsVect from topology before running Phase 3.
+    int needs_recompute;
 };
 
 // ─── Parsimony memory for K trees ─────────────────────────────────────────────

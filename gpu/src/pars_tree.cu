@@ -40,8 +40,9 @@ void cpuToGpuTopology(
     out->start_vface = vface_of(tr, tr->start);
     out->insert_vface = vface_of(tr, tr->insertNode);
     out->num_vfaces = num_vf;
-    out->n_improved_even = out->n_improved_odd = 0;
-    out->n_total_even    = out->n_total_odd    = 0;
+    out->n_improved_even  = out->n_improved_odd = 0;
+    out->n_total_even     = out->n_total_odd    = 0;
+    out->needs_recompute  = 0;
 
     const nodeptr base = tr->nodeBaseAddress;
     for (int vf = 0; vf < num_vf; ++vf)

@@ -46,8 +46,8 @@ python3 ../output/summarize.py             # → output/results.xlsx
 | `-gpu_device N` | **1** | CUDA device ID sử dụng. `cudaSetDevice(N)` được gọi tại đầu `gpuInitCandidateTrees` |
 | `-numpars K` | 100 | Số cây parsimony ban đầu. GPU dùng **K−1 blocks** (tree index 1..K-1) |
 | `-sprdist N` | 6¹ | SPR radius dùng cho Phase 2 (initial SPR) và Phase 3 (NNI+SPR) |
-| `-gpu_hc_iter N` | **30** | Safety cap cho số vòng lặp tối đa của Phase 3. Primary stopping là `-gpu_stop`; 30 là "4× max observed" — đủ headroom |
-| `-gpu_stop N` | **4** | Early stopping: dừng Phase 3 sau N iterations liên tiếp không cải thiện. **Primary stopping mechanism.** 0 = tắt |
+| `-gpu_hc_iter N` | **100** | Safety cap cho số vòng lặp tối đa của Phase 3. Primary stopping là `-gpu_stop` |
+| `-gpu_stop N` | **6** | Early stopping: dừng Phase 3 sau N iterations liên tiếp không cải thiện. **Primary stopping mechanism.** 0 = tắt |
 | `-gpu_nni_strength X` | **0.1** | Strength NNI perturbation trong Phase 3: `numNNI = X×(N−3)`, min=1. Even iterations của Phase 3 |
 | `-gpu_top_pct X` | **0.1** | Opt-G2 two-kernel: chỉ top X% cây (postSprParsimony thấp nhất) mới chạy Phase 3. ≤0 = tắt (single-kernel) |
 | `-seed N` | random | RNG seed cho tất cả K trees |
@@ -62,15 +62,41 @@ python3 ../output/summarize.py             # → output/results.xlsx
 
 #### Recommended benchmark command
 ```bash
-./mpboot-avx -s <dataset> -use_gpu -seed 42 \
-    -numpars 400 -sprdist 3 -gpu_stop 4
-# gpu_device=1, gpu_hc_iter=30, gpu_nni_strength=0.1, gpu_top_pct=0.1 dùng default
+./mpboot-avx -s <dataset> -use_gpu -seed 1 \
+    -numpars 400 -sprdist 3
+# Defaults: gpu_device=1, gpu_hc_iter=100, gpu_stop=6, gpu_nni_strength=0.1, gpu_top_pct=0.1
 ```
 
-#### Thông tin kernel (in lúc chạy)
+#### Thông tin kernel (in lúc chạy) — format mới 2026-05-15
 ```
-[GPU]   [5+6+7] GPU kernel (build+SPR+search): 20527.9 ms  (199 trees, 103.16 ms/tree)
-        [iters=10 NNI=29(0.10) sprDist=3 stop=4 margin=off]
+[GPU] ═══════════════════════════════════════════════════════
+[GPU]   K=399  N=295  device=1
+[GPU]
+[GPU]   [1]      CPU parsimony alloc         :    0.006 s  (width=40 states=4)
+[GPU]   [2]      GPU memory alloc            :    0.001 s
+[GPU]   [3]      Upload tip parsVect (H->D)  :    0.009 s
+[GPU]   [4]      Upload topologies (H->D)    :    0.001 s  (399 trees)
+[GPU]
+[GPU]   buildTreesKernel<STATES=4,NTAXA=800>
+[GPU]         K=399  sprDist=3  top_pct=10%  shared=11.4 KB
+[GPU]         time: 1.234 s
+[GPU]   hillClimbingKernel<STATES=4,NTAXA=800>
+[GPU]         top_k=40/399  threshold=6685  actual=43 (10.8%)  score_range=[6676,6751]
+[GPU]         time: 4.567 s
+[GPU]   [5+6+7]  Kernel (build+SPR+search)   :    5.801 s  (399 trees, 14.54 ms/tree)
+[GPU]            sprDist=3  iters=100  NNI=29(0.10)  stop=6  top_pct=10%
+[GPU]
+[GPU]   [6b]     Pre-SPR  parsimony    :  best=6723     worst=6816
+[GPU]   [6b]     Post-SPR parsimony    :  best=6676     worst=6751
+[GPU]   [6b]     Post-HC  parsimony    :  best=6664     worst=6751
+[GPU]   [6b]     NNI+SPR (even)        :  112/422 iters improved (26.5%)
+[GPU]   [6b]     Ratchet (odd)         :  198/408 iters improved (48.5%)
+[GPU]
+[GPU]   [7a]     Download topologies (D->H)  :    0.006 s
+[GPU]   [7b]     Clone + gpuTopoToCpu        :    0.003 s
+[GPU]   [7c]     Newick conversion           :    0.050 s
+[GPU]   built = 399 / 399 trees
+[GPU] ═══════════════════════════════════════════════════════
 ```
 
 ---

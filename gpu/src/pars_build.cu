@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <functional>
 #include <type_traits>
 #include <vector>
 
@@ -1101,6 +1102,37 @@ __global__ void buildPhase3Kernel(
     }
     __syncwarp();
 
+    // Hybrid: CPU-uploaded tree has stale parsVect and uninitialized nodep[].
+    // Must: (1) init tip nodep[], (2) recompute parsVect from topology, (3) set inner nodep[].
+    if (topo->needs_recompute)
+    {
+        // Step 1: tip nodep[] is always nodep[num] = num-1 (fixed for any tree with N tips)
+        if (lane == 0)
+        {
+            for (int num = 1; num <= N; num++)
+                topo->nodep[num] = num - 1;
+        }
+        __syncwarp();
+
+        // Step 2: recompute parsVect from the CPU tree's back_vf topology (full traversal)
+        unsigned int recomputed = createTiAndEvaluateParsimony<SharedT, STATES>(
+            pars_tree, score_tree, topo, sh, topo->start_vface, N, /*full=*/true, width
+        );
+
+        // Step 3: set inner nodep[] so Phase 3 SPR loop can iterate topo->nodep[i]
+        if (lane == 0)
+        {
+            gpuNodeRectifierPars(topo, sh, N);  // DFS from nodep[1]=0, sets nodep[N+1..2N-1]
+            sh.randomMP      = recomputed;
+            sh.randomMPHits  = 1;
+            sh.bestParsimony = recomputed;
+            topo->bestParsimony    = recomputed;
+            topo->postSprParsimony = recomputed;
+            topo->needs_recompute  = 0;
+        }
+        __syncwarp();
+    }
+
     runPhase3<STATES>(
         pars_tree, score_tree, topo, sh, sw_k, N, sprDist, numSearchIter, numNNI, stopNoImprove,
         lane, k, width
@@ -1129,7 +1161,8 @@ void gpuStepwiseBuildTrees(
     int numNNI,
     int stopNoImprove,
     float topPct,
-    cudaStream_t stream
+    cudaStream_t stream,
+    AfterK1Callback after_k1
 )
 {
     const int K = mem->K;
@@ -1175,25 +1208,53 @@ void gpuStepwiseBuildTrees(
             printf("[GPU]         K=%d  sprDist=%d  top_pct=%.0f%%  shared=%.1f KB\n",
                    K, sprDist, topPct * 100.0f, sharedBytes / 1024.0);
 
-            float k1ms = ev_ms([&] {
-                buildParsimonyTreesKernel<S, NT><<<dim3(K), dim3(kWarpSize), 0, stream>>>(
-                    mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, d_seeds,
-                    mem->width, sprDist,
-                    /*numSearchIter=*/0, numNNI, stopNoImprove,
-                    mem->d_postSprScores,
-                    mem->parsVectPerTree, mem->parsScorePerTree
-                );
-            });
+            // Launch K1 async — do NOT sync here; callback (if any) does cudaStreamQuery loop
+            cudaEvent_t k1_start, k1_end;
+            cudaEventCreate(&k1_start); cudaEventCreate(&k1_end);
+            cudaEventRecord(k1_start, stream);
+            buildParsimonyTreesKernel<S, NT><<<dim3(K), dim3(kWarpSize), 0, stream>>>(
+                mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, d_seeds,
+                mem->width, sprDist,
+                /*numSearchIter=*/0, numNNI, stopNoImprove,
+                mem->d_postSprScores,
+                mem->parsVectPerTree, mem->parsScorePerTree
+            );
+            cudaEventRecord(k1_end, stream);
+            CUDA_CHECK(cudaGetLastError());
+
+            unsigned int threshold;
+            if (after_k1)
+            {
+                // Hybrid: callback builds CPU trees via cudaStreamQuery, syncs, merges, uploads
+                threshold = after_k1(stream, mem);
+                // K1 is now fully done (callback called cudaStreamSynchronize)
+            }
+            else
+            {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                std::vector<unsigned int> scores(K);
+                CUDA_CHECK(cudaMemcpy(
+                    scores.data(), mem->d_postSprScores, (size_t)K * sizeof(unsigned int),
+                    cudaMemcpyDeviceToHost
+                ));
+                std::sort(scores.begin(), scores.end());
+                int top_k = max(1, (int)ceil((double)K * topPct));
+                threshold = scores[top_k - 1];
+            }
+
+            // K1 timing (event already recorded; K1 is done by now)
+            float k1ms = 0.f;
+            cudaEventElapsedTime(&k1ms, k1_start, k1_end);
+            cudaEventDestroy(k1_start); cudaEventDestroy(k1_end);
             printf("[GPU]         time: %.3f s\n", k1ms / 1e3);
 
+            // Download scores for stats (K1 already synced)
             std::vector<unsigned int> scores(K);
             CUDA_CHECK(cudaMemcpy(
                 scores.data(), mem->d_postSprScores, (size_t)K * sizeof(unsigned int),
                 cudaMemcpyDeviceToHost
             ));
             std::sort(scores.begin(), scores.end());
-            int top_k = max(1, (int)ceil((double)K * topPct));
-            unsigned int threshold = scores[top_k - 1];
 
             int actual_phase3 = 0;
             for (int i = 0; i < K; i++)
@@ -1202,7 +1263,8 @@ void gpuStepwiseBuildTrees(
             printf("[GPU]   hillClimbingKernel<STATES=%d,NTAXA=%d>\n", S, NT);
             printf("[GPU]         top_k=%d/%d  threshold=%u  actual=%d (%.1f%%)"
                    "  score_range=[%u, %u]\n",
-                   top_k, K, threshold, actual_phase3, 100.0 * actual_phase3 / K,
+                   max(1, (int)ceil((double)K * topPct)), K, threshold,
+                   actual_phase3, 100.0 * actual_phase3 / K,
                    scores[0], scores[K - 1]);
 
             float k2ms = ev_ms([&] {

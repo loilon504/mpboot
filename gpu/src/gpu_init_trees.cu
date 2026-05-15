@@ -1,7 +1,10 @@
+#include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -115,11 +118,85 @@ int mpbootGpu(
     const int stopNoImprove   = params.gpu_stop;
     const float top_pct       = params.gpu_top_pct;  // Opt-G2: ≤0=disabled
 
+    // ── Hybrid callback: build CPU trees while K1 runs ───────────────────────
+    // Only active in two-kernel mode (top_pct > 0).
+    AfterK1Callback hybrid_cb = nullptr;
+    if (top_pct > 0.0f)
+    {
+        hybrid_cb = [&](cudaStream_t cb_stream, GpuParsimonyMem* cb_mem) -> unsigned int {
+            // Step 1: Build CPU trees while K1 runs on GPU
+            std::vector<CpuTreeData> cpu_trees;
+            while (cudaStreamQuery(cb_stream) == cudaErrorNotReady)
+            {
+                pllInstance*  cpu_inst = pllInstanceClone(tr);
+                partitionList* cpu_pr  = pllPartitionsClone(pr);
+                cpu_inst->randomNumberSeed =
+                    params.ran_seed + (int)cpu_trees.size() * 7919;
+                _pllComputeRandomizedStepwiseAdditionParsimonyTree(
+                    cpu_inst, cpu_pr, params.sprDist + 3, &iqtree
+                );
+                unsigned int score = cpu_inst->bestParsimony;
+
+                CpuTreeData ct;
+                ct.score = score;
+                cpuToGpuTopology(cpu_inst, &ct.topo);
+                ct.topo.preSprParsimony  = score;
+                ct.topo.postSprParsimony = score;
+                ct.topo.bestParsimony    = score;
+                ct.topo.savedSeed = params.ran_seed + (long)cpu_trees.size() * 31337L;
+                ct.topo.needs_recompute  = 1;
+                cpu_trees.push_back(ct);
+
+                pllPartitionsCloneFree(cpu_pr);
+                pllInstanceCloneFree(cpu_inst);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(cb_stream));  // K1 fully done
+
+            // Step 2: Download GPU scores, combine with CPU scores, compute threshold
+            const int Kc = cb_mem->K;
+            std::vector<unsigned int> gpu_scores(Kc);
+            CUDA_CHECK(cudaMemcpy(
+                gpu_scores.data(), cb_mem->d_postSprScores,
+                (size_t)Kc * sizeof(unsigned int), cudaMemcpyDeviceToHost
+            ));
+
+            std::vector<unsigned int> all_scores = gpu_scores;
+            for (auto& ct : cpu_trees)
+                all_scores.push_back(ct.score);
+            std::sort(all_scores.begin(), all_scores.end());
+
+            int top_k = max(1, (int)ceil((double)all_scores.size() * top_pct));
+            unsigned int threshold = all_scores[top_k - 1];
+
+            // Step 3: Upload qualifying CPU trees into worst GPU slots above threshold
+            std::vector<int> replace_slots;
+            for (int k = 0; k < Kc; k++)
+                if (gpu_scores[k] > threshold)
+                    replace_slots.push_back(k);
+            std::sort(replace_slots.begin(), replace_slots.end(),
+                      [&](int a, int b) { return gpu_scores[a] > gpu_scores[b]; });
+
+            int n_replace = (int)std::min(cpu_trees.size(), replace_slots.size());
+            int n_uploaded = 0;
+            for (int i = 0; i < n_replace; i++)
+            {
+                if (cpu_trees[i].score > threshold) break;
+                uploadTopology(cb_mem, replace_slots[i], &cpu_trees[i].topo, cb_stream);
+                n_uploaded++;
+            }
+
+            printf("[GPU]   [hybrid]  CPU built %d trees, %d uploaded to GPU slots\n",
+                   (int)cpu_trees.size(), n_uploaded);
+            return threshold;
+        };
+    }
+
     float build_ms = ev_time(
         [&]
         {
             gpuStepwiseBuildTrees(mem, seeds.data(), params.sprDist,
-                                  numSearchIter, numNNI, stopNoImprove, top_pct, stream);
+                                  numSearchIter, numNNI, stopNoImprove, top_pct, stream,
+                                  hybrid_cb);
         }
     );
     printf("[GPU]   [5+6+7]  %-28s: %8.3f s  (%d trees, %.2f ms/tree)\n",
