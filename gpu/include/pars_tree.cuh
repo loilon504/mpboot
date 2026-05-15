@@ -153,26 +153,19 @@ struct alignas(16) BuildSharedT
     int tipnum;
     int qf0, qf1, qf2;
 
+    // ── [Opt-C] Stagnation detection (sprdist=3 only) ────────────────────────
+    uint32_t last_odd_hash;    // topology fingerprint after last Ratchet iteration
+    int restore_on_next_odd;   // 1 = restore best_back_vf before next Ratchet
+    // ── [Symmetric] Adaptive NNI/Ratchet switching (sprdist>3 only) ──────────
+    int sym_do_ratchet;        // 0=NNI, 1=Ratchet+restore, 2=NNI+restore
+
     // ── [COLD] Timing accumulators (block 0 lane 0 only) ─────────────────────
-    long long t_build;
-    long long t_phase2;
-    long long t_p3_nni;
-    long long t_p3_nni_spr;
-    long long t_p3_ratchet;
-    int n_p3_even;
-    int n_p3_odd;
-    long long t_line2291;
-    long long t_search;
-    long long t_apply;
-    int n_apply;
-    int n_dowhile;
-    long long t_ti_newview;
-    long long t_ti_eval;
-    int n_testInsert;
-    int n_ti_newview_size;
-    int n_ti_eval_size;
-    int n_optb_pruned;
-    int n_optb_checked;
+    long long t_build;        // Phase 1: stepwise addition
+    long long t_phase2;       // Phase 2: initial SPR
+    long long t_p3_nni_spr;   // Phase 3 even iters: SPR cycles
+    long long t_p3_ratchet;   // Phase 3 odd iters: total cycles
+    int n_p3_even;            // count of even Phase 3 iterations
+    int n_p3_odd;             // count of odd Phase 3 iterations
 };
 
 // Default alias (NTAXA=kMaxTaxa=800): used as BuildShared throughout non-templated code

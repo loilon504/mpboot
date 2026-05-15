@@ -18,7 +18,7 @@ namespace mpbootgpu
 // run rearrangeParsimony on each downloaded tree (or skip SPR for GPU trees).
 //
 // Returns the number of distinct trees actually built.
-int gpuInitCandidateTrees(
+int mpbootGpu(
     const Params&        params,
     IQTree&              iqtree,
     int                  numInitTrees,

@@ -359,7 +359,6 @@ void myPartitionsDestroy(partitionList *pl) {
 // This is done independent of Tung's initializePLL function
 // to support reordering aln pattern by parsimony score
 void IQTree::initTopologyByPLLRandomAdition(Params &params){
-    cout << "--Reach 361 iqtree.cpp, initTopologyByPLLRandomAdition\n";
 	pllInstance * tmpInst = NULL;
 	pllInstanceAttr tmpAttr;
 	pllAlignmentData * tmpAlignmentData;

@@ -27,40 +27,45 @@ static inline double msSince(
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
-int gpuInitCandidateTrees(
+int mpbootGpu(
     const Params& params, IQTree& iqtree, int numInitTrees, std::vector<std::string>& candidateTrees
 )
 {
-    int K = numInitTrees - 1;  // tree indices 1..numInitTrees-1
+    struct StdoutUnbuf {
+        StdoutUnbuf()  { setvbuf(stdout, nullptr, _IONBF, 0); }
+        ~StdoutUnbuf() { setvbuf(stdout, nullptr, _IOLBF, 0); }
+    } _stdout_unbuf;
+    int K = numInitTrees;
 
     pllInstance* tr = iqtree.pllInst;
     partitionList* pr = iqtree.pllPartitions;
     const int mxtips = tr->mxtips;
 
     CUDA_CHECK(cudaSetDevice(params.gpu_device));
-    printf("\n[GPU] ── gpuInitCandidateTrees ─────────────────────────────\n");
+    printf("\n[GPU] ═══════════════════════════════════════════════════════\n");
     printf("[GPU]   K=%d  N=%d  device=%d\n", K, mxtips, params.gpu_device);
+    printf("[GPU]\n");
 
     // ── [1] Allocate CPU parsVect & read metadata ─────────────────────────────
     auto t0 = std::chrono::high_resolution_clock::now();
     _allocateParsimonyDataStructures(tr, pr, PLL_FALSE);
     const int width = (int)pr->partitionData[0]->parsimonyLength;
     const int states = (int)pr->partitionData[0]->states;
-    printf(
-        "[GPU]   [1] CPU alloc parsimony structs:  %.1f ms  (width=%d states=%d)\n", msSince(t0),
-        width, states
-    );
+    printf("[GPU]   [1]      %-28s: %8.3f s  (width=%d states=%d)\n",
+           "CPU parsimony alloc", msSince(t0)/1e3, width, states);
 
     // ── [2] Allocate GPU memory ───────────────────────────────────────────────
     t0 = std::chrono::high_resolution_clock::now();
     GpuParsimonyMem* mem = gpuParsimonyMemAlloc(K, mxtips, width, states);
-    printf("[GPU]   [2] GPU mem alloc:                %.1f ms\n", msSince(t0));
+    printf("[GPU]   [2]      %-28s: %8.3f s\n",
+           "GPU memory alloc", msSince(t0)/1e3);
 
     // ── [3] Upload tip parsVect ───────────────────────────────────────────────
     cudaStream_t stream = 0;
     t0 = std::chrono::high_resolution_clock::now();
     uploadTipParsVect(mem, tr, pr, stream);
-    printf("[GPU]   [3] Upload tip parsVect (H→D):    %.1f ms\n", msSince(t0));
+    printf("[GPU]   [3]      %-28s: %8.3f s\n",
+           "Upload tip parsVect (H->D)", msSince(t0)/1e3);
 
     // ── [4] Upload initial topologies ─────────────────────────────────────────
     t0 = std::chrono::high_resolution_clock::now();
@@ -72,7 +77,9 @@ int gpuInitCandidateTrees(
             uploadTopology(mem, k, &h_topo, stream);
         }
     }
-    printf("[GPU]   [4] Upload topologies (H→D):      %.1f ms  (%d trees)\n", msSince(t0), K);
+    printf("[GPU]   [4]      %-28s: %8.3f s  (%d trees)\n",
+           "Upload topologies (H->D)", msSince(t0)/1e3, K);
+    printf("[GPU]\n");
 
     // Free CPU parsVect — not needed after GPU upload
     _pllFreeParsimonyDataStructures(tr, pr);
@@ -115,13 +122,13 @@ int gpuInitCandidateTrees(
                                   numSearchIter, numNNI, stopNoImprove, top_pct, stream);
         }
     );
-    printf(
-        "[GPU]   [5+6+7] GPU kernel (build+SPR+search): %.1f ms  (%d trees, %.2f ms/tree)"
-        "  [iters=%d NNI=%d(%.2f) sprDist=%d stop=%d top_pct=%s]\n",
-        (double)build_ms, K, K > 0 ? (double)build_ms / K : 0.0,
-        numSearchIter, numNNI, params.gpu_nni_strength, params.sprDist, stopNoImprove,
-        top_pct <= 0.0f ? "off" : (std::to_string((int)(top_pct * 100 + 0.5f)) + "%").c_str()
-    );
+    printf("[GPU]   [5+6+7]  %-28s: %8.3f s  (%d trees, %.2f ms/tree)\n",
+           "Kernel (build+SPR+search)", (double)build_ms/1e3,
+           K, K > 0 ? (double)build_ms / K : 0.0);
+    printf("[GPU]            sprDist=%d  iters=%d  NNI=%d(%.2f)  stop=%d  top_pct=%s\n",
+           params.sprDist, numSearchIter, numNNI, params.gpu_nni_strength, stopNoImprove,
+           top_pct <= 0.0f ? "off" : (std::to_string((int)(top_pct * 100 + 0.5f)) + "%").c_str());
+    printf("[GPU]\n");
 
     // ── [6b] Pre/post-SPR parsimony summary + phase effectiveness ───────────
     {
@@ -151,22 +158,22 @@ int gpuInitCandidateTrees(
         }
         if (params.sprDist > 0)
         {
-            printf("[GPU]   [6b] Pre-SPR          parsimony: best=%u  worst=%u\n", best_pre, worst_pre);
-            printf("[GPU]   [6b] Post-SPR         parsimony: best=%u  worst=%u\n", best_spr, worst_spr);
+            printf("[GPU]   [6b]     %-22s:  best=%-7u  worst=%u\n", "Pre-SPR  parsimony",  best_pre, worst_pre);
+            printf("[GPU]   [6b]     %-22s:  best=%-7u  worst=%u\n", "Post-SPR parsimony",  best_spr, worst_spr);
             if (numSearchIter > 0)
             {
-                printf("[GPU]   [6b] Post-Hillclimbing parsimony: best=%u  worst=%u\n", best_hc, worst_hc);
-                printf("[GPU]   [6b] Phase3 NNI+SPR (even): %d/%d iters improved (%.1f%%) across %d trees\n",
-                       sum_improved_even, sum_total_even,
-                       sum_total_even > 0 ? 100.0 * sum_improved_even / sum_total_even : 0.0, K);
-                printf("[GPU]   [6b] Phase3 Ratchet (odd):  %d/%d iters improved (%.1f%%) across %d trees\n",
-                       sum_improved_odd, sum_total_odd,
-                       sum_total_odd > 0 ? 100.0 * sum_improved_odd / sum_total_odd : 0.0, K);
+                printf("[GPU]   [6b]     %-22s:  best=%-7u  worst=%u\n", "Post-HC  parsimony",  best_hc,  worst_hc);
+                printf("[GPU]   [6b]     %-22s:  %d/%d iters improved (%.1f%%)\n",
+                       "NNI+SPR (even)", sum_improved_even, sum_total_even,
+                       sum_total_even > 0 ? 100.0 * sum_improved_even / sum_total_even : 0.0);
+                printf("[GPU]   [6b]     %-22s:  %d/%d iters improved (%.1f%%)\n",
+                       "Ratchet (odd)", sum_improved_odd, sum_total_odd,
+                       sum_total_odd > 0 ? 100.0 * sum_improved_odd / sum_total_odd : 0.0);
             }
         }
         else
         {
-            printf("[GPU]   [6b] Build parsimony: best=%u  worst=%u\n", best_hc, worst_hc);
+            printf("[GPU]   [6b]     %-22s:  best=%-7u  worst=%u\n", "Build parsimony", best_hc, worst_hc);
         }
     }
 
@@ -195,8 +202,8 @@ int gpuInitCandidateTrees(
             localInst->tree_string, localInst, localPr, localInst->start->back, PLL_TRUE, PLL_TRUE,
             PLL_FALSE, PLL_FALSE, PLL_FALSE, PLL_SUMMARIZE_LH, PLL_FALSE, PLL_FALSE
         );
-        candidateTrees[i + 1] = std::string(localInst->tree_string);
-        if (!candidateTrees[i + 1].empty())
+        candidateTrees[i] = std::string(localInst->tree_string);
+        if (!candidateTrees[i].empty())
         {
             built++;
         }
@@ -206,11 +213,12 @@ int gpuInitCandidateTrees(
         pllInstanceCloneFree(localInst);
     }
 
-    printf("[GPU]   [7a] Download topologies (D→H):   %.1f ms total\n", t_download);
-    printf("[GPU]   [7b] Clone + gpuTopoToCpu:         %.1f ms total\n", t_clone);
-    printf("[GPU]   [7c] Newick conversion:            %.1f ms total\n", t_newick);
+    printf("[GPU]\n");
+    printf("[GPU]   [7a]     %-28s: %8.3f s\n", "Download topologies (D->H)", t_download/1e3);
+    printf("[GPU]   [7b]     %-28s: %8.3f s\n", "Clone + gpuTopoToCpu",      t_clone/1e3);
+    printf("[GPU]   [7c]     %-28s: %8.3f s\n", "Newick conversion",         t_newick/1e3);
     printf("[GPU]   built = %d / %d trees\n", built, K);
-    printf("[GPU] ──────────────────────────────────────────────────────\n\n");
+    printf("[GPU] ═══════════════════════════════════════════════════════\n\n");
 
     gpuParsimonyMemFree(mem);
     return built;

@@ -58,7 +58,7 @@
 #include "gpu/include/sprparsimony.hpp"
 #include "gpu/include/gpu_init_trees.cuh"
 #include <chrono>
-#include <chrono>
+#include <iomanip>
 
 void reportReferences(Params &params, ofstream &out, string &original_model) {
 	out << "To cite IQ-TREE please use:" << endl << endl
@@ -1120,7 +1120,6 @@ void computeInitialTree(Params &params, IQTree &iqtree, string &dist_file, int &
 
     string out_file = params.out_prefix;
     if (params.user_file) {
-		cout << "--REACH 1118 phyloanalysis.cpp: user-defined tree\n";
         // start the search with user-defined tree
     	cout << endl;
         cout << "Reading input tree file " << params.user_file << " ..." << endl;
@@ -1163,7 +1162,6 @@ void computeInitialTree(Params &params, IQTree &iqtree, string &dist_file, int &
 		break;
 	case STT_PLL_PARSIMONY:
 		cout << endl;
-		cout << "--REACH 1162 phyloanalysis.cpp: STT_PLL_PARSIMONY\n";
 		cout << "Create initial parsimony tree by phylogenetic likelihood library (PLL)... ";
 		// generate a parsimony tree for model optimization
 		iqtree.pllInst->randomNumberSeed = params.ran_seed;
@@ -1213,7 +1211,6 @@ void computeInitialTree(Params &params, IQTree &iqtree, string &dist_file, int &
     }
     initTree = iqtree.getTreeString();
     if (params.pll) {
-		cout << "--REACH 1213 phyloanalysis.cpp: params.pll = true\n";
         pllNewickTree *newick = pllNewickParseString(initTree.c_str());
         pllTreeInitTopologyNewick(iqtree.pllInst, newick, PLL_TRUE);
         pllNewickParseDestroy(&newick);
@@ -1271,91 +1268,56 @@ int initCandidateTreeSet(Params &params, IQTree &iqtree, int numInitTrees) {
     cout << "Generating " << numInitTrees - 1 << " parsimony trees... ";
     cout.flush();
     double startTime = getCPUTime();
-	auto sTime = std::chrono::high_resolution_clock::now();
     int numDupPars = 0;
 //    if(params.maximum_parsimony) iqtree.candidateTrees.clear(); // Diep: added this to fix the bug of sorted aln <> orig aln
 
-    if (params.use_gpu && params.start_tree == STT_PLL_PARSIMONY) {
-        // GPU path: build all K trees in parallel on GPU, then register sequentially.
-        cout << "\nUsing GPU for parallel parsimony tree building\n";
-        vector<string> gpuTrees(numInitTrees);
-        mpbootgpu::gpuInitCandidateTrees(params, iqtree, numInitTrees, gpuTrees);
-        for (int i = 1; i < numInitTrees; ++i) {
-            if (gpuTrees[i].empty()) continue;
-            if (iqtree.candidateTrees.treeExist(gpuTrees[i])) { numDupPars++; continue; }
-            iqtree.readTreeString(gpuTrees[i]);
-            if (params.count_trees) {
-                string tree = iqtree.getTopology();
-                if (pllTreeCounter.find(tree) == pllTreeCounter.end())
-                    pllTreeCounter[gpuTrees[i]] = 1;
-                else
-                    pllTreeCounter[gpuTrees[i]]++;
-            }
-            if (params.maximum_parsimony) {
-                iqtree.initializeAllPartialPars();
-                iqtree.clearAllPartialLH();
-                iqtree.curScore = -iqtree.computeParsimony();
-                iqtree.candidateTrees.update(gpuTrees[i], iqtree.curScore);
-                if (iqtree.curScore > iqtree.bestScore)
-                    iqtree.setBestTree(gpuTrees[i], iqtree.curScore);
-            } else {
-                iqtree.candidateTrees.update(gpuTrees[i], -DBL_MAX);
-            }
-        }
-    } else {
-        // CPU path: build and register each tree immediately in a single loop.
-        // readTreeString is cheap here because pllInst holds the just-built topology.
-        for (int treeNr = 1; treeNr < numInitTrees; treeNr++) {
-            string curParsTree;
-            if (params.start_tree == STT_PLL_PARSIMONY) {
-                iqtree.pllInst->randomNumberSeed = params.ran_seed + treeNr * 12345;
+	for (int treeNr = 1; treeNr < numInitTrees; treeNr++) {
+		string curParsTree;
+		if (params.start_tree == STT_PLL_PARSIMONY) {
+			iqtree.pllInst->randomNumberSeed = params.ran_seed + treeNr * 12345;
 
-                if (params.maximum_parsimony)
-                    _pllComputeRandomizedStepwiseAdditionParsimonyTree(iqtree.pllInst, iqtree.pllPartitions, params.sprDist, &iqtree);
-                else
-                    pllComputeRandomizedStepwiseAdditionParsimonyTree(iqtree.pllInst, iqtree.pllPartitions, params.sprDist);
+			if (params.maximum_parsimony)
+				_pllComputeRandomizedStepwiseAdditionParsimonyTree(iqtree.pllInst, iqtree.pllPartitions, params.sprDist, &iqtree);
+			else
+				pllComputeRandomizedStepwiseAdditionParsimonyTree(iqtree.pllInst, iqtree.pllPartitions, params.sprDist);
 
-                pllTreeToNewick(iqtree.pllInst->tree_string, iqtree.pllInst, iqtree.pllPartitions,
-                    iqtree.pllInst->start->back,
-                    PLL_TRUE, PLL_TRUE, PLL_FALSE, PLL_FALSE, PLL_FALSE,
-                    PLL_SUMMARIZE_LH, PLL_FALSE, PLL_FALSE);
-                curParsTree = string(iqtree.pllInst->tree_string);
-            } else {
-                iqtree.computeParsimonyTree(NULL, iqtree.aln);
-                curParsTree = iqtree.getTreeString();
-            }
-            if (iqtree.candidateTrees.treeExist(curParsTree)) {
-                numDupPars++;
-                continue;
-            }
-            if (params.start_tree == STT_PLL_PARSIMONY)
-                iqtree.readTreeString(curParsTree);
-            if (params.count_trees) {
-                string tree = iqtree.getTopology();
-                if (pllTreeCounter.find(tree) == pllTreeCounter.end())
-                    pllTreeCounter[curParsTree] = 1;
-                else
-                    pllTreeCounter[curParsTree]++;
-            }
-            // Diep added IF statement for MP doesn't need branch optimization
-            if (params.maximum_parsimony) {
-                iqtree.initializeAllPartialPars();
-                iqtree.clearAllPartialLH();
-                iqtree.curScore = -iqtree.computeParsimony();
-                iqtree.candidateTrees.update(curParsTree, iqtree.curScore);
-                if (iqtree.curScore > iqtree.bestScore)
-                    iqtree.setBestTree(curParsTree, iqtree.curScore);
-            } else {
-                iqtree.candidateTrees.update(curParsTree, -DBL_MAX);
-            }
-        }
-    }
+			pllTreeToNewick(iqtree.pllInst->tree_string, iqtree.pllInst, iqtree.pllPartitions,
+				iqtree.pllInst->start->back,
+				PLL_TRUE, PLL_TRUE, PLL_FALSE, PLL_FALSE, PLL_FALSE,
+				PLL_SUMMARIZE_LH, PLL_FALSE, PLL_FALSE);
+			curParsTree = string(iqtree.pllInst->tree_string);
+		} else {
+			iqtree.computeParsimonyTree(NULL, iqtree.aln);
+			curParsTree = iqtree.getTreeString();
+		}
+		if (iqtree.candidateTrees.treeExist(curParsTree)) {
+			numDupPars++;
+			continue;
+		}
+		if (params.start_tree == STT_PLL_PARSIMONY)
+			iqtree.readTreeString(curParsTree);
+		if (params.count_trees) {
+			string tree = iqtree.getTopology();
+			if (pllTreeCounter.find(tree) == pllTreeCounter.end())
+				pllTreeCounter[curParsTree] = 1;
+			else
+				pllTreeCounter[curParsTree]++;
+		}
+		// Diep added IF statement for MP doesn't need branch optimization
+		if (params.maximum_parsimony) {
+			iqtree.initializeAllPartialPars();
+			iqtree.clearAllPartialLH();
+			iqtree.curScore = -iqtree.computeParsimony();
+			iqtree.candidateTrees.update(curParsTree, iqtree.curScore);
+			if (iqtree.curScore > iqtree.bestScore)
+				iqtree.setBestTree(curParsTree, iqtree.curScore);
+		} else {
+			iqtree.candidateTrees.update(curParsTree, -DBL_MAX);
+		}
+	}
     double parsTime = getCPUTime() - startTime;
     cout << "(" << numDupPars << " duplicated parsimony trees)" << endl;
     cout << "CPU time: " << parsTime << endl;
-	auto eTime = std::chrono::high_resolution_clock::now();
-	double ms = std::chrono::duration_cast<std::chrono::milliseconds>(eTime - sTime).count();
-	cout << "CPU time high resolution clock: " << ms << " ms" << endl;
 
 	// do not do anything for parsimony because tree was already optimized by SPR
 	if (params.maximum_parsimony){
@@ -1450,6 +1412,48 @@ int initCandidateTreeSet(Params &params, IQTree &iqtree, int numInitTrees) {
     double nniTime = getCPUTime() - startTime;
     cout << "Average time for 1 NNI search: " << nniTime / initParsimonyTrees.size() << endl;
     return numDup;
+}
+
+void runBasicMpbootGpu(Params &params, IQTree &iqtree, int numInitTrees) {
+    cout << "Generating " << numInitTrees << " parsimony trees... ";
+    cout.flush();
+	auto startTime = std::chrono::high_resolution_clock::now();
+    int numDupPars = 0;
+//    if(params.maximum_parsimony) iqtree.candidateTrees.clear(); // Diep: added this to fix the bug of sorted aln <> orig aln
+
+    if (params.use_gpu && params.start_tree == STT_PLL_PARSIMONY) {
+        // GPU path: build all K trees in parallel on GPU, then register sequentially.
+        cout << "\nUsing GPU for parallel parsimony tree building\n";
+        vector<string> gpuTrees(numInitTrees);
+        mpbootgpu::mpbootGpu(params, iqtree, numInitTrees, gpuTrees);
+        for (int i = 1; i < numInitTrees; ++i) {
+            if (gpuTrees[i].empty()) continue;
+            if (iqtree.candidateTrees.treeExist(gpuTrees[i])) { numDupPars++; continue; }
+            iqtree.readTreeString(gpuTrees[i]);
+            if (params.count_trees) {
+                string tree = iqtree.getTopology();
+                if (pllTreeCounter.find(tree) == pllTreeCounter.end())
+                    pllTreeCounter[gpuTrees[i]] = 1;
+                else
+                    pllTreeCounter[gpuTrees[i]]++;
+            }
+            if (params.maximum_parsimony) {
+                iqtree.initializeAllPartialPars();
+                iqtree.clearAllPartialLH();
+                iqtree.curScore = -iqtree.computeParsimony();
+                iqtree.candidateTrees.update(gpuTrees[i], iqtree.curScore);
+                if (iqtree.curScore > iqtree.bestScore)
+                    iqtree.setBestTree(gpuTrees[i], iqtree.curScore);
+            } else {
+                iqtree.candidateTrees.update(gpuTrees[i], -DBL_MAX);
+            }
+        }
+    }
+    cout << "(" << numDupPars << " duplicated parsimony trees)" << endl;
+	auto endTime = std::chrono::high_resolution_clock::now();
+	double sec = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count() / 1e6;
+	cout << "runBasicMpbootGpu time: " << std::fixed << std::setprecision(3) << sec << " s" << endl;
+	cout.precision(0);
 }
 
 void pruneTaxa(Params &params, IQTree &iqtree, double *pattern_lh, NodeVector &pruned_taxa, StrVector &linked_name) {
@@ -1708,7 +1712,6 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 
     // Temporary fix since PLL only supports DNA/Protein: switch to IQ-TREE parsimony kernel
     if (params.start_tree == STT_PLL_PARSIMONY) {
-		cout << "--REACH 1674 phyloanalysis.cpp: if dna/protein use PLL_IQtree\n";
 		if (iqtree.isSuperTree()) {
 			PhyloSuperTree *stree = (PhyloSuperTree*)&iqtree;
 			for (PhyloSuperTree::iterator it = stree->begin(); it != stree->end(); it++)
@@ -1721,7 +1724,6 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 
     /***************** Initialization for PLL and sNNI ******************/
     if (params.start_tree == STT_PLL_PARSIMONY || params.pll) {
-		cout << "--REACH 1687 phyloanalysis.cpp: initialize PLL_IQtree\n";
         /* Initialized all data structure for PLL*/
 //        cout << "WHAT'S GOING ON HERE?" << endl;
 //        verbose_mode = VB_MAX;
@@ -1796,9 +1798,11 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
     double cputime_search_start = getCPUTime();
     double realtime_search_start = getRealTime();
 
-    if (params.min_iterations > 0) {
+	if (params.use_gpu)
+	{
+		runBasicMpbootGpu(params, iqtree, numInitTrees);
+	} else if (params.min_iterations > 0) {
         double initTime = getCPUTime();
-		cout << "--REACH 1769 phyloanalysis.cpp: min_iterations = " << params.min_iterations << '\n';
 
         if (!params.user_file && (params.start_tree == STT_PARSIMONY || params.start_tree == STT_PLL_PARSIMONY)) {
         	int numDup = initCandidateTreeSet(params, iqtree, numInitTrees);
@@ -1837,10 +1841,6 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
         cout << "Current best score: " << (params.maximum_parsimony ? -iqtree.bestScore : iqtree.bestScore) << " / CPU time: "
                 << getCPUTime() - initTime << endl << endl;
 	}
-	if (params.use_gpu)
-	{
-		exit(0);
-	}
 
 
     if (params.leastSquareNNI) {
@@ -1866,8 +1866,8 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 	}
 
 	/****************** Do tree search ***************************/
-	if (params.min_iterations > 1) {
-		cout << "--REACH 1839 phyloanalysis.cpp, min_iterations = " << params.min_iterations << '\n';
+	if (params.use_gpu) {}
+	else if (params.min_iterations > 1) {
 		iqtree.readTreeString(iqtree.bestTreeString);
 		iqtree.doTreeSearch();
 		iqtree.setAlignment(iqtree.aln);
@@ -1907,7 +1907,7 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
         iqtree.initializeAllPartialLh();
         iqtree.clearAllPartialLH();
         if(params.maximum_parsimony)
-        	iqtree.computeParsimony();
+        	iqtree.computeParsimony();\
         else
 			iqtree.bestTreeString = iqtree.optimizeModelParameters(true);
 	} else {
