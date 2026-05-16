@@ -3424,6 +3424,7 @@ int pllOptimizeSprParsimony(pllInstance * tr, partitionList * pr, int mintrav, i
 		for(i = 1; i <= tr->mxtips + tr->mxtips - 2; i++){
 //		for(j = 1; j <= tr->mxtips + tr->mxtips - 2; j++){
 //			i = perm[j];
+			if(tr->stop_search) break;
 			tr->insertNode = NULL;
 			tr->removeNode = NULL;
 			bestTreeScoreHits = 1;
@@ -3439,7 +3440,7 @@ int pllOptimizeSprParsimony(pllInstance * tr, partitionList * pr, int mintrav, i
 				randomMP = tr->bestParsimony;
 			}
 		}
-	}while(randomMP < startMP);
+	}while(randomMP < startMP && !tr->stop_search);
 
 	return startMP;
 }

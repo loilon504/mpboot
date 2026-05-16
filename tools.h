@@ -58,7 +58,13 @@
 #endif
 
 #if defined(USE_HASH_MAP) && !defined(_MSC_VER)
-	#if !defined(__GNUC__)
+	// Bug fix: clang and gcc chose different hash_map implementations based on
+	// GCC_VERSION, causing ODR violations and struct-size mismatches at link time.
+	// With C++11 available, prefer std::unordered_map/set unconditionally.
+	#if __cplusplus >= 201103L
+		#include <unordered_map>
+		#include <unordered_set>
+	#elif !defined(__GNUC__)
 		#include <hash_map>
 		#include <hash_set>
 		using namespace stdext;
@@ -83,7 +89,9 @@
 using namespace std;
 
 
-#if	defined(USE_HASH_MAP) && GCC_VERSION < 40300 && !defined(_MSC_VER)
+// Bug fix: guard also on __cplusplus < 201103L so the C++11 path above doesn't
+// re-enter this block when compiled with a GCC version < 4.3 but C++11 mode.
+#if	defined(USE_HASH_MAP) && GCC_VERSION < 40300 && !defined(_MSC_VER) && __cplusplus < 201103L
 /*
         Define the hash function of Split
  */

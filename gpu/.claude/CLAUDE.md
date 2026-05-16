@@ -93,9 +93,9 @@ python3 ../output/summarize.py             # → output/results.xlsx
 [GPU]   [6b]     Ratchet (odd)         :  198/408 iters improved (48.5%)
 [GPU]
 [GPU]   [7a]     Download topologies (D->H)  :    0.006 s
-[GPU]   [7b]     Clone + gpuTopoToCpu        :    0.003 s
+[GPU]   [7b]     gpuTopoToCpu               :    0.003 s
 [GPU]   [7c]     Newick conversion           :    0.050 s
-[GPU]   built = 399 / 399 trees
+[GPU]   best CPU tree: 6664     best GPU tree: 6664
 [GPU] ═══════════════════════════════════════════════════════
 ```
 
@@ -122,7 +122,7 @@ Called from `IQTree::initCandidateTreesParsimony()` when `--use_gpu` is passed.
 | [4] | `cpuToGpuTopology` + `uploadTopology` | Converts PLL pointer-ring to flat integer arrays (`GpuTopology`), uploads **one initial topology** to all K trees |
 | [5] | `buildParsimonyTreesKernel` (`pars_build.cu`) | Each block builds one tree via **stepwise addition** on GPU |
 | [6] | `gpuSprKernel` (`gpu_spr.cu`) | Each block runs **SPR hill-climbing** on its tree |
-| [7] | `downloadTopology` + `gpuTopoToCpu` + `pllTreeToNewick` | Download K topologies, convert back to PLL pointer-rings, emit Newick strings |
+| [7] | `downloadTopology` + `gpuTopoToCpu` + `pllTreeToNewick` + `candidateTrees.update` | Download K topologies, convert to PLL (reuse `tr` directly — no clone), CPU-rescore each via `computeParsimony()`, register into `iqtree.candidateTrees` |
 
 ### Data layout
 

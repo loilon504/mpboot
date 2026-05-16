@@ -21,10 +21,6 @@ void _pllComputeRandomizedStepwiseAdditionParsimonyTree(pllInstance * tr, partit
 void _allocateParsimonyDataStructures(pllInstance *tr, partitionList *pr, int perSiteScores = 0);
 void _pllFreeParsimonyDataStructures(pllInstance *tr, partitionList *pr);
 
-// Run only the SPR hill-climbing on the topology already in tr.
-// Internally calls _allocateParsimonyDataStructures / _pllFreeParsimonyDataStructures.
-void _pllSprOnCurrentTree(pllInstance *tr, partitionList *pr, int sprDist, IQTree *iqtree);
-
 pllInstance*   pllInstanceClone(pllInstance* src);
 void           pllInstanceCloneFree(pllInstance* tr);
 partitionList* pllPartitionsClone(partitionList* src);

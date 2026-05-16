@@ -1418,38 +1418,15 @@ void runBasicMpbootGpu(Params &params, IQTree &iqtree, int numInitTrees) {
     cout << "Generating " << numInitTrees << " parsimony trees... ";
     cout.flush();
 	auto startTime = std::chrono::high_resolution_clock::now();
-    int numDupPars = 0;
 //    if(params.maximum_parsimony) iqtree.candidateTrees.clear(); // Diep: added this to fix the bug of sorted aln <> orig aln
 
     if (params.use_gpu && params.start_tree == STT_PLL_PARSIMONY) {
-        // GPU path: build all K trees in parallel on GPU, then register sequentially.
+        // GPU path: build all K trees in parallel on GPU.
+        // candidateTrees.update + setBestTree are handled inside mpbootGpu.
         cout << "\nUsing GPU for parallel parsimony tree building\n";
         vector<string> gpuTrees(numInitTrees);
         mpbootgpu::mpbootGpu(params, iqtree, numInitTrees, gpuTrees);
-        for (int i = 1; i < numInitTrees; ++i) {
-            if (gpuTrees[i].empty()) continue;
-            if (iqtree.candidateTrees.treeExist(gpuTrees[i])) { numDupPars++; continue; }
-            iqtree.readTreeString(gpuTrees[i]);
-            if (params.count_trees) {
-                string tree = iqtree.getTopology();
-                if (pllTreeCounter.find(tree) == pllTreeCounter.end())
-                    pllTreeCounter[gpuTrees[i]] = 1;
-                else
-                    pllTreeCounter[gpuTrees[i]]++;
-            }
-            if (params.maximum_parsimony) {
-                iqtree.initializeAllPartialPars();
-                iqtree.clearAllPartialLH();
-                iqtree.curScore = -iqtree.computeParsimony();
-                iqtree.candidateTrees.update(gpuTrees[i], iqtree.curScore);
-                if (iqtree.curScore > iqtree.bestScore)
-                    iqtree.setBestTree(gpuTrees[i], iqtree.curScore);
-            } else {
-                iqtree.candidateTrees.update(gpuTrees[i], -DBL_MAX);
-            }
-        }
     }
-    cout << "(" << numDupPars << " duplicated parsimony trees)" << endl;
 	auto endTime = std::chrono::high_resolution_clock::now();
 	double sec = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count() / 1e6;
 	cout << "runBasicMpbootGpu time: " << std::fixed << std::setprecision(3) << sec << " s" << endl;

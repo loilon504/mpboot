@@ -1,6 +1,8 @@
 #pragma once
 #include <string>
 #include <vector>
+
+#include "iqtree.h"
 #include "pllrepo/src/pll.h"
 
 // Forward declarations to avoid including heavy headers here
@@ -10,19 +12,17 @@ class IQTree;
 namespace mpbootgpu
 {
 
-// Build numInitTrees-1 parsimony trees on GPU using stepwise addition.
-// Results go into candidateTrees[1..numInitTrees-1] as Newick strings
-// (same layout as the CPU OpenMP path in initCandidateTreeSet).
+// Build numInitTrees-1 parsimony trees on GPU using stepwise addition + SPR.
+// Results go into candidateTrees[1..numInitTrees-1] as Newick strings.
+// Trees are also registered into iqtree.candidateTrees (via update + setBestTree)
+// using CPU-recomputed parsimony scores.
 //
-// SPR hill-climbing is NOT done on GPU — after this call the caller must
-// run rearrangeParsimony on each downloaded tree (or skip SPR for GPU trees).
-//
-// Returns the number of distinct trees actually built.
+// Returns the number of trees successfully built.
 int mpbootGpu(
-    const Params&        params,
-    IQTree&              iqtree,
-    int                  numInitTrees,
-    std::vector<std::string>& candidateTrees   // out, index 1..numInitTrees-1
+    const Params& params,
+    IQTree& iqtree,
+    int numInitTrees,
+    std::vector<std::string>& candidateTrees  // out, index 1..numInitTrees-1
 );
 
 }  // namespace mpbootgpu

@@ -1196,3 +1196,357 @@ Full results: `output/gpu_final_800/`
 
 4. **Quality cải thiện cùng với speed**: Đây là dấu hiệu của exploitation-exploration balance tốt hơn. Khi mỗi perturbation bắt đầu từ best, exploration có ý nghĩa hơn → tìm được cây tốt hơn trong ít thời gian hơn.
 
+---
+
+## Bug #10 — ODR violation: `sizeof(SearchInfo)` khác nhau giữa CXX TU và CUDA TU
+
+**Ngày**: 2026-05-16
+**Task**: GPU mode crash ngay sau `mpbootGpu()` — `candidateTrees.aln` đọc từ địa chỉ sai
+**File liên quan**: `mpboot/tools.h`, `mpboot/nnisearch.h`, `mpboot/gpu/src/gpu_init_trees.cu`
+
+### Triệu chứng
+
+GPU mode (`-use_gpu`) crash ngay khi bắt đầu `gpuInitCandidateTrees()`. Debug prints in ra
+layout `IQTree` với `candidateTrees.aln` lệch nhiều byte so với kỳ vọng. Crash xảy ra khi
+`gpu_init_trees.cu` đọc `iqtree.candidateTrees.aln` — giá trị là garbage pointer.
+
+### Root cause — ODR (One Definition Rule) violation
+
+`SearchInfo` struct (`nnisearch.h`) chứa field:
+```cpp
+unordered_set<string> aBranches;
+```
+
+`tools.h` chọn implementation của `unordered_set` theo `GCC_VERSION` macro:
+- **Nhánh `< 40300`**: `__gnu_cxx::hash_set<string>` → sizeof = **40 bytes**
+- **Nhánh `>= 40300`**: `std::tr1::unordered_set<string>` → sizeof = **48 bytes**
+
+Hai translation units dùng hai compiler khác nhau:
+- **CXX TU** (`phyloanalysis.cpp`, compiled by `clang++`): `__GNUC__=4.2.1` → `GCC_VERSION=40201 < 40300` → `hash_set` (40 bytes) → `sizeof(SearchInfo)=160`
+- **CUDA TU** (`gpu_init_trees.cu`, compiled by nvcc với host `gcc 9.4`): `__GNUC__=9.4.0` → `GCC_VERSION=90400 >= 40300` → `tr1::unordered_set` (48 bytes) → `sizeof(SearchInfo)=168`
+
+Hệ quả: mọi field của `IQTree` sau `searchinfo` (field đầu tiên dùng `SearchInfo`) đều có offset sai trong CUDA TU, bao gồm `candidateTrees` và `candidateTrees.aln` — đọc từ địa chỉ lệch 8 bytes → garbage pointer → crash.
+
+**Root cause thứ hai**: `CMakeLists.txt` có `set(CMAKE_CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})` tại line 43 nhưng AFTER `enable_language(CUDA)` tại line 42 → vô hiệu. CUDA host compiler thực sự là system gcc 9.4.0, không phải `clang++`.
+
+### Fix: `tools.h` — thêm nhánh `__cplusplus >= 201103L`
+
+Thêm nhánh C++11 trước các nhánh GCC_VERSION:
+```cpp
+#if defined(USE_HASH_MAP) && !defined(_MSC_VER)
+    #if __cplusplus >= 201103L
+        // C++11+: dùng std::unordered_map/set — tránh ODR violation
+        #include <unordered_map>
+        #include <unordered_set>
+    #elif !defined(__GNUC__)
+        // ...
+    #elif GCC_VERSION < 40300
+        // ...
+    #else
+        // ...
+    #endif
+#endif
+```
+
+Cả hai TU đều build với `-std=c++14` → cả hai đều thấy `__cplusplus >= 201103L` → cùng dùng `std::unordered_set` (56 bytes) → `sizeof(SearchInfo)=176` nhất quán.
+
+Cũng guard `__gnu_cxx::hash<string>` specialization:
+```cpp
+#if defined(USE_HASH_MAP) && GCC_VERSION < 40300 && !defined(_MSC_VER) && __cplusplus < 201103L
+```
+
+### Xác nhận fix
+
+Sau fix: `offsetof(IQTree, candidateTrees.aln)` giống nhau trong cả hai TU. GPU mode chạy được qua `gpuInitCandidateTrees()` không crash.
+
+### Bài học / Ghi chú cho khóa luận
+
+1. **ODR violation không compile-error**: Hai TU định nghĩa `SearchInfo` khác nhau mà không có cảnh báo. Linker kết hợp hai object files mà không biết conflict. Chỉ lộ ra khi runtime dùng wrong offsets.
+
+2. **nvcc host compiler ≠ cmake CXX compiler**: Dù CMakeLists.txt ghi `CMAKE_CUDA_HOST_COMPILER = clang++`, việc set sau `enable_language(CUDA)` không có effect. Dùng `cmake --trace` để xác nhận compiler thực sự.
+
+3. **`tools.h` type selection fragile**: Dùng `GCC_VERSION` để chọn container type là anti-pattern khi codebase dùng nhiều compilers. Fix đúng: dùng `__cplusplus` hoặc `__has_include` — consistent trên mọi compiler.
+
+4. **Chẩn đoán bằng `offsetof`**: Khi crash xảy ra tại boundary TU (data từ TU A, đọc từ TU B), print `offsetof(Struct, field)` trong cả hai TU để xác nhận ODR violation.
+
+---
+
+## Bug #11 — `hybrid_cb2`: ba crash độc lập khi GPU hill-climbing chạy song song
+
+**Ngày**: 2026-05-16
+**Task**: `AfterK2Callback` (`hybrid_cb2`) trong `gpu_init_trees.cu` — CPU perturbation trong khi GPU hillClimbingKernel chạy
+**File liên quan**: `gpu/src/gpu_init_trees.cu`
+
+### Bối cảnh
+
+`hybrid_cb2` là callback chạy trên CPU trong khi GPU `hillClimbingKernel` chạy async:
+- Even iterations: NNI perturbation với `iqtree.aln`, rồi score
+- Odd iterations: Ratchet perturbation (weighted alignment), rồi score
+- Sau mỗi iter: lấy tree string hiện tại, update `candidateTrees`
+
+### Crash #1 — SIGFPE: `topologies.count()` sau `pllOptimizeSprParsimonyTree`
+
+**Root cause**: Code gọi `topologies.count(key)` trên một `unordered_map` sau khi `pllOptimizeSprParsimonyTree` đã corrupt `bucket_count` của hash map về 0. Modulo 0 → SIGFPE.
+
+**Fix**: Bỏ toàn bộ `topologies` access trong `hybrid_cb2` — không cần kiểm tra duplicate trong callback này vì `candidateTrees.treeExist()` đã handle.
+
+### Crash #2 — SIGSEGV: `parsVect=NULL` trong PLL parsimony functions
+
+**Root cause**: `ratchet_iter=1` (default) → `_pllFreeParsimonyDataStructures` được gọi sau mỗi `doNNISearch` → `parsVect=NULL`. Lần gọi tiếp theo với `first_call=false` bỏ qua alloc → NULL parsVect → crash khi truy cập.
+
+Quan sát thêm: **tất cả** PLL parsimony calls (`_pllSprOnCurrentTree`, `_pllComputeRandomizedStepwiseAdditionParsimonyTree`) corrupt heap gần `aln->seq_names` ngay cả trên clones. Phase 2 dùng PLL parsimony gây crash sau ~300 iterations.
+
+**Fix**: Bỏ hoàn toàn mọi PLL parsimony function call trong `hybrid_cb2`. Dùng `PhyloTree::computeParsimony()` thay thế — safe, không PLL heap ops.
+
+### Crash #3 — SIGSEGV/ABORT: `candidateTrees.aln = iqtree.aln` sau post-processing
+
+**Root cause**: `iqtree.aln` là sorted alignment (sau `sort_taxa()`). `candidateTrees.aln` từ `setParams` là pre-sort alignment — object khác, được populate trước post-processing. PLL Newick dùng `nameList` tied với original aln object — set `candidateTrees.aln = iqtree.aln` (sorted) → `getTopology()` lookup taxa không match → SIGSEGV/ABORT.
+
+**Fix**: Không bao giờ gán `candidateTrees.aln = iqtree.aln`. `candidateTrees.aln` được setup đúng bởi `setParams` trước khi vào `mpbootGpu`.
+
+### Crash #4 — `doNNISearch()` reinitializes PLL cho alignment hiện tại
+
+**Root cause**: `doNNISearch()` trong parsimony mode reinitializes PLL cho current alignment. Khi gọi với perturbed alignment set, PLL state mismatch → crash. Ngoài ra, `pllTreeInitTopologyNewick` trên clone trả về ORIGINAL `tr` pointers → `child->back=parent` set original tip back-ptrs sang freed clone memory → next `pllInstanceClone(tr)` tạo broken clones.
+
+**Fix**: Xóa `doNNISearch()` call. Thay bằng `iqtree.getTreeString()` — chỉ lấy current tree topology string, không search.
+
+### Crash #5 — `optimizeAllBranches()` trong parsimony mode
+
+**Root cause**: `optimizeAllBranches()` là likelihood function — cần model parameters không tồn tại trong parsimony mode. Crash ngay khi gọi.
+
+**Fix**: Thay bằng:
+```cpp
+iqtree.initializeAllPartialPars();
+iqtree.clearAllPartialLH();
+iqtree.curScore = -(double)iqtree.computeParsimony();
+```
+
+### Final `hybrid_cb2` structure sau fix
+
+```cpp
+// Even: NNI perturbation + parsimony score
+iqtree.doNNI(numNNI);  // safe — in-place NNI, không đụng PLL
+iqtree.initializeAllPartialPars();
+iqtree.clearAllPartialLH();
+iqtree.curScore = -(double)iqtree.computeParsimony();
+
+// Odd: Ratchet perturbation + parsimony score
+Alignment* perturb_aln = new Alignment;
+perturb_aln->createPerturbAlignment(iqtree.aln, ...);
+iqtree.setAlignment(perturb_aln);
+iqtree.initializeAllPartialPars();
+iqtree.clearAllPartialLH();
+iqtree.curScore = -(double)iqtree.computeParsimony();
+
+// Sau odd iter: restore original alignment
+delete iqtree.aln;  // frees perturb_aln
+iqtree.setAlignment(saved_aln);
+iqtree.initializeAllPartialPars();
+iqtree.clearAllPartialLH();
+iqtree.curScore = -(double)iqtree.computeParsimony();
+
+// Get tree string — không search
+std::string imd_tree = iqtree.getTreeString();
+candidateTrees.update(imd_tree, iqtree.curScore);
+```
+
+### Kết quả sau fix
+
+GPU mode chạy hoàn chỉnh:
+```
+[GPU]   [hybrid2] Phase2: 569 iters (285 NNI, 284 ratchet)
+[GPU]   [5+6+7]  Kernel (build+SPR+search)   :    7.723 s  (200 trees, 38.61 ms/tree)
+[GPU]   built = 200 / 200 trees
+(0 duplicated parsimony trees)
+```
+Exit 0, parsimony score 6727.
+
+### Bài học / Ghi chú cho khóa luận
+
+1. **PLL là thư viện riêng với internal state**: Gọi PLL function khi state không khớp (alignment khác, parsVect freed) → crash không dự đoán được. Quy tắc: chỉ dùng PLL functions khi `pllInst` đang giữ đúng alignment + parsVect đã allocated.
+
+2. **`PhyloTree::computeParsimony()` là "safe zone"**: Không dùng PLL internal, chỉ dùng PhyloTree's own parsVect. Trong parsimony mode, đây là cách score cây an toàn nhất.
+
+3. **Multiple independent crashes cùng code path**: Bug không phải một bug duy nhất mà là chuỗi 5 crash độc lập cùng xuất hiện khi code path được kích hoạt. Debug từng crash tuần tự bằng cách fix và rerun.
+
+4. **`candidateTrees.aln` vs `iqtree.aln`**: Hai object khác nhau — `iqtree.aln` là sorted; `candidateTrees.aln` là pre-sort. Không được gán cross (dù trỏ về cùng dataset). Đây là invariant ngầm trong MPBoot không được document.
+
+---
+
+## Bug #12 — `hybrid_cb2`: `searchinfo.curPerStrength` chưa init → `doRandomNNIs(677M)` → 570s overhead
+
+**Ngày**: 2026-05-16  
+**Task**: GPU early-stop — dừng CPU hill-climbing khi GPU K2 xong  
+**File liên quan**: `gpu/src/gpu_init_trees.cu`
+
+### Bối cảnh
+
+Mục tiêu: khi `hillClimbingKernel` (K2) xong (~5–9s), CPU SPR loop trong `doNNISearch`
+phải thoát sớm thay vì chạy đến hội tụ (~191–627s trên 3 outlier datasets N=219–242).
+
+Cơ chế đã implement (session trước):
+1. `volatile int stop_search` trong `pllInstance` struct (`pll.h`)
+2. `if(tr->stop_search) break` tại đầu for-loop + `&& !tr->stop_search` trong do-while condition
+   trong cả `pllOptimizeSprParsimony` và `_pllSprOnCurrentTree` (`sprparsimony.cpp`)
+3. Monitor thread trong `hybrid_cb2`: `cudaStreamSynchronize(cb_stream)` → set flag
+4. `index += 4` → `index += 2` fix trong vòng replace `:nan` của `doNNISearch` (`iqtree.cpp`)
+
+Sau khi implement, test vẫn cho kết quả **572s** — không cải thiện.
+
+### Triệu chứng
+
+Dataset `dna_M14678_225_2673` (N=225, sites=2673):
+```
+[GPU]   hillClimbingKernel: time: 2.834 s
+[CPU]   CPU Hill-Climbing: 1 iters (1 NNI, 0 ratchet), bestScore = 9021
+[GPU]   [5]  Kernels  :  570.794 s  (200 trees, 2853.97 ms/tree)
+```
+
+K2 chỉ mất 2.834s nhưng tổng Kernels là 570.794s. `hybrid_cb2` chạy 1 outer iteration
+và không thoát được. Debug prints bằng stderr cho thấy code stuck tại `doRandomNNIs`.
+
+### Root cause
+
+Trong `hybrid_cb2`, NNI perturbation block:
+```cpp
+// TRƯỚC (sai):
+int numNNI = floor(iqtree.searchinfo.curPerStrength * (iqtree.aln->getNSeq() - 3));
+iqtree.doRandomNNIs(numNNI);
+```
+
+`iqtree.searchinfo.curPerStrength` **không bao giờ được initialize** trong context của
+`hybrid_cb2`. Giá trị là garbage float (~3,051,130). Kết quả:
+```
+numNNI = floor(3051130.0 * (225 - 3)) = 677,352,759
+```
+
+`doRandomNNIs(677352759)` cố gắng thực hiện **677 triệu NNI moves** trên một cây N=225.
+Mỗi NNI là một tree operation, nên đây thực chất là vòng lặp vô tận ~570s.
+
+Cơ chế early-stop (monitor thread + `stop_search` flag) đã hoạt động **đúng** từ đầu —
+nhưng flag chỉ được check bên trong `pllOptimizeSprParsimony`. Code không bao giờ reach được
+đến `pllOptimizeSprParsimony` vì bị stuck trước đó tại `doRandomNNIs`.
+
+### Debug methodology
+
+Thêm `fprintf(stderr, ...)` tại các checkpoint:
+1. `[CPU-DBG] entering while loop check` — while loop được entered ✓
+2. `[CPU-DBG] readTreeString done` — readTreeString nhanh ✓
+3. `[CPU-DBG] doRandomNNIs(677352759)` — **stuck here** ✗
+
+Thiếu `fprintf` ngay sau `doRandomNNIs` confirm đây là bottleneck.
+
+### Fix
+
+```cpp
+// SAU (đúng):
+int numNNI = std::max(1, (int)floor(params.gpu_nni_strength * (iqtree.aln->getNSeq() - 3)));
+iqtree.doRandomNNIs(numNNI);
+```
+
+Dùng `params.gpu_nni_strength` (CLI flag `-gpu_nni_strength`, default=0.1) — cùng formula
+với GPU K2 kernel. Cho N=225: `numNNI = max(1, floor(0.1 * 222)) = 22`.
+
+**File**: `gpu/src/gpu_init_trees.cu`, NNI perturb block bên trong while loop của `hybrid_cb2`.
+
+### Kết quả sau fix
+
+| Dataset | Trước | Sau | Speedup |
+|---------|-------|-----|---------|
+| dna_M14678_225_2673 (N=225, sites=2673) | 9:32 (572s) | **0:05 (5s)** | **115×** |
+| dna_M5731_242_9626 (N=242, sites=9626) | ~300–600s (est.) | **0:08 (8s)** | **~50×** |
+| dna_M6134_219_5158 (N=219, sites=5158) | ~200–400s (est.) | **0:05 (5s)** | **~50×** |
+
+Dataset bình thường (N=295): 8.83s, không đổi so với trước.  
+CPU Hill-Climbing: 218–248 iters/run, bestScore tốt hơn hoặc bằng trước.
+
+### Các thay đổi trong session này (tổng hợp)
+
+1. **`pll.h`**: thêm `volatile int stop_search` vào struct `pllInstance` (auto-zero bởi `rax_calloc`)
+2. **`sprparsimony.cpp`**: thêm `if(tr->stop_search) break` đầu for-loop + `&& !tr->stop_search`
+   vào do-while condition trong `pllOptimizeSprParsimony` và `_pllSprOnCurrentTree`
+3. **`gpu_init_trees.cu`**: thêm `#include <thread>`; monitor thread wrap `doNNISearch` calls;
+   **fix `curPerStrength` → `gpu_nni_strength`**
+4. **`iqtree.cpp`**: fix `index += 4` → `index += 2` trong `:nan` replace loop của `doNNISearch`
+   (bug cũ: `replace(pos, 4, ":0")` xong advance 4 thay vì 2, bỏ sót adjacent `:nan`)
+
+### Bài học / Ghi chú cho khóa luận
+
+1. **Uninitialized float → huge integer**: Garbage float × integer = số nguyên khổng lồ. Không
+   có warning từ compiler vì cast từ float sang int là valid. Cần thêm assert hoặc clamp:
+   `assert(numNNI >= 1 && numNNI <= getNSeq()); // hoặc max(1, min(numNNI, N))`
+
+2. **Early-stop mechanism ẩn sau bug khác**: Cơ chế `stop_search` flag hoạt động đúng ngay
+   từ đầu — 572s không phải do flag không work mà do code không reach được đến `pllOptimizeSprParsimony`.
+   Root cause ẩn sâu dưới symptom (572s overhead tương tự trước khi implement early-stop).
+
+3. **Debug by elimination với stderr**: stdout bị buffered/interleaved với GPU output → dùng
+   `fprintf(stderr, ...)` để trace execution path. Thấy code pass qua `readTreeString` nhưng
+   không qua `doRandomNNIs` → stuck tại đó.
+
+4. **Tham số nào để dùng**: `searchinfo.curPerStrength` là state của IQ-TREE search heuristic —
+   chỉ valid trong `runTreeSearch()` flow, không phải trong GPU callback context. `params.gpu_nni_strength`
+   là CLI parameter luôn có giá trị hợp lệ — đây là lựa chọn đúng cho hybrid_cb2.
+
+---
+
+## Thay đổi thiết kế #1 — [7] loop: bỏ pllClone, chuyển candidateTrees.update vào mpbootGpu
+
+**Ngày**: 2026-05-16  
+**Task**: Refactor bước [7] trong `mpbootGpu()` (`gpu_init_trees.cu`)  
+**Files**: `gpu/src/gpu_init_trees.cu`, `mpboot/phyloanalysis.cpp`, `gpu/include/gpu_init_trees.cuh`
+
+### Trước (hybrid3 design)
+
+Vòng [7] làm:
+1. `pllInstanceClone(tr)` + `pllPartitionsClone(pr)` — tạo bản sao PLL instance cho mỗi cây
+2. `gpuTopoToCpu(&h_topo, tr_clone)` — convert topology vào bản sao
+3. `pllTreeToNewick(tr_clone, ...)` — emit Newick string
+4. Lưu Newick vào `candidateTrees[i]` (vector<string>)
+
+Sau khi `mpbootGpu()` trả về, caller trong `phyloanalysis.cpp` (lines 1429–1450) loop lại:
+- `readTreeString()` + `computeParsimony()` + `candidateTrees.update()` cho mỗi cây
+
+**Vấn đề**:
+- `pllInstanceClone` + `pllPartitionsClone` = O(K) clone overhead (mỗi cây ~50–200 ms cho dataset lớn)
+- Caller phải re-parse và re-score K cây → O(K) redundant work sau khi mpbootGpu đã xong
+
+### Sau (hybrid4 design)
+
+Vòng [7] dùng `tr`/`pr` trực tiếp (loop tuần tự → safe, không cần clone):
+```cpp
+gpuTopoToCpu(&h_topo, tr);           // reuse tr, không clone
+pllTreeToNewick(tr, pr, ...);        // emit Newick
+iqtree.readTreeString(tree_str);
+iqtree.initializeAllPartialPars();
+iqtree.clearAllPartialLH();
+iqtree.curScore = -(double)iqtree.computeParsimony();
+bool isNew = iqtree.candidateTrees.update(tree_str, iqtree.curScore);
+if (isNew && iqtree.curScore > iqtree.bestScore)
+    iqtree.setBestTree(tree_str, iqtree.curScore);
+```
+
+Caller post-loop trong `phyloanalysis.cpp` bị xóa hoàn toàn.
+
+**Print format đổi**:
+- Cũ: `"built = %d / %d trees"`
+- Mới: `"best CPU tree: %-7u  best GPU tree: %u"` — in best parsimony score của CPU hybrid vs GPU post-HC
+
+**Alignment fix**: `%d` → `%3d` cho iteration number trong `hybrid_cb2` print.
+
+### Kết quả (hybrid4 benchmark — 20 datasets, 5 configs)
+
+- **Correctness**: Quality y hệt hybrid3 (≤±2 điểm stochastic) — refactor không tạo regression ✅
+- **Timing overhead nhỏ**: [7] mới thêm K lần `computeParsimony` — overhead ~20% cho N≤100, không đáng kể cho N≥200
+- **GPU vs CPU quality**: 12/20 datasets GPU tốt hơn CPU, 7/20 bằng, 1/20 thua (N=640)
+
+### Bài học / Ghi chú cho khóa luận
+
+1. **Sequential loop = no clone needed**: Loop [7] chạy tuần tự trên CPU — `tr` bị overwrite mỗi iteration nhưng không ai đọc topology của `tr` sau khi loop kết thúc. Không cần clone instance chỉ để "an toàn".
+
+2. **`CandidateSet::update()` return value**: Trả về `bool` (true = cây mới, false = duplicate/rejected). Dùng làm guard cho `setBestTree` — không cần `treeExist()` check riêng.
+
+3. **`best_cpu_pars` capture trước [7] loop**: `(unsigned int)(-iqtree.bestScore)` phải được capture TRƯỚC khi GPU trees được thêm vào candidateTrees — vì `setBestTree` trong [7] có thể cập nhật `bestScore`. Print so sánh CPU-only vs GPU-only scores.
+
+4. **initializeAllPartialPars + clearAllPartialLH**: Cần gọi trước `computeParsimony()` sau `readTreeString()` để reset parsVect state. Đây là overhead chính của [7] mới — tương đương với `pllInstanceClone` trước đó.
+

@@ -2111,7 +2111,6 @@ string IQTree::doNNISearch(int& nniCount, int& nniSteps) {
 
 //		if(false){
 		if(on_ratchet_hclimb1 && params->hclimb1_nni){
-            cout << "--REACH 2108, on_ratchet_hclimb1 && params->hclimb1_nni\n";
 			curScore = optimizeNNI(nniCount, nniSteps);
 			treeString = getTreeString();
 		}else{
@@ -2126,8 +2125,10 @@ string IQTree::doNNISearch(int& nniCount, int& nniSteps) {
 				 /* Make the replacement. */
 				 treeString1.replace(index, 4, ":0");
 
-				 /* Advance index forward so the next iteration doesn't pick it up as well. */
-				 index += 4;
+				 /* Bug fix: advance by 2 (length of ":0"), not 4 (length of ":nan").
+				    Advancing by 4 skipped over the next character after ":0", causing
+				    adjacent ":nan" tokens to be missed. */
+				 index += 2;
 			}
 
 			int max_spr_rad = params->spr_maxtrav;

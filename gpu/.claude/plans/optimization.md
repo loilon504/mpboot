@@ -315,9 +315,36 @@ Rectify vẫn được gọi ở iter 2+ (khi topology thực sự thay đổi s
 - Aligned columns, `═══` borders
 - `setbuf(stdout, NULL)` for immediate flush in GPU section
 
-### Next: Hybrid CPU-GPU
-- Plan: `/gpu/.claude/plans/hybrid_cpu_gpu.md`
-- CPU builds trees in parallel with GPU Kernel 1 (using idle CPU time)
-- After Kernel 1 sync: merge CPU+GPU trees, upload top CPU trees to GPU
-- GPU Kernel 2 + CPU SPR hill-climbing run in parallel
-- Callback pattern: `AfterK1Callback` injected into `gpuStepwiseBuildTrees`
+### ✅ Hybrid CPU-GPU — DONE (2026-05-15 → 2026-05-16)
+
+- **hybrid_cb1**: CPU build cây (`_pllMakeParsimonyTreeFast` + `computeParsimony()`) trong khi GPU Kernel 1 chạy async. Push vào `candidateTrees` khi score đủ tốt.
+- **hybrid_cb2**: CPU alternates NNI (even) / Ratchet (odd) perturbation trong khi GPU `hillClimbingKernel` chạy. Dùng `PhyloTree::computeParsimony()` — không PLL.
+- **[7] redesign**: Xóa `pllInstanceClone`/`pllPartitionsClone` — reuse `tr`/`pr` trực tiếp. `candidateTrees.update()` chạy trong [7] loop, post-loop trong `phyloanalysis.cpp` đã bị xóa.
+- **Print format**: `best CPU tree: X  best GPU tree: Y` thay `built = K / K trees`.
+
+**Bug fixes trong quá trình implement**:
+- Bug #10: ODR violation `sizeof(SearchInfo)` khác nhau giữa CXX TU (clang++) và CUDA TU (gcc) → fix bằng `#if __cplusplus >= 201103L` trong `tools.h`
+- Bug #11: `hybrid_cb2` 5 crash độc lập do PLL state conflict + unsafe function calls → fix bằng loại bỏ toàn bộ PLL parsimony, dùng `PhyloTree::computeParsimony()` only
+
+---
+
+## Hybrid Benchmark — hybrid4 (2026-05-16)
+
+**Setup**: 20 datasets (N=50–640, 7 protein + 13 DNA), seed=1, 5 configs × run trên device 1–5 (A100).
+
+| Config | numpars | sprdist | gpu_stop | Mean speedup | Quality vs CPU |
+|--------|---------|---------|----------|-------------|----------------|
+| n200d3s4 | 200 | 3 | 4 | **3.62×** | 8↑ / 10= / 2↓ |
+| n200d4s6 | 200 | 4 | 6 | 2.64× | **12↑ / 7= / 1↓** |
+| n200d5s6 | 200 | 5 | 6 | 2.12× | **12↑ / 7= / 1↓** |
+| n400d4s6 | 400 | 4 | 6 | 1.99× | **12↑ / 7= / 1↓** |
+| n400d5s6 | 400 | 5 | 6 | 1.66× | **12↑ / 7= / 1↓** |
+
+**Insights**:
+- **Sweet spot**: `n200d4s6` — 2.64× speedup, 95% win/tie vs CPU. sprdist=5 cho cùng quality nhưng chậm hơn 25%.
+- **Speed vs quality**: `n200d3s4` nhanh nhất (3.62×) nhưng chỉ 73% win/tie — sprdist=3 không đủ cho N>300.
+- **n400 không worth it**: 2× trees nhưng quality tăng ≤2 điểm, mất 40–50% tốc độ.
+- **Timing regression nhỏ vs hybrid3**: [7] loop mới thêm K lần `computeParsimony` — overhead ~20% cho N≤100, không đáng kể cho N≥200. Trade-off chấp nhận được vì đổi lấy tính đúng đắn.
+- **dna_M7964 (N=640)**: GPU thua CPU ở d3s4 (~20 điểm), cần sprdist≥4. n400d5s6 xấp xỉ bằng CPU.
+
+→ Full logs: `output/hybrid4_{n200d3s4,n200d4s6,n200d5s6,n400d4s6,n400d5s6}/`

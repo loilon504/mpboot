@@ -1162,7 +1162,8 @@ void gpuStepwiseBuildTrees(
     int stopNoImprove,
     float topPct,
     cudaStream_t stream,
-    AfterK1Callback after_k1
+    AfterK1Callback after_k1,
+    AfterK2Callback after_k2
 )
 {
     const int K = mem->K;
@@ -1204,6 +1205,7 @@ void gpuStepwiseBuildTrees(
         if (topPct > 0.0f)
         {
             // ── Opt-G2: Two-kernel mode ───────────────────────────────────────
+            printf("\n[GPU] --------------------------------------------\n");
             printf("[GPU]   buildTreesKernel<STATES=%d,NTAXA=%d>\n", S, NT);
             printf("[GPU]         K=%d  sprDist=%d  top_pct=%.0f%%  shared=%.1f KB\n",
                    K, sprDist, topPct * 100.0f, sharedBytes / 1024.0);
@@ -1260,6 +1262,7 @@ void gpuStepwiseBuildTrees(
             for (int i = 0; i < K; i++)
                 if (scores[i] <= threshold) actual_phase3++;
 
+            printf("\n[GPU] --------------------------------------------\n");
             printf("[GPU]   hillClimbingKernel<STATES=%d,NTAXA=%d>\n", S, NT);
             printf("[GPU]         top_k=%d/%d  threshold=%u  actual=%d (%.1f%%)"
                    "  score_range=[%u, %u]\n",
@@ -1267,18 +1270,35 @@ void gpuStepwiseBuildTrees(
                    actual_phase3, 100.0 * actual_phase3 / K,
                    scores[0], scores[K - 1]);
 
-            float k2ms = ev_ms([&] {
-                buildPhase3Kernel<S, NT><<<dim3(K), dim3(kWarpSize), 0, stream>>>(
-                    mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights,
-                    mem->width, sprDist, numSearchIter, numNNI, stopNoImprove, threshold,
-                    mem->parsVectPerTree, mem->parsScorePerTree
-                );
-            });
-            printf("[GPU]         time: %.3f s\n", k2ms / 1e3);
+            // Launch K2 async — AfterK2Callback (if any) runs CPU work while K2 executes
+            cudaEvent_t k2_start, k2_end;
+            cudaEventCreate(&k2_start); cudaEventCreate(&k2_end);
+            cudaEventRecord(k2_start, stream);
+            buildPhase3Kernel<S, NT><<<dim3(K), dim3(kWarpSize), 0, stream>>>(
+                mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights,
+                mem->width, sprDist, numSearchIter, numNNI, stopNoImprove, threshold,
+                mem->parsVectPerTree, mem->parsScorePerTree
+            );
+            cudaEventRecord(k2_end, stream);
+            CUDA_CHECK(cudaGetLastError());
+
+            if (after_k2) {
+                // Phase 2: CPU hill-climbing while K2 runs.
+                // Contract: callback must call cudaStreamSynchronize(stream) before returning.
+                after_k2(stream);
+            } else {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
+
+            float k2ms = 0.f;
+            cudaEventElapsedTime(&k2ms, k2_start, k2_end);
+            cudaEventDestroy(k2_start); cudaEventDestroy(k2_end);
+            printf("[GPU]         time: %.3f s\n\n", k2ms / 1e3);
         }
         else
         {
             // ── Single-kernel mode ────────────────────────────────────────────
+            printf("\n[GPU] --------------------------------------------\n");
             printf("[GPU]   buildTreesKernel<STATES=%d,NTAXA=%d>\n", S, NT);
             printf("[GPU]         K=%d  sprDist=%d  iters=%d  NNI=%d  stop=%d  shared=%.1f KB\n",
                    K, sprDist, numSearchIter, numNNI, stopNoImprove, sharedBytes / 1024.0);
@@ -1291,7 +1311,7 @@ void gpuStepwiseBuildTrees(
                     mem->parsVectPerTree, mem->parsScorePerTree
                 );
             });
-            printf("[GPU]         time: %.3f s\n", k1ms / 1e3);
+            printf("[GPU]         time: %.3f s\n\n", k1ms / 1e3);
         }
     };
 
