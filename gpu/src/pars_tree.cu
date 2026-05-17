@@ -48,8 +48,7 @@ void cpuToGpuTopology(
     for (int vf = 0; vf < num_vf; ++vf)
     {
         const nodeptr p = base + vf;
-        out->back_vf[vf]      = vface_of(tr, p->back);
-        out->best_back_vf[vf] = out->back_vf[vf];  // initialize best = current
+        out->back_vf[vf] = vface_of(tr, p->back);
         out->xpars[vf] = p->xPars;
         // next_vf, nnxt_vf, number not stored — computed from arithmetic on download
     }

@@ -826,7 +826,6 @@ void parseArg(int argc, char *argv[], Params &params) {
     params.write_local_optimal_trees = false;
 
 	params.use_gpu = false;
-	params.gpu_hc_iter = 10000;
 	params.gpu_stop = 6;
 	params.gpu_nni_strength   = 0.1f;
 	params.gpu_pool_size = 20;
@@ -2705,10 +2704,6 @@ void parseArg(int argc, char *argv[], Params &params) {
 			}
 			if (strcmp(argv[cnt], "-use_gpu") == 0) {
 				params.use_gpu = true;
-				continue;
-			}
-			if (strcmp(argv[cnt], "-gpu_hc_iter") == 0) {
-				params.gpu_hc_iter = convert_int(argv[++cnt]);
 				continue;
 			}
 			if (strcmp(argv[cnt], "-gpu_stop") == 0) {

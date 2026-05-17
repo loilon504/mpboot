@@ -29,9 +29,8 @@ using AfterK2Callback = std::function<void(cudaStream_t)>;
 
 // Run stepwise-addition + SPR + iterative NNI+SPR search for all K trees.
 // sprDist        = SPR radius (used for all phases)
-// numSearchIter  = outer NNI+ratchet iterations (Phase 3)
 // numNNI         = NNI moves per even outer iteration
-// stopNoImprove  = stop Phase 3 after this many consecutive no-improve iters (0 = disabled)
+// stopNoImprove  = stop Phase 3 after this many consecutive no-improve iters
 // poolSize       = number of pool slots for population-based restarts (from -gpu_pool_size)
 // after_k1       = optional Phase 1 hybrid callback (nullptr = standard mode)
 // after_k2       = optional Phase 2 hybrid callback (nullptr = standard mode)
@@ -39,7 +38,6 @@ void gpuStepwiseBuildTrees(
     GpuParsimonyMem*  mem,
     const long*       seeds,
     int               sprDist,
-    int               numSearchIter,
     int               numNNI,
     int               stopNoImprove,
     int               poolSize,

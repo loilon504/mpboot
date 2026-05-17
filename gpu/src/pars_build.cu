@@ -600,7 +600,6 @@ __device__ void runPhase3(
     unsigned int* sw_k,
     int N,
     int sprDist,
-    int numSearchIter,
     int numNNI,
     int stopNoImprove,
     int lane,
@@ -611,15 +610,10 @@ __device__ void runPhase3(
     int* pool_back_vf           // [pool_size * kMaxVFaces]
 )
 {
-    if (lane == 0 && k == 0)
-    {
-        sh.t_p3_nni_spr = sh.t_p3_ratchet = 0;
-        sh.n_p3_even = sh.n_p3_odd = 0;
-    }
     if (lane == 0) { sh.bcast[1] = 0; }
     __syncwarp();
 
-    for (int outer = 0; outer < numSearchIter; outer++)
+    for (int outer = 0; ; outer++)
     {
         // ── Step 1: Pool restart if stagnated ─────────────────────────────────
         // Load a random pool topology into back_vf when stagnation detected.
@@ -641,13 +635,22 @@ __device__ void runPhase3(
             if (lane == 0) gpuNodeRectifierPars(topo, sh, N);
             __syncwarp();
 
-            if (lane == 0) { sh.randomMP = pool_scores[slot]; sh.randomMPHits = 1; }
+            if (lane == 0)
+            {
+                sh.randomMP = pool_scores[slot];
+                sh.randomMPHits = 1;
+                // Baseline for stagnation must reflect the restarted tree's score.
+                // Without this, NNI that worsens the loaded tree can still look like
+                // "improvement" against a stale bestParsimony.
+                topo->bestParsimony = sh.randomMP;
+                // if (pool_scores[slot] < topo->bestParsimony)
+                //     topo->bestParsimony = pool_scores[slot];
+            }
             __syncwarp();
-            // bcast[1] stays — Step 3a/3b will reset or increment based on pool membership
         }
 
         // ── Step 2: Strict alternating NNI (even) / Ratchet (odd) ────────────
-        // Ratchet perturbs current tree directly — no restore to best_back_vf.
+        // Ratchet perturbs current tree directly.
         const bool iter_is_nni = (outer % 2 == 0);
         if (iter_is_nni)
         {
@@ -658,12 +661,7 @@ __device__ void runPhase3(
             if (lane == 0) { sh.randomMP = pm; sh.randomMPHits = 1; }
             __syncwarp();
 
-            {
-                long long _t0 = 0LL;
-                if (k == 0 && lane == 0) { _t0 = clock64(); }
-                gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
-                if (k == 0 && lane == 0) { sh.t_p3_nni_spr += clock64() - _t0; sh.n_p3_even++; }
-            }
+            gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
         }
         else
         {
@@ -690,106 +688,72 @@ __device__ void runPhase3(
             if (lane == 0) { sh.randomMP = pm2; sh.randomMPHits = 1; }
             __syncwarp();
 
-            {
-                long long _t0 = 0LL;
-                if (k == 0 && lane == 0) { _t0 = clock64(); }
-                gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
-                if (k == 0 && lane == 0) { sh.t_p3_ratchet += clock64() - _t0; sh.n_p3_odd++; }
-            }
+            gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
         }
 
-        // ── Step 3: Single-kernel mode — update per-warp best + stagnation ────
-        if (pool_scores == nullptr)
-        {
-            if (lane == 0)
-            {
-                if (iter_is_nni) topo->n_total_even++;
-                else             topo->n_total_odd++;
-
-                const unsigned int best_before = topo->bestParsimony;
-                if (sh.randomMP < best_before)
-                {
-                    topo->bestParsimony = sh.randomMP;
-                    if (iter_is_nni) topo->n_improved_even++;
-                    else             topo->n_improved_odd++;
-                    for (int vf = 0; vf < topo->num_vfaces; vf++)
-                        topo->best_back_vf[vf] = topo->back_vf[vf];
-                    sh.bcast[1] = 0;
-                }
-                else
-                {
-                    sh.bcast[1]++;
-                }
-                sh.bcast[0] = (stopNoImprove > 0 && sh.bcast[1] >= stopNoImprove) ? 1 : 0;
-            }
-            __syncwarp();
-        }
-
-        // ── Step 3a/3b: Pool mode — pool membership check + stagnation ────────
+        // ── Step 3: Stagnation tracking + pool membership ────────────────────
         // bcast[2]=worst_idx, bcast[3]=worst_score, bcast[4]=CAS win flag
-        if (pool_scores != nullptr)
+        if (lane == 0)
         {
-            if (lane == 0)
+            if (iter_is_nni) topo->n_total_even++;
+            else             topo->n_total_odd++;
+
+            // Stagnation tracks warp's own improvement.
+            // Pool membership update is independent — a warp can converge its own tree
+            // long before it stops beating the pool worst.
+            const unsigned int best_before = topo->bestParsimony;
+            if (sh.randomMP < best_before)
             {
-                if (iter_is_nni) topo->n_total_even++;
-                else             topo->n_total_odd++;
-
-                // Scan all P slots to find worst
-                unsigned int worst_s = 0u;
-                int worst_i = 0;
-                for (int i = 0; i < pool_size; i++)
-                    if (pool_scores[i] > worst_s) { worst_s = pool_scores[i]; worst_i = i; }
-                sh.bcast[2] = worst_i;
-                sh.bcast[3] = (int)worst_s;
-            }
-            __syncwarp();
-
-            const unsigned int worst_score = (unsigned int)sh.bcast[3];
-            const int my_slot = k % pool_size;
-
-            if (sh.randomMP < worst_score)
-            {
-                // 3a: Beat pool worst — try to update my assigned slot via atomicCAS.
-                // Only the warp that wins the CAS copies topology (prevents mixed-topology race).
-                if (lane == 0)
-                {
-                    const unsigned int expected = pool_scores[my_slot];
-                    if (sh.randomMP < expected)
-                        sh.bcast[4] = (atomicCAS(&pool_scores[my_slot], expected, sh.randomMP)
-                                       == expected) ? 1 : 0;
-                    else
-                        sh.bcast[4] = 0;
-                }
-                __syncwarp();
-
-                if (sh.bcast[4])
-                {
-                    int* dst = pool_back_vf + (size_t)my_slot * kMaxVFaces;
-                    for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
-                        dst[vf] = topo->back_vf[vf];
-                    __syncwarp();
-                }
-
-                if (lane == 0)
-                {
-                    if (iter_is_nni) topo->n_improved_even++;
-                    else             topo->n_improved_odd++;
-                    sh.bcast[1] = 0;
-                }
+                topo->bestParsimony = sh.randomMP;
+                if (iter_is_nni) topo->n_improved_even++;
+                else             topo->n_improved_odd++;
+                sh.bcast[1] = 0;
             }
             else
             {
-                // 3b: Did not beat pool worst — increment stagnation counter
-                if (lane == 0) sh.bcast[1]++;
+                sh.bcast[1]++;
+            }
+
+            // Scan all P slots to find worst (for pool update below)
+            unsigned int worst_s = 0u;
+            int worst_i = 0;
+            for (int i = 0; i < pool_size; i++)
+                if (pool_scores[i] > worst_s) { worst_s = pool_scores[i]; worst_i = i; }
+            sh.bcast[2] = worst_i;
+            sh.bcast[3] = (int)worst_s;
+            sh.bcast[0] = (stopNoImprove > 0 && sh.bcast[1] >= stopNoImprove) ? 1 : 0;
+        }
+        __syncwarp();
+
+        if (sh.bcast[0]) break;  // early stop before pool update to save work
+
+        const unsigned int worst_score = (unsigned int)sh.bcast[3];
+        const int my_slot = k % pool_size;
+
+        if (sh.randomMP < worst_score)
+        {
+            // Beat pool worst — try to update my assigned slot via atomicCAS.
+            // Only the warp that wins the CAS copies topology (prevents mixed-topology race).
+            if (lane == 0)
+            {
+                const unsigned int expected = pool_scores[my_slot];
+                if (sh.randomMP < expected)
+                    sh.bcast[4] = (atomicCAS(&pool_scores[my_slot], expected, sh.randomMP)
+                                   == expected) ? 1 : 0;
+                else
+                    sh.bcast[4] = 0;
             }
             __syncwarp();
 
-            if (lane == 0)
-                sh.bcast[0] = (stopNoImprove > 0 && sh.bcast[1] >= stopNoImprove) ? 1 : 0;
-            __syncwarp();
+            if (sh.bcast[4])
+            {
+                int* dst = pool_back_vf + (size_t)my_slot * kMaxVFaces;
+                for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
+                    dst[vf] = topo->back_vf[vf];
+                __syncwarp();
+            }
         }
-
-        if (sh.bcast[0]) break;
+        __syncwarp();
     }
 }
 
@@ -820,13 +784,11 @@ __global__ void buildParsimonyTreesKernel(
     unsigned int* sw_k = d_siteWeights + (size_t)k * width;
     const int N = topo->mxtips;
 
-    // ── Phase 0: init timing + permutation + 3-tip tree ──────────────────────
+    // ── Phase 0: permutation + 3-tip tree ────────────────────────────────────
     if (lane == 0)
     {
         sh.seed = d_seeds[k];
         sh.site_weights = nullptr;
-        sh.t_build = sh.t_phase2 = sh.t_p3_nni_spr = sh.t_p3_ratchet = 0;
-        sh.n_p3_even = sh.n_p3_odd = 0;
 
         for (int i = 1; i <= N; i++)
         {
@@ -873,12 +835,6 @@ __global__ void buildParsimonyTreesKernel(
     __syncwarp();
 
     // ── Phase 1: stepwise addition ────────────────────────────────────────────
-    long long _t_build = 0LL;
-    if (k == 0 && lane == 0)
-    {
-        _t_build = clock64();
-    }
-
     for (int nextsp = 4; nextsp <= N; nextsp++)
     {
         if (lane == 0)
@@ -962,30 +918,13 @@ __global__ void buildParsimonyTreesKernel(
         __syncwarp();
     }
 
-    if (lane == 0)
-    {
-        topo->bestParsimony = sh.bestParsimony;
-        for (int vf = 0; vf < topo->num_vfaces; vf++)
-        {
-            topo->best_back_vf[vf] = topo->back_vf[vf];
-        }
-        if (k == 0)
-        {
-            sh.t_build = clock64() - _t_build;
-        }
-    }
+    if (lane == 0) { topo->bestParsimony = sh.bestParsimony; }
     __syncwarp();
 
     // ── Phase 2: initial SPR hill-climbing ────────────────────────────────────
     if (sprDist <= 0)
     {
         return;
-    }
-
-    long long _t_phase2 = 0LL;
-    if (k == 0 && lane == 0)
-    {
-        _t_phase2 = clock64();
     }
 
     if (lane == 0)
@@ -1003,14 +942,6 @@ __global__ void buildParsimonyTreesKernel(
     {
         topo->postSprParsimony = sh.randomMP;
         topo->bestParsimony = sh.randomMP;
-        for (int vf = 0; vf < topo->num_vfaces; vf++)
-        {
-            topo->best_back_vf[vf] = topo->back_vf[vf];
-        }
-        if (k == 0)
-        {
-            sh.t_phase2 = clock64() - _t_phase2;
-        }
         // Save RNG state and score for Opt-G2 two-kernel Phase 3
         topo->savedSeed = sh.seed;
         if (d_postSprScores)
@@ -1031,7 +962,6 @@ __global__ void buildPhase3Kernel(
     unsigned int* __restrict__ d_siteWeights,
     int width,
     int sprDist,
-    int numSearchIter,
     int numNNI,
     int stopNoImprove,
     size_t parsVectPerTree,
@@ -1063,9 +993,6 @@ __global__ void buildPhase3Kernel(
         sh.randomMPHits = 1;
         sh.site_weights = nullptr;
         sh.bestParsimony = topo->bestParsimony;
-        // Zero timing accumulators (printed by runPhase3 for k=0)
-        sh.t_build = 0;
-        sh.t_phase2 = 0;
     }
     __syncwarp();
 
@@ -1103,7 +1030,7 @@ __global__ void buildPhase3Kernel(
     }
 
     runPhase3<STATES>(
-        pars_tree, score_tree, topo, sh, sw_k, N, sprDist, numSearchIter, numNNI, stopNoImprove,
+        pars_tree, score_tree, topo, sh, sw_k, N, sprDist, numNNI, stopNoImprove,
         lane, k, width, pool_size, pool_scores, pool_back_vf
     );
 }
@@ -1113,7 +1040,6 @@ void gpuStepwiseBuildTrees(
     GpuParsimonyMem* mem,
     const long* seeds,
     int sprDist,
-    int numSearchIter,
     int numNNI,
     int stopNoImprove,
     int poolSize,
@@ -1192,7 +1118,7 @@ void gpuStepwiseBuildTrees(
             cudaEventRecord(k2_start, stream);
             buildPhase3Kernel<S, NT><<<dim3(K), dim3(kWarpSize), 0, stream>>>(
                 mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, mem->width,
-                sprDist, numSearchIter, numNNI, stopNoImprove, mem->parsVectPerTree,
+                sprDist, numNNI, stopNoImprove, mem->parsVectPerTree,
                 mem->parsScorePerTree, poolSize, mem->d_poolScores, mem->d_poolBackVf
             );
             cudaEventRecord(k2_end, stream);

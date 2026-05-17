@@ -124,7 +124,6 @@ int mpbootGpu(
     // ── [5+6+7] Joined kernel: build + initial SPR + iterative NNI+SPR ─────────
     // Phase 4 params
     const int numNNI = (mxtips > 4) ? max(1, (int)(params.gpu_nni_strength * (mxtips - 3))) : 1;
-    const int numSearchIter = params.gpu_hc_iter;
     const int stopNoImprove = params.gpu_stop;
     const int pool_size = params.gpu_pool_size;
 
@@ -218,10 +217,7 @@ int mpbootGpu(
                     GpuTopology h_topo;
                     downloadTopology(cb_mem, cand.idx, &h_topo, cb_stream);
                     cudaStreamSynchronize(cb_stream);
-                    // Use best_back_vf as canonical topology
-                    bvf.assign(h_topo.best_back_vf, h_topo.best_back_vf + h_topo.num_vfaces);
-                    for (int vf = 0; vf < h_topo.num_vfaces; vf++)
-                        h_topo.back_vf[vf] = h_topo.best_back_vf[vf];
+                    bvf.assign(h_topo.back_vf, h_topo.back_vf + h_topo.num_vfaces);
                     gpuTopoToCpu(&h_topo, tr);
                 } else {
                     GpuTopology cpu_topo_copy = cpu_trees[cand.idx].topo;
@@ -272,8 +268,7 @@ int mpbootGpu(
                     const auto& bvf = pool_bvf[slot];
                     unsigned int ps = candidates[pool_ci[slot]].score;
                     GpuTopology h_topo = tmpl;
-                    memcpy(h_topo.back_vf,      bvf.data(), bvf.size() * sizeof(int));
-                    memcpy(h_topo.best_back_vf,  bvf.data(), bvf.size() * sizeof(int));
+                    memcpy(h_topo.back_vf, bvf.data(), bvf.size() * sizeof(int));
                     h_topo.postSprParsimony = ps;
                     h_topo.bestParsimony    = ps;
                     h_topo.preSprParsimony  = ps;
@@ -502,7 +497,7 @@ int mpbootGpu(
         [&]
         {
             gpuStepwiseBuildTrees(
-                mem, seeds.data(), params.sprDist, numSearchIter, numNNI, stopNoImprove,
+                mem, seeds.data(), params.sprDist, numNNI, stopNoImprove,
                 pool_size, stream, hybrid_cb, hybrid_cb2
             );
         }
@@ -569,7 +564,7 @@ int mpbootGpu(
                 "[GPU]   [6]     %-22s:  best=%-7u  worst=%u\n", "Post-SPR parsimony", best_spr,
                 worst_spr
             );
-            if (numSearchIter > 0)
+            if (stopNoImprove > 0)
             {
                 printf(
                     "[GPU]   [6]     %-22s:  best=%-7u  worst=%u\n", "Post-HC  parsimony", best_hc,

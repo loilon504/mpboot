@@ -60,8 +60,6 @@ struct GpuTopology
     int n_total_even;     // total even iterations run
     int n_total_odd;      // total odd iterations run
 
-    // COLD: only on bestParsimony update + topology download
-    int best_back_vf[kMaxVFaces];  // back_vf[] snapshot at the time bestParsimony was achieved
     // NOTE: number[], next_vf[], nnxt_vf[] removed — kernel uses pure arithmetic
     //   (vfToNum, vfNextFace, vfNnxtFace) and CPU-side p->number/p->next are stable after init.
 
@@ -107,7 +105,7 @@ struct GpuParsimonyMem
 // Opt-P Layer 3: Templated on NTAXA so array sizes track actual taxa count.
 // Dispatch buckets: N≤128→128, N≤256→256, N≤384→384, N≤512→512, N>512→800.
 // Using static __shared__ so size is compile-time; no dynamic shared mem needed.
-// Layout: HOT int16_t arrays first (no padding between them) → int scalars → COLD timing.
+// Layout: HOT int16_t arrays first (no padding between them) → int scalars.
 // Grouping same-type arrays eliminates int16_t/int alignment padding.
 // int16_t: values bounded by N (≤800) or ±sprDist — all fit in 16 bits.
 // stackMaxt stays int: NNI bitset uses (1u<<pb) with pb=0..31, needs full 32 bits.
@@ -162,19 +160,7 @@ struct alignas(16) BuildSharedT
     int tipnum;
     int qf0, qf1, qf2;
 
-    // ── [Opt-C] Stagnation detection (sprdist=3 only) ────────────────────────
-    uint32_t last_odd_hash;    // topology fingerprint after last Ratchet iteration
-    int restore_on_next_odd;   // 1 = restore best_back_vf before next Ratchet
-    // ── [Symmetric] Adaptive NNI/Ratchet switching (sprdist>3 only) ──────────
-    int sym_do_ratchet;        // 0=NNI, 1=Ratchet+restore, 2=NNI+restore
 
-    // ── [COLD] Timing accumulators (block 0 lane 0 only) ─────────────────────
-    long long t_build;        // Phase 1: stepwise addition
-    long long t_phase2;       // Phase 2: initial SPR
-    long long t_p3_nni_spr;   // Phase 3 even iters: SPR cycles
-    long long t_p3_ratchet;   // Phase 3 odd iters: total cycles
-    int n_p3_even;            // count of even Phase 3 iterations
-    int n_p3_odd;             // count of odd Phase 3 iterations
 };
 
 // Default alias (NTAXA=kMaxTaxa=800): used as BuildShared throughout non-templated code
