@@ -87,6 +87,11 @@ struct GpuParsimonyMem
     unsigned int* d_siteWeights;  // [K][width] per-block weights; 1=normal, 2=ratchet-doubled
     unsigned int* d_postSprScores; // [K] postSprParsimony scores, filled by Phase 2; used by Opt-G2 two-kernel
 
+    // Population pool for hill-climbing restarts (Phase 3)
+    int pool_size;                // number of pool slots (runtime, from -gpu_pool_size)
+    unsigned int* d_poolScores;   // [pool_size] parsimony score per pool slot
+    int* d_poolBackVf;            // [pool_size][kMaxVFaces] topology snapshots
+
     int K;  // number of trees
     int mxtips;
     int width;  // parsimonyLength (compressed blocks)
@@ -188,7 +193,7 @@ void gpuTopoToCpu(const GpuTopology* in, pllInstance* tr);
 
 // Allocate all GPU memory for K trees.
 // mxtips, width, states must match the alignment.
-GpuParsimonyMem* gpuParsimonyMemAlloc(int K, int mxtips, int width, int states);
+GpuParsimonyMem* gpuParsimonyMemAlloc(int K, int mxtips, int width, int states, int pool_size = 20);
 void gpuParsimonyMemFree(GpuParsimonyMem* mem);
 
 // Upload tip parsVect for ALL K trees (shared; tips are read-only).

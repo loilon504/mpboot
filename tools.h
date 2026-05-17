@@ -1693,7 +1693,7 @@ struct Params {
     int gpu_hc_iter;        // hill-climbing iterations per tree in GPU Phase 3 (0 = disabled)
     int gpu_stop;           // early stopping: stop Phase 3 after this many consecutive no-improve iters (default 4)
     float gpu_nni_strength;   // Phase 3 NNI perturbation: numNNI = strength*(N-3), min 1; default=0.1
-    float gpu_top_pct; // Opt-G2 two-kernel: only top X% trees (lowest postSprParsimony) do Phase 3; -1=disabled
+    int gpu_pool_size; // number of pool slots for population-based restarts (default 20)
     int gpu_device;    // CUDA device ID to use (default 1)
 };
 

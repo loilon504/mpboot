@@ -69,7 +69,7 @@ int mpbootGpu(
 
     // ── [2] Allocate GPU memory ───────────────────────────────────────────────
     t0 = std::chrono::high_resolution_clock::now();
-    GpuParsimonyMem* mem = gpuParsimonyMemAlloc(K, mxtips, width, states);
+    GpuParsimonyMem* mem = gpuParsimonyMemAlloc(K, mxtips, width, states, params.gpu_pool_size);
     printf("[GPU]   [2]      %-28s: %8.3f s\n", "GPU memory alloc", msSince(t0) / 1e3);
 
     // ── [3] Upload tip parsVect ───────────────────────────────────────────────
@@ -126,17 +126,14 @@ int mpbootGpu(
     const int numNNI = (mxtips > 4) ? max(1, (int)(params.gpu_nni_strength * (mxtips - 3))) : 1;
     const int numSearchIter = params.gpu_hc_iter;
     const int stopNoImprove = params.gpu_stop;
-    const float top_pct = params.gpu_top_pct;  // Opt-G2: ≤0=disabled
+    const int pool_size = params.gpu_pool_size;
 
     // ── Hybrid callbacks: Phase 1 (CPU builds during K1) + Phase 2 (CPU HC during K2) ─────
-    // Only active in two-kernel mode (top_pct > 0).
     AfterK1Callback hybrid_cb = nullptr;
     AfterK2Callback hybrid_cb2 = nullptr;
-
-    if (top_pct > 0.0f)
     {
         // ── Phase 1 callback: build CPU trees while K1 runs ──────────────────
-        hybrid_cb = [&](cudaStream_t cb_stream, GpuParsimonyMem* cb_mem) -> unsigned int
+        hybrid_cb = [&](cudaStream_t cb_stream, GpuParsimonyMem* cb_mem) -> void
         {
             iqtree.candidateTrees.aln = iqtree.aln;
             // Step 1: Build CPU trees while K1 runs on GPU
@@ -146,7 +143,7 @@ int mpbootGpu(
                 std::string curParsTree;
                 tr->randomNumberSeed = params.ran_seed + (int)cpu_trees.size() * 7919;
                 _pllComputeRandomizedStepwiseAdditionParsimonyTree(
-                    tr, pr, params.sprDist + 3, &iqtree
+                    tr, pr, params.sprDist + 1, &iqtree
                 );
                 pllTreeToNewick(
                     iqtree.pllInst->tree_string, iqtree.pllInst, iqtree.pllPartitions,
@@ -186,7 +183,7 @@ int mpbootGpu(
             }
             CUDA_CHECK(cudaStreamSynchronize(cb_stream));  // K1 fully done
 
-            // Step 2: Download GPU scores, combine with CPU scores, compute threshold
+            // Step 2: Download all K GPU postSprScores
             const int Kc = cb_mem->K;
             std::vector<unsigned int> gpu_scores(Kc);
             CUDA_CHECK(cudaMemcpy(
@@ -194,170 +191,118 @@ int mpbootGpu(
                 cudaMemcpyDeviceToHost
             ));
 
-            std::vector<unsigned int> all_scores = gpu_scores;
-            for (auto& ct : cpu_trees)
-            {
-                all_scores.push_back(ct.score);
-            }
-            std::sort(all_scores.begin(), all_scores.end());
-
-            int top_k = max(1, (int)ceil((double)all_scores.size() * top_pct));
-            unsigned int threshold = all_scores[top_k - 1];
-
-            // Step 3: Upload qualifying CPU trees into worst GPU slots above threshold
-            std::vector<int> replace_slots;
+            // Step 3: Diversity selection — best pool_size trees with distinct topologies
+            struct Candidate { unsigned int score; int idx; bool is_gpu; };
+            std::vector<Candidate> candidates;
+            candidates.reserve(Kc + (int)cpu_trees.size());
             for (int k = 0; k < Kc; k++)
+                candidates.push_back({gpu_scores[k], k, true});
+            for (int i = 0; i < (int)cpu_trees.size(); i++)
+                candidates.push_back({cpu_trees[i].score, i, false});
+            std::sort(candidates.begin(), candidates.end(),
+                [](const Candidate& a, const Candidate& b){ return a.score < b.score; });
+
+            int scan_limit = std::min((int)candidates.size(), pool_size * 5);
+            std::unordered_set<std::string> seen_topologies;
+            std::vector<int>         pool_ci;      // indices into candidates[]
+            std::vector<std::string> pool_newicks; // cached Newicks (for Step 6)
+            std::vector<std::vector<int>> pool_bvf; // back_vf arrays (for pool upload + reseed)
+
+            for (int ci = 0; ci < scan_limit && (int)pool_ci.size() < pool_size; ci++)
             {
-                if (gpu_scores[k] > threshold)
-                {
-                    replace_slots.push_back(k);
+                const Candidate& cand = candidates[ci];
+                std::string newick;
+                std::vector<int> bvf;
+
+                if (cand.is_gpu) {
+                    GpuTopology h_topo;
+                    downloadTopology(cb_mem, cand.idx, &h_topo, cb_stream);
+                    cudaStreamSynchronize(cb_stream);
+                    // Use best_back_vf as canonical topology
+                    bvf.assign(h_topo.best_back_vf, h_topo.best_back_vf + h_topo.num_vfaces);
+                    for (int vf = 0; vf < h_topo.num_vfaces; vf++)
+                        h_topo.back_vf[vf] = h_topo.best_back_vf[vf];
+                    gpuTopoToCpu(&h_topo, tr);
+                } else {
+                    GpuTopology cpu_topo_copy = cpu_trees[cand.idx].topo;
+                    bvf.assign(cpu_topo_copy.back_vf,
+                               cpu_topo_copy.back_vf + cpu_topo_copy.num_vfaces);
+                    gpuTopoToCpu(&cpu_topo_copy, tr);
                 }
-            }
-            std::sort(
-                replace_slots.begin(), replace_slots.end(),
-                [&](int a, int b)
-                {
-                    return gpu_scores[a] > gpu_scores[b];
-                }
-            );
-
-            // Sort CPU trees best-first (ascending score = lower parsimony = better),
-            // so the best CPU tree is paired with the worst GPU slot and the break below
-            // is correct (once score > threshold, all remaining are also > threshold).
-            std::sort(cpu_trees.begin(), cpu_trees.end(),
-                [](const CpuTreeData& a, const CpuTreeData& b){ return a.score < b.score; });
-
-            int n_replace = (int)std::min(cpu_trees.size(), replace_slots.size());
-            int n_uploaded = 0;
-            for (int i = 0; i < n_replace; i++)
-            {
-                if (cpu_trees[i].score > threshold)
-                {
-                    break;  // sorted ascending: all remaining trees are also > threshold
-                }
-                uploadTopology(cb_mem, replace_slots[i], &cpu_trees[i].topo, cb_stream);
-                n_uploaded++;
-            }
-
-            // Step 3.5: Build threshold pool + reseed remaining bad GPU slots
-            int n_reseeded = 0;
-            {
-                int n_remaining = (int)replace_slots.size() - n_uploaded;
-                if (n_remaining > 0)
-                {
-                    // a) Collect good GPU topologies: download + restore best_back_vf.
-                    //    Step 3 uploaded to replace_slots[] (score > threshold) only;
-                    //    here we read slots with score <= threshold — no conflict.
-                    std::vector<GpuTopology> good_gpu_topos;
-                    for (int k = 0; k < Kc; k++)
-                    {
-                        if (gpu_scores[k] <= threshold)
-                        {
-                            GpuTopology h_topo;
-                            downloadTopology(cb_mem, k, &h_topo, cb_stream);
-                            cudaStreamSynchronize(cb_stream);
-                            for (int vf = 0; vf < h_topo.num_vfaces; vf++)
-                                h_topo.back_vf[vf] = h_topo.best_back_vf[vf];
-                            good_gpu_topos.push_back(h_topo);
-                        }
-                    }
-
-                    // b) Build combined pool: good GPU topos + good CPU trees.
-                    //    cpu_trees already sorted ascending (best-first) from Step 3.
-                    std::vector<const GpuTopology*> pool;
-                    for (int i = 0; i < (int)good_gpu_topos.size(); i++)
-                        pool.push_back(&good_gpu_topos[i]);
-                    for (int i = 0; i < (int)cpu_trees.size(); i++)
-                    {
-                        if (cpu_trees[i].score <= threshold)
-                            pool.push_back(&cpu_trees[i].topo);
-                        else
-                            break;  // sorted ascending: rest all > threshold
-                    }
-
-                    // c) Reseed each remaining bad slot from the pool.
-                    //    K2 filter checks topo->postSprParsimony (from GpuTopology struct).
-                    //    Donor's postSprParsimony <= threshold → reseeded slot enters K2.
-                    //    needs_recompute=1 triggers full parsVect rebuild inside K2.
-                    if (!pool.empty())
-                    {
-                        for (int i = n_uploaded; i < (int)replace_slots.size(); i++)
-                        {
-                            int slot = replace_slots[i];
-                            GpuTopology fill_topo = *pool[random_int((int)pool.size())];
-                            fill_topo.savedSeed = params.ran_seed + (long)slot * 99991L;
-                            fill_topo.needs_recompute = 1;
-                            uploadTopology(cb_mem, slot, &fill_topo, cb_stream);
-                            n_reseeded++;
-                        }
-                    }
-                }
-            }
-
-            // Step 4: add qualifying GPU trees into iqtree.candidateTrees
-            // First, purge candidateTrees entries worse than threshold
-            {
-                double score_threshold = -(double)threshold;
-                iqtree.candidateTrees.erase(
-                    iqtree.candidateTrees.begin(),
-                    iqtree.candidateTrees.lower_bound(score_threshold)
-                );
-            }
-            int n_gpu_added = 0;
-            for (int k = 0; k < Kc; k++)
-            {
-                if (gpu_scores[k] > threshold)
-                {
+                pllTreeToNewick(tr->tree_string, tr, pr, tr->start->back, PLL_TRUE, PLL_TRUE,
+                                PLL_FALSE, PLL_FALSE, PLL_FALSE, PLL_SUMMARIZE_LH,
+                                PLL_FALSE, PLL_FALSE);
+                newick = std::string(tr->tree_string);
+                if (newick.empty() || !seen_topologies.insert(newick).second)
                     continue;
-                }
 
-                GpuTopology h_topo;
-                downloadTopology(cb_mem, k, &h_topo, cb_stream);
+                pool_ci.push_back(ci);
+                pool_newicks.push_back(std::move(newick));
+                pool_bvf.push_back(std::move(bvf));
+            }
+            int actual_pool = (int)pool_ci.size();
+
+            // Step 4: Upload pool to GPU memory
+            {
+                std::vector<unsigned int> h_pool_scores(pool_size, 0xFFFFFFFFu);
+                std::vector<int> h_pool_vf((size_t)pool_size * kMaxVFaces, -1);
+                for (int i = 0; i < actual_pool; i++) {
+                    h_pool_scores[i] = candidates[pool_ci[i]].score;
+                    int* dst = h_pool_vf.data() + (size_t)i * kMaxVFaces;
+                    memcpy(dst, pool_bvf[i].data(), pool_bvf[i].size() * sizeof(int));
+                }
+                CUDA_CHECK(cudaMemcpy(cb_mem->d_poolScores, h_pool_scores.data(),
+                                      pool_size * sizeof(unsigned int), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(cb_mem->d_poolBackVf, h_pool_vf.data(),
+                                      (size_t)pool_size * kMaxVFaces * sizeof(int),
+                                      cudaMemcpyHostToDevice));
+                int show = std::min(actual_pool, 5);
+                printf("[GPU]   Pool: %d/%d slots, top-%d scores:", actual_pool, pool_size, show);
+                for (int i = 0; i < show; i++) printf(" %u", h_pool_scores[i]);
+                printf("\n");
+            }
+
+            // Step 5: Reseed ALL K GPU slots from pool (round-robin)
+            if (actual_pool > 0) {
+                GpuTopology tmpl;
+                downloadTopology(cb_mem, 0, &tmpl, cb_stream);
                 cudaStreamSynchronize(cb_stream);
-                for (int vf = 0; vf < h_topo.num_vfaces; vf++)
-                {
-                    h_topo.back_vf[vf] = h_topo.best_back_vf[vf];
+                for (int k = 0; k < Kc; k++) {
+                    int slot = k % actual_pool;
+                    const auto& bvf = pool_bvf[slot];
+                    unsigned int ps = candidates[pool_ci[slot]].score;
+                    GpuTopology h_topo = tmpl;
+                    memcpy(h_topo.back_vf,      bvf.data(), bvf.size() * sizeof(int));
+                    memcpy(h_topo.best_back_vf,  bvf.data(), bvf.size() * sizeof(int));
+                    h_topo.postSprParsimony = ps;
+                    h_topo.bestParsimony    = ps;
+                    h_topo.preSprParsimony  = ps;
+                    h_topo.savedSeed        = params.ran_seed + (long)k * 31337L;
+                    h_topo.needs_recompute  = 1;
+                    h_topo.n_improved_even  = h_topo.n_improved_odd = 0;
+                    h_topo.n_total_even     = h_topo.n_total_odd    = 0;
+                    uploadTopology(cb_mem, k, &h_topo, cb_stream);
                 }
+                cudaStreamSynchronize(cb_stream);
+            }
 
-                gpuTopoToCpu(&h_topo, tr);
-                pllTreeToNewick(
-                    tr->tree_string, tr, pr, tr->start->back, PLL_TRUE, PLL_TRUE, PLL_FALSE,
-                    PLL_FALSE, PLL_FALSE, PLL_SUMMARIZE_LH, PLL_FALSE, PLL_FALSE
-                );
-                std::string gpuTree = std::string(tr->tree_string);
-
-                if (gpuTree.empty() || iqtree.candidateTrees.treeExist(gpuTree))
-                {
-                    continue;
-                }
-
-                iqtree.readTreeString(gpuTree);
+            // Step 6: Add pool trees to CPU candidateSet
+            int n_pool_added = 0;
+            for (int i = 0; i < actual_pool; i++) {
+                const std::string& newick = pool_newicks[i];
+                if (newick.empty() || iqtree.candidateTrees.treeExist(newick)) continue;
+                iqtree.readTreeString(newick);
                 iqtree.initializeAllPartialPars();
                 iqtree.clearAllPartialLH();
-                double score = -(double)iqtree.computeParsimony();
-                iqtree.candidateTrees.update(gpuTree, score);
-                if (score > iqtree.bestScore)
-                {
-                    iqtree.setBestTree(gpuTree, score);
-                }
-
-                n_gpu_added++;
+                iqtree.curScore = -(double)iqtree.computeParsimony();
+                iqtree.candidateTrees.update(newick, iqtree.curScore);
+                if (iqtree.curScore > iqtree.bestScore)
+                    iqtree.setBestTree(newick, iqtree.curScore);
+                n_pool_added++;
             }
 
-            int n_gpu_good = Kc - (int)replace_slots.size();
-            printf(
-                "[CPU]   CPU built %d trees, %d uploaded to GPU slots, %d slots reseeded; "
-                "%d GPU trees added to candidateTrees\n",
-                (int)cpu_trees.size(), n_uploaded, n_reseeded, n_gpu_added
-            );
-            printf(
-                "[GPU]   hillClimbingKernel: threshold=%u  (%d GPU + %d CPU + %d reseeded = %d "
-                "trees enter K2)\n",
-                threshold, n_gpu_good, n_uploaded, n_reseeded,
-                n_gpu_good + n_uploaded + n_reseeded
-            );
-
-            return threshold;
+            printf("[CPU]   CPU built %d trees; pool: %d/%d diverse; %d added to candidateTrees\n",
+                   (int)cpu_trees.size(), actual_pool, pool_size, n_pool_added);
         };
 
         // ── Phase 2 callback: alternating NNI/ratchet perturb, PhyloTree scoring ──
@@ -557,8 +502,8 @@ int mpbootGpu(
         [&]
         {
             gpuStepwiseBuildTrees(
-                mem, seeds.data(), params.sprDist, numSearchIter, numNNI, stopNoImprove, top_pct,
-                stream, hybrid_cb, hybrid_cb2
+                mem, seeds.data(), params.sprDist, numSearchIter, numNNI, stopNoImprove,
+                pool_size, stream, hybrid_cb, hybrid_cb2
             );
         }
     );
@@ -567,9 +512,8 @@ int mpbootGpu(
         (double)build_ms / 1e3, K, K > 0 ? (double)build_ms / K : 0.0
     );
     printf(
-        "[GPU]            sprDist=%d  NNI=%d(%.2f)  stop=%d  top_pct=%s\n",
-        params.sprDist, numNNI, params.gpu_nni_strength, stopNoImprove,
-        top_pct <= 0.0f ? "off" : (std::to_string((int)(top_pct * 100 + 0.5f)) + "%").c_str()
+        "[GPU]            sprDist=%d  NNI=%d(%.2f)  stop=%d\n",
+        params.sprDist, numNNI, params.gpu_nni_strength, stopNoImprove
     );
     printf("[GPU]\n");
 
@@ -589,34 +533,31 @@ int mpbootGpu(
             downloadTopology(mem, k, &h_topo_tmp, stream);
             cudaStreamSynchronize(stream);
             if (h_topo_tmp.preSprParsimony < best_pre)
-            {
                 best_pre = h_topo_tmp.preSprParsimony;
-            }
             if (h_topo_tmp.preSprParsimony > worst_pre)
-            {
                 worst_pre = h_topo_tmp.preSprParsimony;
-            }
             if (h_topo_tmp.postSprParsimony < best_spr)
-            {
                 best_spr = h_topo_tmp.postSprParsimony;
-            }
             if (h_topo_tmp.postSprParsimony > worst_spr)
-            {
                 worst_spr = h_topo_tmp.postSprParsimony;
-            }
-            if (h_topo_tmp.bestParsimony < best_hc)
-            {
-                best_hc = h_topo_tmp.bestParsimony;
-            }
-            if (h_topo_tmp.bestParsimony > worst_hc)
-            {
-                worst_hc = h_topo_tmp.bestParsimony;
-            }
 
             sum_improved_even += h_topo_tmp.n_improved_even;
             sum_total_even += h_topo_tmp.n_total_even;
             sum_improved_odd += h_topo_tmp.n_improved_odd;
             sum_total_odd += h_topo_tmp.n_total_odd;
+        }
+
+        // Aggregate best_hc/worst_hc from pool scores
+        {
+            std::vector<unsigned int> h_ps(pool_size, 0xFFFFFFFFu);
+            CUDA_CHECK(cudaMemcpy(h_ps.data(), mem->d_poolScores,
+                pool_size * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+            for (int i = 0; i < pool_size; i++)
+            {
+                if (h_ps[i] == 0xFFFFFFFFu) continue;
+                if (h_ps[i] < best_hc) best_hc = h_ps[i];
+                if (h_ps[i] > worst_hc) worst_hc = h_ps[i];
+            }
         }
         if (params.sprDist > 0)
         {
@@ -662,44 +603,55 @@ int mpbootGpu(
     int built = 0;
     double t_download = 0, t_topo = 0, t_newick = 0;
 
-    for (int i = 0; i < K; ++i)
     {
+        // Download pool_scores + pool_back_vf directly.
+        // Use warp 0 as template for scalar fields (num_vfaces, mxtips, start_vface).
+        // gpuTopoToCpu only needs back_vf + start_vface — does not read nodep[].
         auto ti = std::chrono::high_resolution_clock::now();
-        GpuTopology h_topo;
-        downloadTopology(mem, i, &h_topo, stream);
-        // Restore the best-seen topology (not the end-state after last iteration)
-        for (int vf = 0; vf < h_topo.num_vfaces; vf++)
-            h_topo.back_vf[vf] = h_topo.best_back_vf[vf];
+        std::vector<unsigned int> h_ps(pool_size, 0xFFFFFFFFu);
+        std::vector<int> h_pvf((size_t)pool_size * kMaxVFaces);
+        CUDA_CHECK(cudaMemcpy(h_ps.data(), mem->d_poolScores,
+            pool_size * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_pvf.data(), mem->d_poolBackVf,
+            (size_t)pool_size * kMaxVFaces * sizeof(int), cudaMemcpyDeviceToHost));
+        GpuTopology tmpl;
+        downloadTopology(mem, 0, &tmpl, stream);
+        cudaStreamSynchronize(stream);
         t_download += msSince(ti);
 
-        if (h_topo.bestParsimony > best_hc) {
-            candidateTrees[i] = "";
-            continue;
-        }
-
-        ti = std::chrono::high_resolution_clock::now();
-        gpuTopoToCpu(&h_topo, tr);
-        t_topo += msSince(ti);
-
-        ti = std::chrono::high_resolution_clock::now();
-        pllTreeToNewick(
-            tr->tree_string, tr, pr, tr->start->back, PLL_TRUE, PLL_TRUE,
-            PLL_FALSE, PLL_FALSE, PLL_FALSE, PLL_SUMMARIZE_LH, PLL_FALSE, PLL_FALSE
-        );
-        std::string tree_str(tr->tree_string);
-        candidateTrees[i] = tree_str;
-        if (!tree_str.empty())
+        for (int i = 0; i < pool_size; i++)
         {
-            built++;
-            iqtree.readTreeString(tree_str);
-            iqtree.initializeAllPartialPars();
-            iqtree.clearAllPartialLH();
-            iqtree.curScore = -(double)iqtree.computeParsimony();
-            bool isNew = iqtree.candidateTrees.update(tree_str, iqtree.curScore);
-            if (isNew && iqtree.curScore > iqtree.bestScore)
-                iqtree.setBestTree(tree_str, iqtree.curScore);
+            if (h_ps[i] == 0xFFFFFFFFu || h_ps[i] > best_hc) continue;
+
+            GpuTopology h_topo = tmpl;
+            memcpy(h_topo.back_vf, h_pvf.data() + (size_t)i * kMaxVFaces,
+                   h_topo.num_vfaces * sizeof(int));
+            h_topo.bestParsimony = h_ps[i];
+
+            ti = std::chrono::high_resolution_clock::now();
+            gpuTopoToCpu(&h_topo, tr);
+            t_topo += msSince(ti);
+
+            ti = std::chrono::high_resolution_clock::now();
+            pllTreeToNewick(
+                tr->tree_string, tr, pr, tr->start->back, PLL_TRUE, PLL_TRUE,
+                PLL_FALSE, PLL_FALSE, PLL_FALSE, PLL_SUMMARIZE_LH, PLL_FALSE, PLL_FALSE
+            );
+            std::string tree_str(tr->tree_string);
+            t_newick += msSince(ti);
+
+            if (!tree_str.empty())
+            {
+                built++;
+                iqtree.readTreeString(tree_str);
+                iqtree.initializeAllPartialPars();
+                iqtree.clearAllPartialLH();
+                iqtree.curScore = -(double)iqtree.computeParsimony();
+                bool isNew = iqtree.candidateTrees.update(tree_str, iqtree.curScore);
+                if (isNew && iqtree.curScore > iqtree.bestScore)
+                    iqtree.setBestTree(tree_str, iqtree.curScore);
+            }
         }
-        t_newick += msSince(ti);
     }
 
     printf("[GPU]\n");

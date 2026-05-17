@@ -81,7 +81,7 @@ void gpuTopoToCpu(
 
 // ─── gpuParsimonyMemAlloc ─────────────────────────────────────────────────────
 GpuParsimonyMem* gpuParsimonyMemAlloc(
-    int K, int mxtips, int width, int states
+    int K, int mxtips, int width, int states, int pool_size
 )
 {
     auto* mem = new GpuParsimonyMem();
@@ -89,6 +89,7 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     mem->mxtips = mxtips;
     mem->width = width;
     mem->states = states;
+    mem->pool_size = pool_size;
     mem->nodesPerTree        = (size_t)(2 * mxtips + 1);
     mem->parsVectPerTree     = mem->nodesPerTree * (size_t)width * (size_t)states;
     mem->parsScorePerTree    = mem->nodesPerTree;
@@ -109,6 +110,12 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     CUDA_CHECK(cudaMalloc(&mem->d_topos,       topoBytes));
     CUDA_CHECK(cudaMalloc(&mem->d_siteWeights, siteWeightsBytes));
     CUDA_CHECK(cudaMalloc(&mem->d_postSprScores, (size_t)K * sizeof(unsigned int)));
+
+    // Pool for population-based hill-climbing restarts
+    CUDA_CHECK(cudaMalloc(&mem->d_poolScores, (size_t)pool_size * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&mem->d_poolBackVf, (size_t)pool_size * kMaxVFaces * sizeof(int)));
+    // Init pool scores to UINT_MAX (empty)
+    CUDA_CHECK(cudaMemset(mem->d_poolScores, 0xFF, (size_t)pool_size * sizeof(unsigned int)));
 
     CUDA_CHECK(cudaMemset(mem->d_parsVect,    0, parsVectBytes));
     CUDA_CHECK(cudaMemset(mem->d_parsScore,   0, parsScoreBytes));
@@ -150,6 +157,14 @@ void gpuParsimonyMemFree(
     if (mem->d_postSprScores)
     {
         cudaFree(mem->d_postSprScores);
+    }
+    if (mem->d_poolScores)
+    {
+        cudaFree(mem->d_poolScores);
+    }
+    if (mem->d_poolBackVf)
+    {
+        cudaFree(mem->d_poolBackVf);
     }
     delete mem;
 }
