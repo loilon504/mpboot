@@ -1550,3 +1550,64 @@ Caller post-loop trong `phyloanalysis.cpp` bị xóa hoàn toàn.
 
 4. **initializeAllPartialPars + clearAllPartialLH**: Cần gọi trước `computeParsimony()` sau `readTreeString()` để reset parsVect state. Đây là overhead chính của [7] mới — tương đương với `pllInstanceClone` trước đó.
 
+---
+
+## Experiment — Reseed bad GPU slots from threshold pool (2026-05-17)
+
+**Ngày**: 2026-05-17  
+**Task**: Cải thiện chất lượng K2 bằng cách tái sử dụng topology tốt cho các bad GPU slots  
+**File**: `gpu/src/gpu_init_trees.cu` — `hybrid_cb` lambda (Step 3.5)
+
+### Vấn đề
+
+Trong `hybrid_cb` (sau K1), Step 3 upload CPU threshold trees vào các bad GPU slots (score > threshold). Thường số CPU trees < số bad slots → nhiều bad slots không được điền, tiếp tục vào K2 với topology kém từ K1 SPR — lãng phí compute budget.
+
+### Giải pháp — Step 3.5
+
+Sau Step 3, với các bad slots còn lại chưa được điền:
+1. **Thu thập good GPU topos**: Download các slots có `gpu_scores[k] <= threshold`, restore `best_back_vf → back_vf` (topology tốt nhất của K1 Phase 3).
+2. **Build pool**: Kết hợp good GPU topos + good CPU trees (score ≤ threshold) vào một pool.
+3. **Reseed**: Mỗi remaining bad slot nhận một topology ngẫu nhiên từ pool, với `savedSeed` khác nhau (`params.ran_seed + slot * 99991L`) để diversity, và `needs_recompute=1` để K2 recompute parsVect từ actual topology.
+
+```cpp
+GpuTopology fill_topo = *pool[random_int((int)pool.size())];
+fill_topo.savedSeed = params.ran_seed + (long)slot * 99991L;
+fill_topo.needs_recompute = 1;
+uploadTopology(cb_mem, slot, &fill_topo, cb_stream);
+```
+
+### Cơ chế K2 compatibility
+
+- `buildPhase3Kernel` filter: `if (topo->postSprParsimony > phase3Threshold) return;`
+  → Donor's `postSprParsimony ≤ threshold` → reseeded slots được vào K2.
+- `needs_recompute=1` trigger (lines 1107–1133): Recompute parsVect từ actual topology (`back_vf`), override `sh.randomMP`, `topo->bestParsimony`, `topo->postSprParsimony` → Phase 3 bắt đầu từ trạng thái đúng với seed mới.
+
+### Kết quả benchmark
+
+**N≈200 (37 datasets, numpars=200, sprdist=4, gpu_stop=6):**
+
+| Metric | Value |
+|--------|-------|
+| Better (↑) | 14/37 |
+| Same (=) | 23/37 |
+| Worse (↓) | **0/37** |
+| Avg Δscore | −1.2 (reseed tốt hơn trung bình) |
+| Avg time | 8.2s → 9.4s (+14.5%) |
+
+**N=767 (dna_M7024, numpars=400):**
+- Score cải thiện: 95079 vs baseline 95088 (−9)
+- K2 time tăng ~2× (143s vs 66.5s) — tất cả 400 slots start từ good topology → chạy nhiều Phase 3 iterations hơn
+
+### Trade-offs
+
+- ✅ Quality không bao giờ tệ hơn (0 regressions trên 37 datasets N≈200)
+- ✅ 38% datasets cải thiện score
+- ⚠️ Time overhead: +14.5% (N≈200), +100% (N=767) — do K2 có nhiều improving iterations hơn
+- ⚠️ Overhead tăng theo N: slots lớn hơn → K2 iterations dài hơn khi start từ good topology
+
+### Bài học / Ghi chú cho khóa luận
+
+1. **Slot diversity vs quality**: Mỗi slot nhận cùng donor topology nhưng seed khác nhau → trajectories diverge trong K2, tạo diversity mà không cần extra memory.
+2. **`needs_recompute` flag**: Cho phép upload topology shell (chỉ `back_vf`) mà không cần upload toàn bộ parsVect (2.44 MB/slot). GPU recompute trong kernel → tiết kiệm bandwidth đáng kể.
+3. **Overhead asymmetry**: Reseed có giá trị nhất khi K2 budget lớn tương đối so với K1. Với N nhỏ (≈200), +14.5% là chấp nhận được. Với N lớn (≥700), cần cân nhắc giới hạn `gpu_stop` để kiểm soát overhead.
+

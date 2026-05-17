@@ -239,6 +239,61 @@ int mpbootGpu(
                 n_uploaded++;
             }
 
+            // Step 3.5: Build threshold pool + reseed remaining bad GPU slots
+            int n_reseeded = 0;
+            {
+                int n_remaining = (int)replace_slots.size() - n_uploaded;
+                if (n_remaining > 0)
+                {
+                    // a) Collect good GPU topologies: download + restore best_back_vf.
+                    //    Step 3 uploaded to replace_slots[] (score > threshold) only;
+                    //    here we read slots with score <= threshold — no conflict.
+                    std::vector<GpuTopology> good_gpu_topos;
+                    for (int k = 0; k < Kc; k++)
+                    {
+                        if (gpu_scores[k] <= threshold)
+                        {
+                            GpuTopology h_topo;
+                            downloadTopology(cb_mem, k, &h_topo, cb_stream);
+                            cudaStreamSynchronize(cb_stream);
+                            for (int vf = 0; vf < h_topo.num_vfaces; vf++)
+                                h_topo.back_vf[vf] = h_topo.best_back_vf[vf];
+                            good_gpu_topos.push_back(h_topo);
+                        }
+                    }
+
+                    // b) Build combined pool: good GPU topos + good CPU trees.
+                    //    cpu_trees already sorted ascending (best-first) from Step 3.
+                    std::vector<const GpuTopology*> pool;
+                    for (int i = 0; i < (int)good_gpu_topos.size(); i++)
+                        pool.push_back(&good_gpu_topos[i]);
+                    for (int i = 0; i < (int)cpu_trees.size(); i++)
+                    {
+                        if (cpu_trees[i].score <= threshold)
+                            pool.push_back(&cpu_trees[i].topo);
+                        else
+                            break;  // sorted ascending: rest all > threshold
+                    }
+
+                    // c) Reseed each remaining bad slot from the pool.
+                    //    K2 filter checks topo->postSprParsimony (from GpuTopology struct).
+                    //    Donor's postSprParsimony <= threshold → reseeded slot enters K2.
+                    //    needs_recompute=1 triggers full parsVect rebuild inside K2.
+                    if (!pool.empty())
+                    {
+                        for (int i = n_uploaded; i < (int)replace_slots.size(); i++)
+                        {
+                            int slot = replace_slots[i];
+                            GpuTopology fill_topo = *pool[random_int((int)pool.size())];
+                            fill_topo.savedSeed = params.ran_seed + (long)slot * 99991L;
+                            fill_topo.needs_recompute = 1;
+                            uploadTopology(cb_mem, slot, &fill_topo, cb_stream);
+                            n_reseeded++;
+                        }
+                    }
+                }
+            }
+
             // Step 4: add qualifying GPU trees into iqtree.candidateTrees
             // First, purge candidateTrees entries worse than threshold
             {
@@ -291,13 +346,15 @@ int mpbootGpu(
 
             int n_gpu_good = Kc - (int)replace_slots.size();
             printf(
-                "[CPU]   CPU built %d trees, %d uploaded to GPU slots; %d GPU trees added to "
-                "candidateTrees\n",
-                (int)cpu_trees.size(), n_uploaded, n_gpu_added
+                "[CPU]   CPU built %d trees, %d uploaded to GPU slots, %d slots reseeded; "
+                "%d GPU trees added to candidateTrees\n",
+                (int)cpu_trees.size(), n_uploaded, n_reseeded, n_gpu_added
             );
             printf(
-                "[GPU]   hillClimbingKernel: threshold=%u  (%d GPU + %d CPU = %d trees enter K2)\n",
-                threshold, n_gpu_good, n_uploaded, n_gpu_good + n_uploaded
+                "[GPU]   hillClimbingKernel: threshold=%u  (%d GPU + %d CPU + %d reseeded = %d "
+                "trees enter K2)\n",
+                threshold, n_gpu_good, n_uploaded, n_reseeded,
+                n_gpu_good + n_uploaded + n_reseeded
             );
 
             return threshold;
@@ -614,6 +671,11 @@ int mpbootGpu(
         for (int vf = 0; vf < h_topo.num_vfaces; vf++)
             h_topo.back_vf[vf] = h_topo.best_back_vf[vf];
         t_download += msSince(ti);
+
+        if (h_topo.bestParsimony > best_hc) {
+            candidateTrees[i] = "";
+            continue;
+        }
 
         ti = std::chrono::high_resolution_clock::now();
         gpuTopoToCpu(&h_topo, tr);

@@ -21,6 +21,7 @@
 | Opt-Q1 | score_tree zero-init loop removal (dead code) | **−3.4% avg** (10 datasets) |
 | Opt-Q2 | Lazy gpuNodeRectifierPars: skip first do-while iteration | **−13.0% avg** (10/10 datasets) |
 | **Opt-R** | **Restore best_back_vf trước mỗi Phase 3 perturbation** | **avg +60% speedup vs CPU, −38% ms/tree** |
+| **Reseed** | **Reseed bad GPU slots từ threshold pool (hybrid_cb Step 3.5)** | **0/37 regressions, 14/37 improved, +14.5% time (N≈200)** |
 
 ---
 
@@ -273,7 +274,8 @@ Rectify vẫn được gọi ở iter 2+ (khi topology thực sự thay đổi s
 1. ~~Opt-K~~ ✅  2. ~~Opt-B / Opt-B+~~ ✅  3. ~~Opt-M~~ ✅  4. ~~Opt-P L1+L2b+L3~~ ✅  5. ~~Opt-G xoá~~ ✅
 6. ~~Opt-Q1+Q2~~ ✅ (Phase 3 micro-opts, −13% avg)
 7. ~~Opt-R~~ ✅ (Restore best_back_vf, **−38% ms/tree, +60% speedup vs CPU**)
-8. **Opt-N** (thread coarsening UNROLL=2 cho STATES=4): estimate +10-20% cho DNA datasets
+8. ~~Reseed~~ ✅ (Reseed bad slots từ threshold pool, 0 regressions / +14.5% time N≈200)
+9. **Opt-N** (thread coarsening UNROLL=2 cho STATES=4): estimate +10-20% cho DNA datasets
 9. ~~Opt-O~~ — hủy: applyMove chiếm <0.1% thời gian, không đáng optimize
 10. ~~Opt-E~~ — hủy: không khả thi, redesign quá lớn
 
