@@ -30,22 +30,24 @@ using AfterK2Callback = std::function<void(cudaStream_t)>;
 // Run stepwise-addition + SPR + iterative NNI+SPR search for all K trees.
 // sprDist        = SPR radius (used for all phases)
 // numNNI         = NNI moves per even outer iteration
-// stopNoImprove  = stop Phase 3 after this many consecutive no-improve iters
 // poolSize       = number of pool slots for population-based restarts (from -gpu_pool_size)
+// poolStopThresh = stop K2 after this many outer iters with no global improvement (from -gpu_pool_stop)
 // after_k1       = optional Phase 1 hybrid callback (nullptr = standard mode)
 // after_k2       = optional Phase 2 hybrid callback (nullptr = standard mode)
-// k1_trees       = K' trees to build in K1 (≤ K); -1 or K = build all K (default)
+// k1_count       = K1 blocks to build (= numpars); must be ≤ mem->K
+// k2_workers     = K2 blocks (-1 = same as k1_count); mem->K = max(k1_count, k2_workers)
 void gpuStepwiseBuildTrees(
     GpuParsimonyMem*  mem,
     const long*       seeds,
+    int               k1_count,
     int               sprDist,
     int               numNNI,
-    int               stopNoImprove,
     int               poolSize,
+    int               poolStopThresh,
     cudaStream_t      stream,
-    AfterK1Callback   after_k1 = nullptr,
-    AfterK2Callback   after_k2 = nullptr,
-    int               k1_trees = -1
+    AfterK1Callback   after_k1   = nullptr,
+    AfterK2Callback   after_k2   = nullptr,
+    int               k2_workers = -1
 );
 
 }  // namespace mpbootgpu

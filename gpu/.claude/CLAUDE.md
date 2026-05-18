@@ -453,7 +453,57 @@ Actual iterations used: 2–8 (vs 10 hardcoded). Quality: 9/10 same or better.
 | K1 `buildParsimonyTreesKernel` | **96** (↓ từ 155) | 20 | **20.31%** |
 | K2 `buildPhase3Kernel` | **151** | 12 | 18.75% |
 
-K1 giảm mạnh 155→96 regs. K2 vẫn 151 regs (register-bound, Phase 3 có nhiều live variables hơn).
+K1 giảm mạnh 155→96 regs. K2 vẫn 151 regs sau dead code removal.
+
+### ✅ Pool restart simplification — (2026-05-18)
+
+**Thay đổi**: Thay warp-parallel k-th min scan bằng lane-0 O(pool_size²) selection-sort.
+
+**Rationale**: `pool_size ≤ 60` → bitmask `unsigned long long used` đủ để track đã chọn slot nào.
+Sequential selection-sort với 60² = 3600 ops tối đa, đơn giản hơn nhiều so với warp-parallel.
+
+```cpp
+// Lane-0 only: O(pool_size²) selection-sort để chọn rank order_idx
+uint32_t used = 0;
+int found_slot = -1;
+for (int rank = 0; rank <= order_idx; rank++) {
+    unsigned int best = 0xFFFFFFFFu; int best_slot = -1;
+    for (int i = 0; i < accessible; i++) {
+        if ((used >> i) & 1u) continue;
+        if (pool_scores[i] < best) { best = pool_scores[i]; best_slot = i; }
+    }
+    used |= (1u << best_slot); found_slot = best_slot;
+}
+```
+
+**File**: `gpu/src/pars_build.cu` — pool restart scan block.
+**Effect on registers**: K2 regs **151 → 128** (đo NCU sau thay đổi này).
+
+### ✅ Per-slot pool spinlocks — Opt-S (2026-05-18)
+
+**Vấn đề**: 1 `pool_lock` global int bị tranh chấp bởi K=1000 blocks → thundering herd.
+- Pool restart: 1000 blocks busywait cùng một lock để copy 12.8 KB `back_vf`
+- Pool insert: thêm contention khi một block insert vào pool
+
+**Fix**: Thay `pool_lock` (1 int) bằng `pool_slot_locks[pool_size]` (20 ints):
+- Pool restart: `atomicCAS(&pool_slot_locks[phys_slot], 0, 1)` — chỉ lock đúng slot đang đọc
+- Pool insert: `atomicCAS(&pool_slot_locks[worst_slot], 0, 1)` — chỉ lock đúng slot đang ghi
+- Contention giảm từ K=1000 blocks tranh 1 lock → max K/pool_size ≈ 50 blocks per lock
+
+**Files thay đổi**:
+| File | Thay đổi |
+|------|---------|
+| `gpu/include/pars_tree.cuh` | `d_poolLock` → `d_poolSlotLocks` (int* array) |
+| `gpu/src/pars_tree.cu` | alloc pool_size ints + cudaMemset; free d_poolSlotLocks |
+| `gpu/src/pars_build.cu` | runPhase3 + buildPhase3Kernel: pool_lock → pool_slot_locks[slot] |
+| `gpu/src/gpu_init_trees.cu` | hybrid_cb: cudaMemset toàn bộ array thay cudaMemcpy 1 int |
+
+**NCU profiling** (K=1000, N=295, A100):
+| Kernel | Regs | Theor. Occ | Achieved Occ | Waves/SM |
+|--------|------|-----------|-------------|---------|
+| K2 `buildPhase3Kernel` | **128** | 20.31% | 13.29% | 0.71 |
+
+Shared memory (12.9 KB/block) là bottleneck chiếm dụng (không phải registers). Bottleneck còn lại: `gpuRandomNNIs` 31 lanes idle.
 
 ### ✅ K' < K: Build fewer trees in K1 — Opt-LessK1 (2026-05-17)
 

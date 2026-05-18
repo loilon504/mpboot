@@ -67,9 +67,13 @@ int mpbootGpu(
         msSince(t0) / 1e3, width, states
     );
 
+    // K2 workers computed early — needed for memory allocation size
+    const int k2_workers_early = (params.gpu_worker > 0) ? params.gpu_worker : K;
+    const int K_alloc = std::max(K, k2_workers_early);
+
     // ── [2] Allocate GPU memory ───────────────────────────────────────────────
     t0 = std::chrono::high_resolution_clock::now();
-    GpuParsimonyMem* mem = gpuParsimonyMemAlloc(K, mxtips, width, states, params.gpu_pool_size);
+    GpuParsimonyMem* mem = gpuParsimonyMemAlloc(K_alloc, mxtips, width, states, params.gpu_pool_size);
     printf("[GPU]   [2]      %-28s: %8.3f s\n", "GPU memory alloc", msSince(t0) / 1e3);
 
     // ── [3] Upload tip parsVect ───────────────────────────────────────────────
@@ -124,13 +128,9 @@ int mpbootGpu(
     // ── [5+6+7] Joined kernel: build + initial SPR + iterative NNI+SPR ─────────
     // Phase 4 params
     const int numNNI = (mxtips > 4) ? max(1, (int)(params.gpu_nni_strength * (mxtips - 3))) : 1;
-    const int stopNoImprove = params.gpu_stop;
     const int pool_size = params.gpu_pool_size;
-    // K' trees built by K1; K2 still runs K blocks (all reseeded from pool by callback)
-    const float k1_ratio = params.gpu_k1_ratio;
-    const int k1_trees = (k1_ratio <= 0.0f || k1_ratio >= 1.0f)
-                         ? K
-                         : std::max(pool_size, (int)(K * k1_ratio));
+    // K2 workers: independent of K1; mem->K = K_alloc = max(K, k2_workers)
+    const int k2_workers = k2_workers_early;
 
     // ── Hybrid callbacks: Phase 1 (CPU builds during K1) + Phase 2 (CPU HC during K2) ─────
     AfterK1Callback hybrid_cb = nullptr;
@@ -187,9 +187,9 @@ int mpbootGpu(
             }
             CUDA_CHECK(cudaStreamSynchronize(cb_stream));  // K1 fully done
 
-            // Step 2: Download K1 GPU postSprScores (only k1_trees slots are valid)
-            const int Kc_scores = k1_trees;  // K' slots written by K1
-            const int Kc_full   = cb_mem->K; // all K slots for reseed in Step 5
+            // Step 2: Download K1 GPU postSprScores (K1 builds all K trees)
+            const int Kc_scores = K;          // all K slots written by K1
+            const int Kc_full   = k2_workers; // reseed k2_workers slots for K2
             std::vector<unsigned int> gpu_scores(Kc_scores);
             CUDA_CHECK(cudaMemcpy(
                 gpu_scores.data(), cb_mem->d_postSprScores, (size_t)Kc_scores * sizeof(unsigned int),
@@ -262,6 +262,17 @@ int mpbootGpu(
                 printf("[GPU]   Pool: %d/%d slots, top-%d scores:", actual_pool, pool_size, show);
                 for (int i = 0; i < show; i++) printf(" %u", h_pool_scores[i]);
                 printf("\n");
+            }
+
+            // Step 4b: Init fill counter + per-slot spinlocks + accessible window
+            {
+                int h_filled = actual_pool, h_acc = 10, h_stop = 0;
+                unsigned int h_inf = 0xFFFFFFFFu;
+                CUDA_CHECK(cudaMemcpy(cb_mem->d_poolFilled,     &h_filled, sizeof(int),          cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemset(cb_mem->d_poolSlotLocks,  0, (size_t)cb_mem->pool_size * sizeof(int)));
+                CUDA_CHECK(cudaMemcpy(cb_mem->d_poolAccessible, &h_acc,    sizeof(int),          cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(cb_mem->d_poolStop,       &h_stop,   sizeof(int),          cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(cb_mem->d_globalBest,     &h_inf,    sizeof(unsigned int), cudaMemcpyHostToDevice));
             }
 
             // Step 5: Reseed ALL K GPU slots from pool (round-robin)
@@ -503,8 +514,8 @@ int mpbootGpu(
         [&]
         {
             gpuStepwiseBuildTrees(
-                mem, seeds.data(), params.sprDist, numNNI, stopNoImprove,
-                pool_size, stream, hybrid_cb, hybrid_cb2, k1_trees
+                mem, seeds.data(), K, params.sprDist, numNNI,
+                pool_size, params.gpu_pool_stop, stream, hybrid_cb, hybrid_cb2, k2_workers
             );
         }
     );
@@ -513,8 +524,8 @@ int mpbootGpu(
         (double)build_ms / 1e3, K, K > 0 ? (double)build_ms / K : 0.0
     );
     printf(
-        "[GPU]            sprDist=%d  NNI=%d(%.2f)  stop=%d\n",
-        params.sprDist, numNNI, params.gpu_nni_strength, stopNoImprove
+        "[GPU]            sprDist=%d  NNI=%d(%.2f)  pool_stop=%d\n",
+        params.sprDist, numNNI, params.gpu_nni_strength, params.gpu_pool_stop
     );
     printf("[GPU]\n");
 
@@ -570,23 +581,20 @@ int mpbootGpu(
                 "[GPU]   [6]     %-22s:  best=%-7u  worst=%u\n", "Post-SPR parsimony", best_spr,
                 worst_spr
             );
-            if (stopNoImprove > 0)
-            {
-                printf(
-                    "[GPU]   [6]     %-22s:  best=%-7u  worst=%u\n", "Post-HC  parsimony", best_hc,
-                    worst_hc
-                );
-                printf(
-                    "[GPU]   [6]     %-22s:  %d/%d iters improved (%.1f%%)\n", "NNI+SPR",
-                    sum_improved_even, sum_total_even,
-                    sum_total_even > 0 ? 100.0 * sum_improved_even / sum_total_even : 0.0
-                );
-                printf(
-                    "[GPU]   [6]     %-22s:  %d/%d iters improved (%.1f%%)\n", "Ratchet",
-                    sum_improved_odd, sum_total_odd,
-                    sum_total_odd > 0 ? 100.0 * sum_improved_odd / sum_total_odd : 0.0
-                );
-            }
+            printf(
+                "[GPU]   [6]     %-22s:  best=%-7u  worst=%u\n", "Post-HC  parsimony", best_hc,
+                worst_hc
+            );
+            printf(
+                "[GPU]   [6]     %-22s:  %d/%d iters improved (%.1f%%)\n", "NNI+SPR",
+                sum_improved_even, sum_total_even,
+                sum_total_even > 0 ? 100.0 * sum_improved_even / sum_total_even : 0.0
+            );
+            printf(
+                "[GPU]   [6]     %-22s:  %d/%d iters improved (%.1f%%)\n", "Ratchet",
+                sum_improved_odd, sum_total_odd,
+                sum_total_odd > 0 ? 100.0 * sum_improved_odd / sum_total_odd : 0.0
+            );
         }
         else
         {

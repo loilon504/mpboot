@@ -301,17 +301,17 @@ __device__ void gpuSPRHillClimb(
     // nodep[] is guaranteed fresh by the caller (runPhase3 calls it before gpuSPRHillClimb).
     bool first_iter = true;
     unsigned int startMP;
-    if (lane == 0) sh.bestParsimony = sh.randomMP;
+    if (lane == 0)
+    {
+        sh.bestParsimony = sh.randomMP;
+    }
     __syncwarp();
     do
     {
         startMP = sh.randomMP;
         if (!first_iter)
         {
-            if (lane == 0)
-            {
-                gpuNodeRectifierPars(topo, sh, N);
-            }
+            if (lane == 0) { gpuNodeRectifierPars(topo, sh, N); }
             __syncwarp();
         }
         first_iter = false;
@@ -601,52 +601,110 @@ __device__ void runPhase3(
     int N,
     int sprDist,
     int numNNI,
-    int stopNoImprove,
     int lane,
     int k,
     int width,
     int pool_size,
-    unsigned int* pool_scores,  // [pool_size] — UINT_MAX = empty slot
-    int* pool_back_vf           // [pool_size * kMaxVFaces]
+    unsigned int* pool_scores,  // [pool_size] parsimony score per physical slot (UINT_MAX=empty)
+    int* pool_back_vf,          // [pool_size * kMaxVFaces] topology per physical slot
+    int* pool_filled,           // device ptr: number of filled slots (0..pool_size)
+    int* pool_slot_locks,       // device ptr: per-slot spinlocks [pool_size]
+    int* pool_accessible,       // device ptr: accessible window; starts at 10, +1 per insert
+    int* pool_stop,             // device ptr: no-improve counter; reset on new global best, +1 otherwise
+    int  pool_stop_thresh,      // stop K2 when pool_stop >= this (from -gpu_pool_stop, default 100)
+    unsigned int* global_best   // device ptr: global best parsimony across all warps
 )
 {
-    if (lane == 0) { sh.bcast[1] = 0; }
-    __syncwarp();
-
-    for (int outer = 0; ; outer++)
+    for (int outer = 0;; outer++)
     {
-        // ── Step 1: Pool restart if stagnated ─────────────────────────────────
-        // Load a random pool topology into back_vf when stagnation detected.
-        // NNI/Ratchet (Step 2) then perturbs from this topology.
-        if (sh.bcast[1] >= 1 && pool_scores != nullptr)
+        if (pool_stop != nullptr && *pool_stop >= pool_stop_thresh)
         {
-            int slot = (int)(((unsigned)k * 2654435761u + (unsigned)outer * 1013904223u) >> 8)
-                       % pool_size;
-            if (pool_scores[slot] == 0xFFFFFFFFu) slot = 0;
+            return;
+        }
 
-            const int* src = pool_back_vf + (size_t)slot * kMaxVFaces;
-            for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
-            {
-                topo->back_vf[vf] = src[vf];
-                topo->xpars[vf] = 0;
-            }
-            __syncwarp();
-
-            if (lane == 0) gpuNodeRectifierPars(topo, sh, N);
-            __syncwarp();
-
+        // ── Step 1: Pool restart every iteration ─────────────────────────────
+        // Lane 0 computes accessible/order_idx (no lock needed for scan).
+        // All 32 lanes do warp-parallel k-th min scan over pool_scores[].
+        // Lock is acquired only when copying back_vf. Supports pool_size ≤ kWarpSize²=1024.
+        if (pool_scores != nullptr)
+        {
             if (lane == 0)
             {
-                sh.randomMP = pool_scores[slot];
-                sh.randomMPHits = 1;
-                // Baseline for stagnation must reflect the restarted tree's score.
-                // Without this, NNI that worsens the loaded tree can still look like
-                // "improvement" against a stale bestParsimony.
-                topo->bestParsimony = sh.randomMP;
-                // if (pool_scores[slot] < topo->bestParsimony)
-                //     topo->bestParsimony = pool_scores[slot];
+                int filled = *pool_filled;
+                int accessible = *pool_accessible;
+                if (accessible > pool_size) accessible = pool_size;
+                if (accessible > filled)    accessible = filled;
+                sh.bcast[2] = -1;
+                sh.bcast[3] = 0;  // 0 = skip scan; >0 = accessible
+                if (accessible > 0)
+                {
+                    sh.bcast[3] = accessible;
+                    sh.bcast[5] = (int)(((unsigned)k * 2654435761u + (unsigned)outer * 1013904223u)
+                                        >> 8)
+                                  % (unsigned)accessible;  // order_idx
+                }
             }
             __syncwarp();
+
+            // Lane-0 k-th min: O(pool_size²), pool_size ≤ 60 → ≤ 3600 ops.
+            if (lane == 0 && sh.bcast[3] > 0)
+            {
+                const int accessible = sh.bcast[3];
+                const int order_idx  = sh.bcast[5];
+                unsigned long long used = 0;
+                int found_slot = -1;
+                for (int rank = 0; rank <= order_idx; rank++)
+                {
+                    unsigned int best = 0xFFFFFFFFu;
+                    int best_slot = -1;
+                    for (int i = 0; i < accessible; i++)
+                    {
+                        if ((used >> i) & 1ULL) continue;
+                        unsigned int s = pool_scores[i];
+                        if (s < best) { best = s; best_slot = i; }
+                    }
+                    if (best_slot < 0) break;
+                    used |= (1ULL << best_slot);
+                    found_slot = best_slot;
+                }
+                sh.bcast[2] = found_slot;
+                if (found_slot >= 0)
+                {
+                    sh.randomMP = pool_scores[found_slot];
+                    sh.randomMPHits = 1;
+                    topo->bestParsimony = sh.randomMP;
+                }
+            }
+            __syncwarp();
+
+            if (sh.bcast[2] >= 0)
+            {
+                // Acquire per-slot lock for back_vf copy (score reads above were lockless).
+                int phys_slot = sh.bcast[2];
+                if (lane == 0)
+                {
+                    while (atomicCAS(&pool_slot_locks[phys_slot], 0, 1) != 0)
+                    {
+                    }
+                }
+                __syncwarp();
+                const int* src = pool_back_vf + (size_t)phys_slot * kMaxVFaces;
+                for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
+                {
+                    topo->back_vf[vf] = src[vf];
+                    topo->xpars[vf] = 0;
+                }
+                __syncwarp();
+
+                if (lane == 0)
+                {
+                    atomicExch(&pool_slot_locks[phys_slot], 0);  // release after copy complete
+                }
+                __syncwarp();
+
+                if (lane == 0) { gpuNodeRectifierPars(topo, sh, N); }
+                __syncwarp();
+            }
         }
 
         // ── Step 2: Strict alternating NNI (even) / Ratchet (odd) ────────────
@@ -657,10 +715,16 @@ __device__ void runPhase3(
             gpuRandomNNIs<SharedT>(topo, sh, N, numNNI, lane);
 
             unsigned int pm = createTiAndEvaluateParsimony<SharedT, STATES>(
-                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width);
-            if (lane == 0) { sh.randomMP = pm; sh.randomMPHits = 1; }
+                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width
+            );
+            if (lane == 0)
+            {
+                sh.randomMP = pm;
+                sh.randomMPHits = 1;
+            }
             __syncwarp();
 
+            if (pool_stop != nullptr && *pool_stop >= pool_stop_thresh) break;
             gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
         }
         else
@@ -668,89 +732,164 @@ __device__ void runPhase3(
             if (lane == 0)
             {
                 for (int b = 0; b < width; b++)
+                {
                     sw_k[b] = (gpuRandum(&sh.seed) < 0.5) ? 2u : 1u;
+                }
                 sh.site_weights = sw_k;
             }
             __syncwarp();
 
             unsigned int pm1 = createTiAndEvaluateParsimony<SharedT, STATES>(
-                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width);
-            if (lane == 0) { sh.randomMP = pm1; sh.randomMPHits = 1; }
+                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width
+            );
+            if (lane == 0)
+            {
+                sh.randomMP = pm1;
+                sh.randomMPHits = 1;
+            }
             __syncwarp();
 
+            if (pool_stop != nullptr && *pool_stop >= pool_stop_thresh)
+            {
+                if (lane == 0) sh.site_weights = nullptr;
+                __syncwarp();
+                break;
+            }
             gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
 
-            if (lane == 0) { sh.site_weights = nullptr; }
+            if (lane == 0)
+            {
+                sh.site_weights = nullptr;
+            }
             __syncwarp();
 
             unsigned int pm2 = createTiAndEvaluateParsimony<SharedT, STATES>(
-                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width);
-            if (lane == 0) { sh.randomMP = pm2; sh.randomMPHits = 1; }
+                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width
+            );
+            if (lane == 0)
+            {
+                sh.randomMP = pm2;
+                sh.randomMPHits = 1;
+            }
             __syncwarp();
 
+            if (pool_stop != nullptr && *pool_stop >= pool_stop_thresh) break;
             gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
         }
 
-        // ── Step 3: Stagnation tracking + pool membership ────────────────────
-        // bcast[2]=worst_idx, bcast[3]=worst_score, bcast[4]=CAS win flag
+        // ── Step 3: Stagnation tracking + sorted pool insert ─────────────────
         if (lane == 0)
         {
-            if (iter_is_nni) topo->n_total_even++;
-            else             topo->n_total_odd++;
+            if (iter_is_nni)
+            {
+                topo->n_total_even++;
+            }
+            else
+            {
+                topo->n_total_odd++;
+            }
 
-            // Stagnation tracks warp's own improvement.
-            // Pool membership update is independent — a warp can converge its own tree
-            // long before it stops beating the pool worst.
             const unsigned int best_before = topo->bestParsimony;
             if (sh.randomMP < best_before)
             {
                 topo->bestParsimony = sh.randomMP;
-                if (iter_is_nni) topo->n_improved_even++;
-                else             topo->n_improved_odd++;
-                sh.bcast[1] = 0;
+                if (iter_is_nni)
+                {
+                    topo->n_improved_even++;
+                }
+                else
+                {
+                    topo->n_improved_odd++;
+                }
             }
-            else
-            {
-                sh.bcast[1]++;
-            }
-
-            // Scan all P slots to find worst (for pool update below)
-            unsigned int worst_s = 0u;
-            int worst_i = 0;
-            for (int i = 0; i < pool_size; i++)
-                if (pool_scores[i] > worst_s) { worst_s = pool_scores[i]; worst_i = i; }
-            sh.bcast[2] = worst_i;
-            sh.bcast[3] = (int)worst_s;
-            sh.bcast[0] = (stopNoImprove > 0 && sh.bcast[1] >= stopNoImprove) ? 1 : 0;
         }
         __syncwarp();
 
-        if (sh.bcast[0]) break;  // early stop before pool update to save work
-
-        const unsigned int worst_score = (unsigned int)sh.bcast[3];
-        const int my_slot = k % pool_size;
-
-        if (sh.randomMP < worst_score)
+        // Pool update: scan for worst slot (no lock), atomicCAS to claim, lock for back_vf copy.
+        if (lane == 0)
         {
-            // Beat pool worst — try to update my assigned slot via atomicCAS.
-            // Only the warp that wins the CAS copies topology (prevents mixed-topology race).
-            if (lane == 0)
+            sh.bcast[4] = -1;
+            if (pool_scores != nullptr)
             {
-                const unsigned int expected = pool_scores[my_slot];
-                if (sh.randomMP < expected)
-                    sh.bcast[4] = (atomicCAS(&pool_scores[my_slot], expected, sh.randomMP)
-                                   == expected) ? 1 : 0;
-                else
-                    sh.bcast[4] = 0;
+                // Find worst slot (max score) without holding lock
+                int worst_slot = 0;
+                unsigned int worst_score = pool_scores[0];
+                for (int i = 1; i < pool_size; i++)
+                {
+                    unsigned int s = pool_scores[i];
+                    if (s > worst_score)
+                    {
+                        worst_score = s;
+                        worst_slot = i;
+                    }
+                }
+                if (sh.randomMP < worst_score)
+                {
+                    // atomicCAS: claim the slot atomically (no lock needed for score)
+                    unsigned int old = atomicCAS(
+                        (unsigned int*)&pool_scores[worst_slot], worst_score, sh.randomMP
+                    );
+                    if (old == worst_score)
+                    {
+                        if (old == 0xFFFFFFFFu)
+                        {
+                            atomicAdd(pool_filled, 1);  // grew pool
+                        }
+                        atomicAdd(pool_accessible, 1);  // grow window by 1 (capped on read)
+                        sh.bcast[4] = worst_slot;
+                        // Acquire per-slot lock to protect back_vf copy from concurrent restart reads
+                        while (atomicCAS(&pool_slot_locks[worst_slot], 0, 1) != 0)
+                        {
+                        }
+                    }
+                }
+            }
+        }
+        __syncwarp();
+
+        // All 32 lanes copy topology; lock still held by lane 0 when bcast[4] >= 0.
+        // Holding the lock prevents another warp from evicting and reusing the same
+        // physical slot before this warp finishes writing pool_back_vf[phys].
+        if (sh.bcast[4] >= 0)
+        {
+            int* dst = pool_back_vf + (size_t)sh.bcast[4] * kMaxVFaces;
+            for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
+            {
+                dst[vf] = topo->back_vf[vf];
             }
             __syncwarp();
+        }
+        __syncwarp();
 
-            if (sh.bcast[4])
+        // Release per-slot spinlock after topology copy is complete
+        if (sh.bcast[4] >= 0 && lane == 0)
+        {
+            atomicExch(&pool_slot_locks[sh.bcast[4]], 0);
+        }
+        __syncwarp();
+
+        // Pool convergence: +1/iter (not +k2_workers/iter) so threshold is independent of worker count.
+        // All warps update global_best; only warp 0 increments the iter counter.
+        // Reset uses atomicCAS to guard against resurrecting the counter after block 0 has exited:
+        //   once pool_stop >= thresh, no block may reset it to 0 — all blocks will then exit.
+        if (lane == 0 && global_best != nullptr)
+        {
+            if (sh.randomMP < *global_best)
             {
-                int* dst = pool_back_vf + (size_t)my_slot * kMaxVFaces;
-                for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
-                    dst[vf] = topo->back_vf[vf];
-                __syncwarp();
+                atomicMin(global_best, sh.randomMP);
+                if (pool_stop != nullptr)
+                {
+                    // Only reset if block 0 hasn't yet triggered exit.
+                    // If CAS fails under contention, we conservatively skip the reset;
+                    // this may cause a 1-iter-early stop, which is acceptable.
+                    unsigned int s = *((volatile unsigned int*)pool_stop);
+                    if (s < (unsigned int)pool_stop_thresh)
+                        atomicCAS((unsigned int*)pool_stop, s, 0u);
+                }
+            }
+            else if (blockIdx.x == 0 && pool_stop != nullptr)
+            {
+                atomicAdd(pool_stop, 1);  // +1 per outer iter, independent of k2_workers
             }
         }
         __syncwarp();
@@ -812,20 +951,7 @@ __global__ void buildParsimonyTreesKernel(
         topo->nextnode = N + 2;
         sh.bestParsimony = UINT_MAX;
         sh.bestHits = 1;
-
-        // Init nodep[] — inner nodes overwritten by gpuNodeRectifierPars in Phase 3
-        for (int num = 1; num <= N; num++)
-        {
-            topo->nodep[num] = num - 1;
-        }
-        for (int num = N + 1; num <= 2 * N - 1; num++)
-        {
-            int p = nodepVf(num, N);
-            topo->nodep[num] = p;
-            topo->xpars[p] = 1;
-            topo->xpars[p - 1] = 0;
-            topo->xpars[p - 2] = 0;
-        }
+        // nodep[] and xpars already initialized by cpuToGpuTopology on host before upload
     }
     __syncwarp();
 
@@ -918,7 +1044,10 @@ __global__ void buildParsimonyTreesKernel(
         __syncwarp();
     }
 
-    if (lane == 0) { topo->bestParsimony = sh.bestParsimony; }
+    if (lane == 0)
+    {
+        topo->bestParsimony = sh.bestParsimony;
+    }
     __syncwarp();
 
     // ── Phase 2: initial SPR hill-climbing ────────────────────────────────────
@@ -927,9 +1056,10 @@ __global__ void buildParsimonyTreesKernel(
         return;
     }
 
+    if (lane == 0) { gpuNodeRectifierPars(topo, sh, N); }
+    __syncwarp();
     if (lane == 0)
     {
-        gpuNodeRectifierPars(topo, sh, N);
         sh.randomMPHits = 1;
         sh.randomMP = sh.bestParsimony;
         topo->preSprParsimony = sh.bestParsimony;
@@ -950,7 +1080,6 @@ __global__ void buildParsimonyTreesKernel(
         }
     }
     __syncwarp();
-
 }
 
 // ─── Opt-G2: Phase 3 only kernel (two-kernel selective Phase 3) ───────────────
@@ -963,12 +1092,17 @@ __global__ void buildPhase3Kernel(
     int width,
     int sprDist,
     int numNNI,
-    int stopNoImprove,
     size_t parsVectPerTree,
     size_t parsScorePerTree,
     int pool_size,
-    unsigned int* pool_scores,  // [pool_size] population pool scores
-    int* pool_back_vf           // [pool_size * kMaxVFaces] population pool topologies
+    unsigned int* pool_scores,  // [pool_size] population pool scores (UINT_MAX=empty)
+    int* pool_back_vf,          // [pool_size * kMaxVFaces] population pool topologies
+    int* pool_filled,           // device ptr: number of filled slots
+    int* pool_slot_locks,       // device ptr: per-slot spinlocks [pool_size]
+    int* pool_accessible,       // device ptr: accessible window; starts at 10, +1 per insert
+    int* pool_stop,             // device ptr: no-improve counter
+    int  pool_stop_thresh,      // stop when pool_stop >= this
+    unsigned int* global_best   // device ptr: global best parsimony across all warps
 )
 {
     __shared__ BuildSharedT<NTAXA> sh;
@@ -983,8 +1117,6 @@ __global__ void buildPhase3Kernel(
     unsigned int* sw_k = d_siteWeights + (size_t)k * width;
     const int N = topo->mxtips;
 
-
-
     // Restore inter-kernel state from GpuTopology
     if (lane == 0)
     {
@@ -996,42 +1128,34 @@ __global__ void buildPhase3Kernel(
     }
     __syncwarp();
 
-    // Hybrid: CPU-uploaded tree has stale parsVect and uninitialized nodep[].
-    // Must: (1) init tip nodep[], (2) recompute parsVect from topology, (3) set inner nodep[].
-    if (topo->needs_recompute)
-    {
-        // Step 1: tip nodep[] is always nodep[num] = num-1 (fixed for any tree with N tips)
-        if (lane == 0)
-        {
-            for (int num = 1; num <= N; num++)
-            {
-                topo->nodep[num] = num - 1;
-            }
-        }
-        __syncwarp();
+    // Hybrid: CPU-uploaded tree has stale parsVect; nodep[] is pre-initialized by cpuToGpuTopology.
+    // Must: (1) recompute parsVect from topology, (2) set inner nodep[] in DFS order.
+    // if (topo->needs_recompute)
+    // {
+    //     // Step 1: recompute parsVect from the CPU tree's back_vf topology (full traversal)
+    //     unsigned int recomputed = createTiAndEvaluateParsimony<SharedT, STATES>(
+    //         pars_tree, score_tree, topo, sh, topo->start_vface, N, /*full=*/true, width
+    //     );
 
-        // Step 2: recompute parsVect from the CPU tree's back_vf topology (full traversal)
-        unsigned int recomputed = createTiAndEvaluateParsimony<SharedT, STATES>(
-            pars_tree, score_tree, topo, sh, topo->start_vface, N, /*full=*/true, width
-        );
-
-        // Step 3: set inner nodep[] so Phase 3 SPR loop can iterate topo->nodep[i]
-        if (lane == 0)
-        {
-            gpuNodeRectifierPars(topo, sh, N);  // DFS from nodep[1]=0, sets nodep[N+1..2N-1]
-            sh.randomMP = recomputed;
-            sh.randomMPHits = 1;
-            sh.bestParsimony = recomputed;
-            topo->bestParsimony = recomputed;
-            topo->postSprParsimony = recomputed;
-            topo->needs_recompute = 0;
-        }
-        __syncwarp();
-    }
+    //     // Step 2: set inner nodep[] so Phase 3 SPR loop can iterate topo->nodep[i]
+    //     if (lane == 0) { gpuNodeRectifierPars(topo, sh, N); }
+    //     __syncwarp();
+    //     if (lane == 0)
+    //     {
+    //         sh.randomMP = recomputed;
+    //         sh.randomMPHits = 1;
+    //         sh.bestParsimony = recomputed;
+    //         topo->bestParsimony = recomputed;
+    //         topo->postSprParsimony = recomputed;
+    //         topo->needs_recompute = 0;
+    //     }
+    //     __syncwarp();
+    // }
 
     runPhase3<STATES>(
-        pars_tree, score_tree, topo, sh, sw_k, N, sprDist, numNNI, stopNoImprove,
-        lane, k, width, pool_size, pool_scores, pool_back_vf
+        pars_tree, score_tree, topo, sh, sw_k, N, sprDist, numNNI, lane, k, width,
+        pool_size, pool_scores, pool_back_vf, pool_filled, pool_slot_locks, pool_accessible,
+        pool_stop, pool_stop_thresh, global_best
     );
 }
 
@@ -1039,23 +1163,25 @@ __global__ void buildPhase3Kernel(
 void gpuStepwiseBuildTrees(
     GpuParsimonyMem* mem,
     const long* seeds,
+    int k1_count,
     int sprDist,
     int numNNI,
-    int stopNoImprove,
     int poolSize,
+    int poolStopThresh,
     cudaStream_t stream,
     AfterK1Callback after_k1,
     AfterK2Callback after_k2,
-    int k1_trees
+    int k2_workers
 )
 {
-    const int K = mem->K;
-    if (k1_trees <= 0 || k1_trees > K) k1_trees = K;
+    const int K = mem->K;  // K_alloc = max(k1_count, k2_workers)
+    if (k1_count <= 0 || k1_count > K) k1_count = K;
+    if (k2_workers <= 0 || k2_workers > K) k2_workers = K;
     long* d_seeds = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_seeds, (size_t)k1_trees * sizeof(long)));
-    CUDA_CHECK(
-        cudaMemcpyAsync(d_seeds, seeds, (size_t)k1_trees * sizeof(long), cudaMemcpyHostToDevice, stream)
-    );
+    CUDA_CHECK(cudaMalloc(&d_seeds, (size_t)k1_count * sizeof(long)));
+    CUDA_CHECK(cudaMemcpyAsync(
+        d_seeds, seeds, (size_t)k1_count * sizeof(long), cudaMemcpyHostToDevice, stream
+    ));
     CUDA_CHECK(cudaMemsetAsync(
         mem->d_parsScore, 0, (size_t)K * mem->parsScorePerTree * sizeof(unsigned int), stream
     ));
@@ -1073,75 +1199,75 @@ void gpuStepwiseBuildTrees(
         const size_t sharedBytes = sizeof(BuildSharedT<NT>);
 
         printf("\n[GPU] --------------------------------------------\n");
-            printf("[GPU]   buildTreesKernel<STATES=%d,NTAXA=%d>\n", S, NT);
-            printf(
-                "[GPU]         K=%d  K1=%d  sprDist=%d  shared=%.1f KB\n", K, k1_trees, sprDist,
-                sharedBytes / 1024.0
-            );
+        printf("[GPU]   buildTreesKernel<STATES=%d,NTAXA=%d>\n", S, NT);
+        printf(
+            "[GPU]         K1=%d  k2=%d  sprDist=%d  shared=%.1f KB\n", k1_count, k2_workers, sprDist,
+            sharedBytes / 1024.0
+        );
 
-            // Launch K1 async — do NOT sync here; callback (if any) does cudaStreamQuery loop
-            cudaEvent_t k1_start, k1_end;
-            cudaEventCreate(&k1_start);
-            cudaEventCreate(&k1_end);
-            cudaEventRecord(k1_start, stream);
-            buildParsimonyTreesKernel<S, NT><<<dim3(k1_trees), dim3(kWarpSize), 0, stream>>>(
-                mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, d_seeds,
-                mem->width, sprDist, mem->d_postSprScores,
-                mem->parsVectPerTree, mem->parsScorePerTree
-            );
-            cudaEventRecord(k1_end, stream);
-            CUDA_CHECK(cudaGetLastError());
+        // Launch K1 async — builds k1_count trees; callback (if any) does cudaStreamQuery loop
+        cudaEvent_t k1_start, k1_end;
+        cudaEventCreate(&k1_start);
+        cudaEventCreate(&k1_end);
+        cudaEventRecord(k1_start, stream);
+        buildParsimonyTreesKernel<S, NT><<<dim3(k1_count), dim3(kWarpSize), 0, stream>>>(
+            mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, d_seeds,
+            mem->width, sprDist, mem->d_postSprScores, mem->parsVectPerTree, mem->parsScorePerTree
+        );
+        cudaEventRecord(k1_end, stream);
+        CUDA_CHECK(cudaGetLastError());
 
-            if (after_k1)
-            {
-                // Hybrid: callback builds CPU trees via cudaStreamQuery, syncs, merges, uploads
-                after_k1(stream, mem);
-                // K1 is now fully done (callback called cudaStreamSynchronize)
-            }
-            else
-            {
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-            }
+        if (after_k1)
+        {
+            // Hybrid: callback builds CPU trees via cudaStreamQuery, syncs, merges, uploads
+            after_k1(stream, mem);
+            // K1 is now fully done (callback called cudaStreamSynchronize)
+        }
+        else
+        {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
 
-            // K1 timing (event already recorded; K1 is done by now)
-            float k1ms = 0.f;
-            cudaEventElapsedTime(&k1ms, k1_start, k1_end);
-            cudaEventDestroy(k1_start);
-            cudaEventDestroy(k1_end);
-            printf("[GPU]         time: %.3f s\n", k1ms / 1e3);
+        // K1 timing (event already recorded; K1 is done by now)
+        float k1ms = 0.f;
+        cudaEventElapsedTime(&k1ms, k1_start, k1_end);
+        cudaEventDestroy(k1_start);
+        cudaEventDestroy(k1_end);
+        printf("[GPU]         time: %.3f s\n", k1ms / 1e3);
 
-            printf("\n[GPU] --------------------------------------------\n");
-            printf("[GPU]   hillClimbingKernel<STATES=%d,NTAXA=%d>\n", S, NT);
+        printf("\n[GPU] --------------------------------------------\n");
+        printf("[GPU]   hillClimbingKernel<STATES=%d,NTAXA=%d>\n", S, NT);
 
-            // Launch K2 async — AfterK2Callback (if any) runs CPU work while K2 executes
-            cudaEvent_t k2_start, k2_end;
-            cudaEventCreate(&k2_start);
-            cudaEventCreate(&k2_end);
-            cudaEventRecord(k2_start, stream);
-            buildPhase3Kernel<S, NT><<<dim3(K), dim3(kWarpSize), 0, stream>>>(
-                mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, mem->width,
-                sprDist, numNNI, stopNoImprove, mem->parsVectPerTree,
-                mem->parsScorePerTree, poolSize, mem->d_poolScores, mem->d_poolBackVf
-            );
-            cudaEventRecord(k2_end, stream);
-            CUDA_CHECK(cudaGetLastError());
+        // Launch K2 async — AfterK2Callback (if any) runs CPU work while K2 executes
+        cudaEvent_t k2_start, k2_end;
+        cudaEventCreate(&k2_start);
+        cudaEventCreate(&k2_end);
+        cudaEventRecord(k2_start, stream);
+        buildPhase3Kernel<S, NT><<<dim3(k2_workers), dim3(kWarpSize), 0, stream>>>(
+            mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, mem->width,
+            sprDist, numNNI, mem->parsVectPerTree, mem->parsScorePerTree, poolSize,
+            mem->d_poolScores, mem->d_poolBackVf, mem->d_poolFilled, mem->d_poolSlotLocks,
+            mem->d_poolAccessible, mem->d_poolStop, poolStopThresh, mem->d_globalBest
+        );
+        cudaEventRecord(k2_end, stream);
+        CUDA_CHECK(cudaGetLastError());
 
-            if (after_k2)
-            {
-                // Phase 2: CPU hill-climbing while K2 runs.
-                // Contract: callback must call cudaStreamSynchronize(stream) before returning.
-                after_k2(stream);
-            }
-            else
-            {
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-            }
+        if (after_k2)
+        {
+            // Phase 2: CPU hill-climbing while K2 runs.
+            // Contract: callback must call cudaStreamSynchronize(stream) before returning.
+            after_k2(stream);
+        }
+        else
+        {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
 
-            float k2ms = 0.f;
-            cudaEventElapsedTime(&k2ms, k2_start, k2_end);
-            cudaEventDestroy(k2_start);
-            cudaEventDestroy(k2_end);
-            printf("[GPU]         time: %.3f s\n\n", k2ms / 1e3);
+        float k2ms = 0.f;
+        cudaEventElapsedTime(&k2ms, k2_start, k2_end);
+        cudaEventDestroy(k2_start);
+        cudaEventDestroy(k2_end);
+        printf("[GPU]         time: %.3f s\n\n", k2ms / 1e3);
     };
 
     // Dispatch on NTAXA bucket (Opt-P L3) then STATES.

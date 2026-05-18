@@ -38,7 +38,7 @@ __device__ __forceinline__ int vfToNum(
 }
 
 // vface of tr->nodep[num]: face[2] for inner nodes, vf=num-1 for tips.
-__device__ __forceinline__ int nodepVf(
+__host__ __device__ __forceinline__ int nodepVf(
     int num, int N
 )
 {

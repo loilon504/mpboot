@@ -87,8 +87,13 @@ struct GpuParsimonyMem
 
     // Population pool for hill-climbing restarts (Phase 3)
     int pool_size;                // number of pool slots (runtime, from -gpu_pool_size)
-    unsigned int* d_poolScores;   // [pool_size] parsimony score per pool slot
+    unsigned int* d_poolScores;   // [pool_size] parsimony score per pool slot (UINT_MAX = empty)
     int* d_poolBackVf;            // [pool_size][kMaxVFaces] topology snapshots
+    int*     d_poolFilled;        // number of filled slots (0..pool_size)
+    int*     d_poolSlotLocks;     // per-slot spinlocks [pool_size] (0=free, 1=held)
+    int*     d_poolAccessible;    // accessible window [0..pool_size]; starts at 10, +1 per insert
+    int*          d_poolStop;     // global no-improve counter; reset to 0 on new global best, +1 otherwise; stop when >= pool_size
+    unsigned int* d_globalBest;   // global best parsimony across all warps
 
     int K;  // number of trees
     int mxtips;

@@ -24,6 +24,8 @@
 | **Reseed** | **Reseed bad GPU slots từ threshold pool (hybrid_cb Step 3.5)** | **0/37 regressions, 14/37 improved, +14.5% time (N≈200)** |
 | **Dead code removal** | **Xóa timing fields, best_back_vf, numSearchIter, gpu_hc_iter** | **K1: 155→96 regs; GpuTopology −12.8 KB; API đơn giản hơn** |
 | **K' < K (Opt-LessK1)** | **Build K'=max(pool,0.2K) trees trong K1; K2 vẫn K blocks** | **−60% K1 time; +17–28% total speedup; GPU wins +13–25%** |
+| **Pool restart simplify** | **Lane-0 O(pool_size²) selection-sort, uint32_t bitmask** | **K2 regs 151→128; simpler code** |
+| **Opt-S: Per-slot locks** | **pool_lock→pool_slot_locks[pool_size]; thundering herd fix** | **Contention 1000→50 blocks/lock (pool=20)** |
 
 ---
 
@@ -86,6 +88,74 @@ Target: giảm K2 xuống ≤128 regs → Block Limit Reg = 16 → **25% occupan
 | buildPhase3Kernel | 4 | 148 | **151** (+2%) |
 
 → Full NCU report: `/tmp/ncu_both_reg.ncu-rep`, `/tmp/ncu_K600.ncu-rep`, `/tmp/ncu_K1000.ncu-rep`
+
+---
+
+---
+
+## Pool Restart Simplification (2026-05-18)
+
+**Vấn đề**: Scan block trong pool restart dùng warp-parallel k-th min (phức tạp, scattered lane work).
+
+**Fix**: Lane-0 chạy O(pool_size²) selection-sort với `uint32_t used` bitmask:
+- pool_size ≤ 32 → bitmask fits in 1 uint32_t
+- Setup block (bcast[3]=accessible, bcast[5]=order_idx) giữ nguyên
+- Scan block thay toàn bộ bằng lane-0 sequential sort
+
+**Effect**: K2 registers **151 → 128** (theo NCU); Block Limit Reg 12→16; Theor. Occ 18.75%→25%.
+(Thực tế Achieved Occ vẫn bị giới hạn bởi shared memory: 12.9 KB/block → 12 blocks/SM → 18.75%).
+
+**File**: `gpu/src/pars_build.cu` — pool restart scan block (~70 dòng).
+
+---
+
+## Opt-S: Per-slot Pool Spinlocks (2026-05-18)
+
+**Vấn đề**: 1 `pool_lock` int → 1000 blocks thundering herd khi cần copy pool slot (12.8 KB).
+
+**Fix**: `pool_slot_locks[pool_size]` — lock riêng cho mỗi slot trong pool:
+```cpp
+// Pool restart — lock slot đang đọc:
+while (atomicCAS(&pool_slot_locks[phys_slot], 0, 1) != 0) {}
+// ... copy 12.8 KB ...
+atomicExch(&pool_slot_locks[phys_slot], 0);
+
+// Pool insert — lock slot đang ghi:
+while (atomicCAS(&pool_slot_locks[worst_slot], 0, 1) != 0) {}
+// ... copy topology to pool ...
+atomicExch(&pool_slot_locks[sh.bcast[4]], 0);
+```
+
+**Tại sao an toàn**: Lock A (restart) và Lock B (insert) dùng đúng slot ID → không deadlock.
+Hai block cùng restart từ slot 3 vẫn contend 1 lock (pool_slot_locks[3]), nhưng xác suất thấp.
+
+**Memory delta**: +pool_size×4 bytes = +80 bytes (pool_size=20).
+
+**NCU** (worker=1000, N=295, A100, sau tất cả thay đổi):
+| Metric | Giá trị |
+|--------|---------|
+| K2 Regs | 128 |
+| Theor. Occ | 20.31% (shared-mem limited) |
+| Achieved Occ | 13.29% |
+| Waves/SM | 0.71 |
+| Compute% | 6.30% (GPU mostly stalling) |
+
+**Files**: `pars_tree.cuh`, `pars_tree.cu`, `pars_build.cu` (2 sites), `gpu_init_trees.cu`.
+
+---
+
+## Benchmark 4 configs (2026-05-18, numpars=200, pool=20, 115 datasets)
+
+CPU baseline: `cpu_d6` (sprdist=6, numpars=200), avg 56.70s, avg_score=29022.9.
+
+| Config | avg_time | avg_speedup | wins/115 | GPU≤CPU |
+|--------|----------|------------|---------|---------|
+| w400_d6_s3 | 12.13s | 2.97× | 52 | 106 |
+| w1000_d6_s2 | 15.88s | 2.27× | 50.5 | 102 |
+| **w400_d4_s3** | **9.68s** | **3.84×** | 48 | 98 |
+| w1000_d4_s2 | 10.51s | 3.63× | 49 | 97 |
+
+→ Full results: `output/compare_4configs.txt`; xlsx: `output/worker_*/results.xlsx`
 
 ---
 
@@ -321,8 +391,10 @@ Rectify vẫn được gọi ở iter 2+ (khi topology thực sự thay đổi s
 8. ~~Reseed~~ ✅ (Reseed bad slots từ threshold pool, 0 regressions / +14.5% time N≈200)
 9. ~~Dead code removal~~ ✅ (K1: 155→96 regs, GpuTopology −12.8 KB, API simplification)
 10. ~~K' < K (Opt-LessK1)~~ ✅ (**−60% K1 time; +17–28% total speedup; GPU wins +13–25%**)
-11. **Opt-N** (thread coarsening UNROLL=2 cho STATES=4): estimate +10-20% cho DNA datasets
-12. **K2 register reduction** (151→≤128 regs): Block Limit Reg 12→16, occupancy 18.75%→25%
+11. ~~Pool restart simplify~~ ✅ (K2 regs 151→128, simpler lane-0 selection-sort)
+12. ~~Opt-S: Per-slot pool locks~~ ✅ (thundering herd fix, pool_size=20 → ~50 blocks/lock)
+13. **Opt-N** (thread coarsening UNROLL=2 cho STATES=4): estimate +10-20% cho DNA datasets
+14. **gpuRandomNNIs parallelize** (31 lanes idle → all 32 active): estimate 10–20× NNI phase
 13. ~~Opt-O~~ — hủy: applyMove chiếm <0.1% thời gian, không đáng optimize
 14. ~~Opt-E~~ — hủy: không khả thi, redesign quá lớn
 

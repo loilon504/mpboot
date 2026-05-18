@@ -94,6 +94,108 @@ khi tất cả 32 lanes thuộc cùng một warp.
 
 ---
 
+## Opt-S — Per-slot pool spinlocks: giảm thundering herd contention
+
+**Ngày**: 2026-05-18
+**File liên quan**: `gpu/include/pars_tree.cuh`, `gpu/src/pars_tree.cu`, `gpu/src/pars_build.cu`, `gpu/src/gpu_init_trees.cu`
+
+### Vấn đề
+
+K2 kernel (`buildPhase3Kernel`) có K=1000 blocks (warps) cạnh tranh cùng một spinlock `pool_lock`
+để copy 12.8 KB `back_vf` từ pool vào topology riêng của mỗi block. Đây là **thundering herd**:
+tất cả K blocks busywait trên `atomicCAS(pool_lock, 0, 1)` cho đến khi block đang giữ lock nhả ra.
+
+Trong CUDA, busywait trên atomicCAS là vòng lặp kín — block không ngủ mà tiêu tốn SM cycles
+hoàn toàn. Với K=1000 và pool_size=20, trung bình 50 blocks cùng đợi 1 slot, nhưng trước đây
+tất cả 1000 blocks đều đợi 1 lock duy nhất.
+
+### Root cause
+
+```cpp
+// Trước (pool_lock global):
+if (lane == 0) {
+    while (atomicCAS(pool_lock, 0, 1) != 0) {}  // 999 warps spin ở đây
+}
+// ... copy 12.8 KB ...
+if (lane == 0) { atomicExch(pool_lock, 0); }
+```
+
+### Fix
+
+Thay 1 `pool_lock` int bằng `pool_slot_locks[pool_size]` — mỗi slot có lock riêng:
+
+```cpp
+// Sau (per-slot lock):
+if (lane == 0) {
+    while (atomicCAS(&pool_slot_locks[phys_slot], 0, 1) != 0) {}  // chỉ lock slot đang dùng
+}
+// ... copy 12.8 KB ...
+if (lane == 0) { atomicExch(&pool_slot_locks[phys_slot], 0); }
+```
+
+**Pool insert** cũng dùng `pool_slot_locks[worst_slot]` thay vì `pool_lock`.
+
+### Tại sao an toàn
+
+Lock A (pool restart, reads slot i) và Lock B (pool insert, writes slot j) chỉ conflict khi `i == j`
+(xác suất 1/pool_size ≈ 5%). Không có deadlock vì mỗi block giữ tối đa 1 lock tại một thời điểm.
+
+### Kết quả
+
+Contention giảm từ **K=1000 → K/pool_size ≈ 50 blocks per lock** (pool_size=20).
+Memory overhead: +80 bytes (20 × 4 bytes).
+
+### Bài học / Ghi chú cho khóa luận
+
+**Thundering herd** là anti-pattern phổ biến trong GPU concurrent programming. Khi nhiều threads
+cạnh tranh 1 shared resource, granularity của lock nên match granularity của resource:
+- 1 global resource → 1 global lock (quá coarse-grained khi K lớn)
+- N independent resources (pool slots) → N locks (fine-grained, scales với K)
+
+Tương tự như phân biệt `mutex` (global) vs `per-bucket lock` trong hash table implementations.
+
+---
+
+## Refactor #2 — Pool restart simplification (pool_size ≤ 32)
+
+**Ngày**: 2026-05-18
+**File liên quan**: `gpu/src/pars_build.cu`
+
+### Thay đổi
+
+Old: warp-parallel k-th min selection (complex scattered lane work, ~70 dòng)
+New: lane-0 O(pool_size²) selection-sort với `uint32_t used` bitmask (~20 dòng)
+
+```cpp
+// Lane-0 selection-sort: chọn rank order_idx trong accessible slots
+uint32_t used = 0;
+int found_slot = -1;
+for (int rank = 0; rank <= order_idx; rank++) {
+    unsigned int best = 0xFFFFFFFFu; int best_slot = -1;
+    for (int i = 0; i < accessible; i++) {
+        if ((used >> i) & 1u) continue;
+        if (pool_scores[i] < best) { best = pool_scores[i]; best_slot = i; }
+    }
+    used |= (1u << best_slot);
+    found_slot = best_slot;
+}
+```
+
+**Điều kiện đủ**: pool_size ≤ 32 → uint32_t bitmask đủ; O(pool_size²) ≤ 1024 ops → overhead nhỏ.
+
+### Effect on registers
+
+K2 regs: **151 → 128** sau khi simplify (warp-parallel code tạo nhiều temp registers hơn).
+Block Limit Reg: 12 → 16 blocks/SM. Nhưng Theor. Occ vẫn 20.31% vì shared memory bottleneck (12.9 KB/block).
+
+### Bài học
+
+Đôi khi giải pháp đơn giản (sequential lane-0) hiệu quả hơn giải pháp phức tạp (warp-parallel) khi:
+1. Input size nhỏ (pool_size ≤ 32 — không đủ để amortize warp overhead)
+2. Compiler tối ưu sequential code tốt hơn (ít live variables → ít registers)
+
+---
+
 ## Refactor #1 — Joined kernel: SPR vào buildParsimonyTreesKernel, chung BuildShared
 
 **Ngày**: 2026-05-07

@@ -52,6 +52,19 @@ void cpuToGpuTopology(
         out->xpars[vf] = p->xPars;
         // next_vf, nnxt_vf, number not stored — computed from arithmetic on download
     }
+
+    // Init nodep[] and canonical xpars so all K slots are ready before any kernel runs.
+    // Tips are fixed: nodep[num] = num-1. Inner nodes use face[2] as canonical face.
+    for (int num = 1; num <= N; num++)
+        out->nodep[num] = num - 1;
+    for (int num = N + 1; num <= 2 * N - 1; num++)
+    {
+        int face2 = nodepVf(num, N);
+        out->nodep[num]      = face2;
+        out->xpars[face2]     = 1;
+        out->xpars[face2 - 1] = 0;
+        out->xpars[face2 - 2] = 0;
+    }
 }
 
 // ─── gpuTopoToCpu ─────────────────────────────────────────────────────────────
@@ -116,6 +129,20 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     // Init pool scores to UINT_MAX (empty)
     CUDA_CHECK(cudaMemset(mem->d_poolScores, 0xFF, (size_t)pool_size * sizeof(unsigned int)));
 
+    // Fill counter + per-slot spinlocks + accessible window
+    CUDA_CHECK(cudaMalloc(&mem->d_poolFilled,     sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&mem->d_poolSlotLocks,  (size_t)pool_size * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&mem->d_poolAccessible, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&mem->d_poolStop,       sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&mem->d_globalBest,     sizeof(unsigned int)));
+    int h_zero = 0, h_acc = 10;
+    unsigned int h_inf = 0xFFFFFFFFu;
+    CUDA_CHECK(cudaMemcpy(mem->d_poolFilled,     &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(mem->d_poolSlotLocks,  0, (size_t)pool_size * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(mem->d_poolAccessible, &h_acc,  sizeof(int),          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(mem->d_poolStop,       &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(mem->d_globalBest,     &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
+
     CUDA_CHECK(cudaMemset(mem->d_parsVect,    0, parsVectBytes));
     CUDA_CHECK(cudaMemset(mem->d_parsScore,   0, parsScoreBytes));
     // Init all site weights to 1 (normal, unweighted mode)
@@ -165,6 +192,11 @@ void gpuParsimonyMemFree(
     {
         cudaFree(mem->d_poolBackVf);
     }
+    if (mem->d_poolFilled)     cudaFree(mem->d_poolFilled);
+    if (mem->d_poolSlotLocks)  cudaFree(mem->d_poolSlotLocks);
+    if (mem->d_poolAccessible) cudaFree(mem->d_poolAccessible);
+    if (mem->d_poolStop)       cudaFree(mem->d_poolStop);
+    if (mem->d_globalBest)     cudaFree(mem->d_globalBest);
     delete mem;
 }
 
