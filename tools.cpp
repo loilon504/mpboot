@@ -829,6 +829,7 @@ void parseArg(int argc, char *argv[], Params &params) {
 	params.gpu_stop = 6;
 	params.gpu_nni_strength   = 0.1f;
 	params.gpu_pool_size = 20;
+	params.gpu_k1_ratio = 1.0f;
 	params.gpu_device = 0;
 
 	if (params.nni5) {
@@ -2716,6 +2717,10 @@ void parseArg(int argc, char *argv[], Params &params) {
 			}
 			if (strcmp(argv[cnt], "-gpu_pool_size") == 0) {
 				params.gpu_pool_size = convert_int(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_k1_ratio") == 0) {
+				params.gpu_k1_ratio = (float)atof(argv[++cnt]);
 				continue;
 			}
 			if (strcmp(argv[cnt], "-gpu_device") == 0) {

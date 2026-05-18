@@ -126,6 +126,11 @@ int mpbootGpu(
     const int numNNI = (mxtips > 4) ? max(1, (int)(params.gpu_nni_strength * (mxtips - 3))) : 1;
     const int stopNoImprove = params.gpu_stop;
     const int pool_size = params.gpu_pool_size;
+    // K' trees built by K1; K2 still runs K blocks (all reseeded from pool by callback)
+    const float k1_ratio = params.gpu_k1_ratio;
+    const int k1_trees = (k1_ratio <= 0.0f || k1_ratio >= 1.0f)
+                         ? K
+                         : std::max(pool_size, (int)(K * k1_ratio));
 
     // ── Hybrid callbacks: Phase 1 (CPU builds during K1) + Phase 2 (CPU HC during K2) ─────
     AfterK1Callback hybrid_cb = nullptr;
@@ -182,19 +187,20 @@ int mpbootGpu(
             }
             CUDA_CHECK(cudaStreamSynchronize(cb_stream));  // K1 fully done
 
-            // Step 2: Download all K GPU postSprScores
-            const int Kc = cb_mem->K;
-            std::vector<unsigned int> gpu_scores(Kc);
+            // Step 2: Download K1 GPU postSprScores (only k1_trees slots are valid)
+            const int Kc_scores = k1_trees;  // K' slots written by K1
+            const int Kc_full   = cb_mem->K; // all K slots for reseed in Step 5
+            std::vector<unsigned int> gpu_scores(Kc_scores);
             CUDA_CHECK(cudaMemcpy(
-                gpu_scores.data(), cb_mem->d_postSprScores, (size_t)Kc * sizeof(unsigned int),
+                gpu_scores.data(), cb_mem->d_postSprScores, (size_t)Kc_scores * sizeof(unsigned int),
                 cudaMemcpyDeviceToHost
             ));
 
             // Step 3: Diversity selection — best pool_size trees with distinct topologies
             struct Candidate { unsigned int score; int idx; bool is_gpu; };
             std::vector<Candidate> candidates;
-            candidates.reserve(Kc + (int)cpu_trees.size());
-            for (int k = 0; k < Kc; k++)
+            candidates.reserve(Kc_scores + (int)cpu_trees.size());
+            for (int k = 0; k < Kc_scores; k++)
                 candidates.push_back({gpu_scores[k], k, true});
             for (int i = 0; i < (int)cpu_trees.size(); i++)
                 candidates.push_back({cpu_trees[i].score, i, false});
@@ -263,7 +269,7 @@ int mpbootGpu(
                 GpuTopology tmpl;
                 downloadTopology(cb_mem, 0, &tmpl, cb_stream);
                 cudaStreamSynchronize(cb_stream);
-                for (int k = 0; k < Kc; k++) {
+                for (int k = 0; k < Kc_full; k++) {
                     int slot = k % actual_pool;
                     const auto& bvf = pool_bvf[slot];
                     unsigned int ps = candidates[pool_ci[slot]].score;
@@ -498,7 +504,7 @@ int mpbootGpu(
         {
             gpuStepwiseBuildTrees(
                 mem, seeds.data(), params.sprDist, numNNI, stopNoImprove,
-                pool_size, stream, hybrid_cb, hybrid_cb2
+                pool_size, stream, hybrid_cb, hybrid_cb2, k1_trees
             );
         }
     );

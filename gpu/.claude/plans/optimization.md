@@ -22,26 +22,70 @@
 | Opt-Q2 | Lazy gpuNodeRectifierPars: skip first do-while iteration | **−13.0% avg** (10/10 datasets) |
 | **Opt-R** | **Restore best_back_vf trước mỗi Phase 3 perturbation** | **avg +60% speedup vs CPU, −38% ms/tree** |
 | **Reseed** | **Reseed bad GPU slots từ threshold pool (hybrid_cb Step 3.5)** | **0/37 regressions, 14/37 improved, +14.5% time (N≈200)** |
+| **Dead code removal** | **Xóa timing fields, best_back_vf, numSearchIter, gpu_hc_iter** | **K1: 155→96 regs; GpuTopology −12.8 KB; API đơn giản hơn** |
+| **K' < K (Opt-LessK1)** | **Build K'=max(pool,0.2K) trees trong K1; K2 vẫn K blocks** | **−60% K1 time; +17–28% total speedup; GPU wins +13–25%** |
 
 ---
 
-## Profiling Findings (2026-05-13)
+## K' < K: Giảm số cây K1 (Opt-LessK1, 2026-05-17)
 
-**Method**: ptxas compile-time analysis (`--ptxas-options=-v`)
+**Phát hiện quan trọng**: `hybrid_cb` (callback sau K1) đã reseed **toàn bộ K slots** từ pool
+(Step 5: `for (k=0; k<Kc_full; k++)` với `Kc_full = mem->K`). K2 đọc `needs_recompute=1` path
+— không dùng K1 topology trực tiếp. K1 trees chỉ cần đủ để populate pool (Step 3).
 
-| Kernel | STATES | Registers/thread | Spills |
-|--------|--------|-----------------|--------|
-| buildParsimonyTreesKernel | 32 | 173 | 0 |
-| buildParsimonyTreesKernel | 20 | 158 | 0 |
-| buildPhase3Kernel | 32 | 166 | 0 |
-| buildPhase3Kernel | 20 | 134 | 0 |
-| buildPhase3Kernel | 4 | 148 | 0 |
+**Tối ưu**: Build K'=max(pool_size, K×ratio) trees trong K1 thay vì K:
+- `k1_trees = max(30, (int)(K × gpu_k1_ratio))` với `gpu_k1_ratio=0.2` → K'=200 (K=999)
+- K1 launch: `dim3(k1_trees)` (thay vì `dim3(K)`)
+- Callback split: `Kc_scores = k1_trees` (Step 2/3), `Kc_full = K` (Step 5 không đổi)
+- K2 launch: `dim3(K)` không đổi
 
-**Occupancy**: `BuildShared = 28.4 KB` là bottleneck → **5 blocks/SM** (164 KB ÷ 28.4 KB) → **7.8% theoretical occupancy** (5/64 warps).  
-Register limit = 11–15 blocks/SM — NOT the bottleneck.  
-**Opt-M speedup đến từ ILP/loop unrolling, KHÔNG từ occupancy.**
+**Win-win**: K1 ngắn hơn → CPU builds ~50% more trees trong callback window → pool tốt hơn
+→ K2 cả nhanh hơn (16%) lẫn chất lượng cao hơn (GPU wins tăng 20–25%).
 
-→ Full analysis: [benchmark/profile_results_postOptM.md](../benchmark/profile_results_postOptM.md)
+**Benchmark** (K=999, pool=30, k1_ratio=0.2, 115 datasets per config, A100-SXM4-80GB):
+
+| Config (sprdist, stop) | K1 Δ | K2 Δ | Δtotal speedup | GPU wins (K'=K → K'=0.2K) |
+|------------------------|------|------|----------------|--------------------------|
+| d3, s10 | −59.7% | +15.6% | **+25.8%** (8.04×→10.11×) | 57→64 |
+| d4, s6  | −59.6% | +16.2% | **+22.5%** (6.70×→8.21×)  | 53→64 |
+| d4, s20 | −59.8% | +0.7%  | **+27.4%** (5.82×→7.41×)  | 52→65 |
+| d5, s6  | −59.4% | +15.2% | **+21.1%** (5.46×→6.61×)  | 48→58 |
+| d6, s6  | −58.8% | +18.5% | **+17.6%** (4.55×→5.35×)  | 45→61 |
+
+**Files**: `mpboot/tools.h` (gpu_k1_ratio field), `mpboot/tools.cpp` (default+parse),
+`gpu/include/pars_build.cuh` (k1_trees param), `gpu/src/pars_build.cu` (K1 dim3),
+`gpu/src/gpu_init_trees.cu` (compute k1_trees, Kc_scores/Kc_full split).
+
+→ Full logs: `output/hybrid_pool_{lessk1,n1000p30}d{3s10,4s6,4s20,5s6,6s6}/`
+
+---
+
+## Profiling Findings (2026-05-17 — sau dead code removal)
+
+**Method**: NCU `--set basic --launch-count 2` trên A100-SXM4-80GB, dna_M10434 (544 taxa), K=200
+
+| Kernel | Regs/thread | Block Limit Reg | Block Limit Smem | Theor. Occ | Achieved Occ (K=200/600/1000) |
+|--------|------------|-----------------|-----------------|-----------|-------------------------------|
+| K1 `buildParsimonyTreesKernel` | **96** (↓ từ 155) | 20 | 13 | **20.31%** | 2.83% / 7.98% / 13.20% |
+| K2 `buildPhase3Kernel` | **151** | **12** | 13 | **18.75%** | 2.34% / 5.64% / 9.22% |
+
+**Bottleneck K2**: 151 regs × 32 threads = 4832 regs/block; A100 có 65536 regs/SM → Block Limit Reg = 12 → 18.75% occupancy ceiling.  
+Target: giảm K2 xuống ≤128 regs → Block Limit Reg = 16 → **25% occupancy**.
+
+**Scaling với K** (K1 / K2):
+- Duration: K=200→7.31s/9.63s; K=600→10.80s/12.11s; K=1000→13.53s/14.03s  
+  (sublinear — GPU waves overlap tốt hơn khi K lớn)
+- Compute throughput K=1000: K1=9.39%, K2=4.71% — K2 stall nhiều hơn (divergence trong NNI/SPR loop)
+- K2 SM active/elapsed ratio thấp hơn K1 (~44% vs ~78%) → warps stall do divergent branch trong Phase 3
+
+**Profiling cũ** (2026-05-13, ptxas trước dead code removal):
+
+| Kernel | STATES | Regs/thread cũ | Regs/thread mới |
+|--------|--------|----------------|-----------------|
+| buildParsimonyTreesKernel | 4 | ~155 | **96** (−38%) |
+| buildPhase3Kernel | 4 | 148 | **151** (+2%) |
+
+→ Full NCU report: `/tmp/ncu_both_reg.ncu-rep`, `/tmp/ncu_K600.ncu-rep`, `/tmp/ncu_K1000.ncu-rep`
 
 ---
 
@@ -275,9 +319,12 @@ Rectify vẫn được gọi ở iter 2+ (khi topology thực sự thay đổi s
 6. ~~Opt-Q1+Q2~~ ✅ (Phase 3 micro-opts, −13% avg)
 7. ~~Opt-R~~ ✅ (Restore best_back_vf, **−38% ms/tree, +60% speedup vs CPU**)
 8. ~~Reseed~~ ✅ (Reseed bad slots từ threshold pool, 0 regressions / +14.5% time N≈200)
-9. **Opt-N** (thread coarsening UNROLL=2 cho STATES=4): estimate +10-20% cho DNA datasets
-9. ~~Opt-O~~ — hủy: applyMove chiếm <0.1% thời gian, không đáng optimize
-10. ~~Opt-E~~ — hủy: không khả thi, redesign quá lớn
+9. ~~Dead code removal~~ ✅ (K1: 155→96 regs, GpuTopology −12.8 KB, API simplification)
+10. ~~K' < K (Opt-LessK1)~~ ✅ (**−60% K1 time; +17–28% total speedup; GPU wins +13–25%**)
+11. **Opt-N** (thread coarsening UNROLL=2 cho STATES=4): estimate +10-20% cho DNA datasets
+12. **K2 register reduction** (151→≤128 regs): Block Limit Reg 12→16, occupancy 18.75%→25%
+13. ~~Opt-O~~ — hủy: applyMove chiếm <0.1% thời gian, không đáng optimize
+14. ~~Opt-E~~ — hủy: không khả thi, redesign quá lớn
 
 ---
 
@@ -306,10 +353,12 @@ Rectify vẫn được gọi ở iter 2+ (khi topology thực sự thay đổi s
 
 → Details: `/gpu/.claude/benchmark/phase3_variants_comparison.md`
 
-### Current Defaults (2026-05-15)
-- `gpu_hc_iter = 100` (was 30)
-- `gpu_stop = 6` (was 4)
+### Current Defaults (2026-05-17, updated post-LessK1)
+- `gpu_stop = 6` — **sweet spot** (benchmark 115 datasets: 4.55× total speedup K'=K, 5.35× với K'=0.2K)
 - `gpu_top_pct = 0.1`
+- `gpu_pool_size = 30`, `numpars = 1000`, `sprdist = 6` — recommended production config
+- `gpu_k1_ratio = 0.2` — **production default** (K'=max(30, 200)=200 với K=999); 1.0 = backward compat
+- `-gpu_hc_iter` đã bị xóa (2026-05-17); `gpu_stop` là stopping criterion duy nhất
 
 ### Output Formatting (2026-05-15)
 - Kernel times now in **seconds** (%.3f s) instead of ms

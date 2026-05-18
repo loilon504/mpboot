@@ -1693,6 +1693,7 @@ struct Params {
     int gpu_stop;           // early stopping: stop Phase 3 after this many consecutive no-improve iters (default 4)
     float gpu_nni_strength;   // Phase 3 NNI perturbation: numNNI = strength*(N-3), min 1; default=0.1
     int gpu_pool_size; // number of pool slots for population-based restarts (default 20)
+    float gpu_k1_ratio; // fraction of K trees built in K1; K'=max(pool,K*ratio) (default 1.0=all)
     int gpu_device;    // CUDA device ID to use (default 1)
 };
 

@@ -375,6 +375,130 @@ landscape parsimony có nhiều local optima tốt ở 6665; cần rất nhiều
 
 ---
 
+## Refactor #3 — Dead code removal: timing fields, best_back_vf, numSearchIter (2026-05-17)
+
+**Ngày**: 2026-05-17
+**Task**: Loại bỏ toàn bộ code không dùng sau khi kiến trúc 2-kernel (K1/K2) ổn định
+**File liên quan**: `pars_tree.cuh`, `pars_build.cu`, `pars_build.cuh`, `gpu_init_trees.cu`, `pars_tree.cu`, `tools.h`, `tools.cpp`
+
+### Thay đổi
+
+#### 1. Xóa timing fields khỏi `BuildSharedT`
+
+Các field đo thời gian fine-grained trong shared memory không còn cần thiết sau khi Phase 3 ổn định:
+```cpp
+// Đã xóa khỏi BuildSharedT:
+long long t_build, t_phase2, t_p3_nni_spr, t_p3_ratchet;
+int n_p3_even, n_p3_odd;
+```
+Các block `{ long long _t0 = clock64(); ...; sh.t_xxx += clock64() - _t0; }` trong Phase 1/2/3 cũng bị xóa.
+
+#### 2. Xóa dead Opt-C/sym fields khỏi `BuildSharedT`
+
+Ba field từ thời gian thử nghiệm Opt-C (stagnation detection) và Symmetric Adaptive variant, không còn dùng:
+```cpp
+// Đã xóa khỏi BuildSharedT:
+unsigned int last_odd_hash;
+int restore_on_next_odd;
+int sym_do_ratchet;
+```
+
+#### 3. Xóa `GpuTopology.best_back_vf[kMaxVFaces]`
+
+`best_back_vf` ban đầu lưu topology tốt nhất để restore ở đầu mỗi iteration (Opt-R).
+Sau khi kiến trúc chuyển sang 2-kernel (K1/K2), việc restore topology được thực hiện
+qua pool mechanism (`d_poolBackVf`) thay vì per-tree field. `best_back_vf` trở thành dead field.
+
+**Kết quả**: GpuTopology shrink thêm **12.8 KB** (kMaxVFaces=3196 × 4 bytes).
+
+Trong `hybrid_cb` của `gpu_init_trees.cu`, chuyển từ:
+```cpp
+bvf.assign(h_topo.best_back_vf, h_topo.best_back_vf + h_topo.num_vfaces);
+for (int vf = 0; vf < h_topo.num_vfaces; vf++)
+    h_topo.back_vf[vf] = h_topo.best_back_vf[vf];
+```
+sang:
+```cpp
+bvf.assign(h_topo.back_vf, h_topo.back_vf + h_topo.num_vfaces);
+```
+An toàn vì tại thời điểm hybrid_cb đọc topology (sau K1, trước K2), `back_vf == best_back_vf` (được set bằng nhau ở cuối Phase 2 của K1).
+
+#### 4. Xóa `numSearchIter` và `-gpu_hc_iter`
+
+`numSearchIter` là tham số giới hạn số vòng lặp tối đa của Phase 3 (safety cap). Sau khi `gpu_stop` (stopNoImprove) trở thành primary stopping criterion, `numSearchIter` chỉ còn là dead parameter.
+
+Xóa toàn bộ chuỗi: `tools.h` → `tools.cpp` → `gpu_init_trees.cu` → `gpuStepwiseBuildTrees` → `buildPhase3Kernel` → `runPhase3`.
+
+Vòng lặp Phase 3 thay đổi:
+```cpp
+// Trước:
+for (int outer = 0; outer < numSearchIter; outer++) { ... }
+
+// Sau:
+for (int outer = 0; ; outer++) { ... }   // chỉ dừng khi gpu_stop kích hoạt
+```
+
+**Lưu ý**: `gpu_stop > 0` là điều kiện bắt buộc để loop có thể thoát. Default = 6, CLI `-gpu_stop 0` sẽ gây infinite loop.
+
+### Kết quả NCU sau cleanup (A100-SXM4-80GB, K=200, dna_M10434 544 taxa)
+
+| Kernel | Regs/thread | Block Limit Reg | Theor. Occupancy | Ghi chú |
+|--------|------------|-----------------|-----------------|---------|
+| K1 `buildParsimonyTreesKernel` | **96** (↓ từ 155) | 20 | **20.31%** (↑ từ 18.75%) | Cải thiện rõ |
+| K2 `buildPhase3Kernel` | **151** | 12 | **18.75%** | Bottleneck: register |
+
+K2 vẫn là register-bound: 151 regs × 32 threads = 4832 regs/block; A100 có 65536 regs/SM → Block Limit = 12 blocks/SM → 18.75% occupancy.
+Target: giảm K2 xuống ≤128 regs → Block Limit tăng lên 16 → occupancy 25%.
+
+### Bài học / Ghi chú cho khóa luận
+
+Dead code tích lũy theo thời gian khi thuật toán thay đổi (Opt-C thử rồi bỏ, best_back_vf dùng khác đi, numSearchIter bị thay thế bởi gpu_stop). Việc dọn dẹp định kỳ:
+1. Giảm register pressure compiler: K1 từ 155 → 96 regs, chiếm block Limit Reg thấp hơn
+2. Giảm shared memory dùng: BuildSharedT bỏ 6 fields (timing + dead flags)
+3. Giảm GpuTopology size: bỏ best_back_vf (−12.8 KB per tree struct)
+4. API đơn giản hơn: `gpuStepwiseBuildTrees` mất 1 param; K2 kernel mất 1 param
+
+---
+
+## Kết quả thực nghiệm — Benchmark 115 datasets, numpars=1000, pool=30 (2026-05-17)
+
+**Ngày**: 2026-05-17
+**Hardware**: 5 × NVIDIA A100-SXM4-80GB (devices 1–5)
+**Config**: numpars=1000, sprdist=6, gpu_pool_size=30, seed=1, 115 datasets (N=50–767)
+**Baseline**: cpu_d6 (CPU chạy cùng dataset, seed=1)
+
+### Tổng hợp theo gpu_stop
+
+| gpu_stop | Mean spd | Median spd | Total spd | Total GPU time | GPU faster | CPU better score |
+|----------|----------|------------|-----------|---------------|------------|-----------------|
+| 4 | 2.70× | 2.42× | 4.36× | 1497s | 107/115 | 24/115 |
+| **6** | **2.77×** | 2.38× | **4.55×** | **1434s** | **111/115** | **21/115** |
+| 8 | 2.61× | 2.17× | 4.25× | 1534s | 107/115 | 22/115 |
+| 12 | 2.57× | 2.16× | 4.10× | 1590s | 107/115 | 24/115 |
+| 14 | 2.52× | 2.08× | 4.06× | 1605s | 105/115 | 22/115 |
+
+### Kết luận
+
+**gpu_stop=6 là sweet spot**: nhanh nhất (4.55× total, 1434s GPU total), ít dataset CPU thắng nhất (21/115), và GPU faster nhiều nhất (111/115).
+Pattern rõ ràng: tăng gpu_stop > 6 chậm hơn mà không cải thiện score.
+
+### Speedup theo taxa group (gpu_stop=6)
+
+| Taxa | Mean speedup |
+|------|-------------|
+| 0–99 | 1.59× |
+| 100–199 | 2.54× |
+| 200–299 | 2.78× |
+| 300–399 | 3.74× |
+| 400–499 | 4.42× |
+| 500–599 | 5.45× |
+| 600–699 | 10.75× |
+| 700–799 | 6.91× |
+
+GPU speedup tăng mạnh theo taxa (N). Dataset N<100 bị overhead-bound; N≥400 GPU rõ ràng chiếm ưu thế.
+
+---
+
 ## Kết quả thực nghiệm — CPU serial baseline (branch mpboot gốc, 2026-05-11)
 
 **Ngày**: 2026-05-11
@@ -1610,4 +1734,61 @@ uploadTopology(cb_mem, slot, &fill_topo, cb_stream);
 1. **Slot diversity vs quality**: Mỗi slot nhận cùng donor topology nhưng seed khác nhau → trajectories diverge trong K2, tạo diversity mà không cần extra memory.
 2. **`needs_recompute` flag**: Cho phép upload topology shell (chỉ `back_vf`) mà không cần upload toàn bộ parsVect (2.44 MB/slot). GPU recompute trong kernel → tiết kiệm bandwidth đáng kể.
 3. **Overhead asymmetry**: Reseed có giá trị nhất khi K2 budget lớn tương đối so với K1. Với N nhỏ (≈200), +14.5% là chấp nhận được. Với N lớn (≥700), cần cân nhắc giới hạn `gpu_stop` để kiểm soát overhead.
+
+---
+
+## Experiment — K' < K: Build fewer trees in K1 (Opt-LessK1, 2026-05-17)
+
+**Ngày**: 2026-05-17  
+**Task**: Giảm K1 build từ K xuống K'=max(pool_size, K×ratio) để tiết kiệm K1 time  
+**Files**: `mpboot/tools.h`, `mpboot/tools.cpp`, `gpu/include/pars_build.cuh`, `gpu/src/pars_build.cu`, `gpu/src/gpu_init_trees.cu`
+
+### Phát hiện chính
+
+`hybrid_cb` (callback sau K1) đã reseed **toàn bộ K slots** từ pool (Step 5: `for (k=0; k<Kc_full; k++)` với `Kc_full = mem->K`). K2 dùng `needs_recompute=1` path — **không đọc K1 topology trực tiếp**. K1 trees chỉ cần đủ để populate pool (Step 3). Vì vậy, build K−K' trees thêm trong K1 là lãng phí.
+
+### Thay đổi
+
+**CLI flag**: `-gpu_k1_ratio X` (default=1.0 = backward compat, production=0.2)
+
+```cpp
+// gpu_init_trees.cu — compute k1_trees
+const float k1_ratio = params.gpu_k1_ratio;
+const int k1_trees = (k1_ratio <= 0.0f || k1_ratio >= 1.0f)
+                     ? K : std::max(pool_size, (int)(K * k1_ratio));
+
+// hybrid_cb Step 2/3: chỉ download K' scores (valid K1 results)
+const int Kc_scores = k1_trees;   // K' slots written by K1
+const int Kc_full   = cb_mem->K;  // for Step 5: reseed ALL K (unchanged)
+
+// pars_build.cu K1 launch: dim3(k1_trees) thay vì dim3(K)
+buildParsimonyTreesKernel<S, NT><<<dim3(k1_trees), dim3(kWarpSize), 0, stream>>>(...);
+// K2 launch: unchanged dim3(K)
+```
+
+### Win-win effect
+
+K1 ngắn hơn → CPU builds ~50% more trees trong callback window → pool quality tốt hơn → K2 cả nhanh hơn (do better pool → less wasted iterations) lẫn chất lượng cao hơn (more diverse good candidates).
+
+### Kết quả benchmark (K=999, pool=30, k1_ratio=0.2, 115 datasets per config, A100-SXM4-80GB)
+
+| Config (sprdist, stop) | K1 Δ | K2 Δ | Δtotal speedup | GPU wins (K'=K → K'=0.2K) |
+|------------------------|------|------|----------------|--------------------------|
+| d3, s10 | −59.7% | +15.6% | **+25.8%** (8.04×→10.11×) | 57→64/115 |
+| d4, s6  | −59.6% | +16.2% | **+22.5%** (6.70×→8.21×)  | 53→64/115 |
+| d4, s20 | −59.8% | +0.7%  | **+27.4%** (5.82×→7.41×)  | 52→65/115 |
+| d5, s6  | −59.4% | +15.2% | **+21.1%** (5.46×→6.61×)  | 48→58/115 |
+| d6, s6  | −58.8% | +18.5% | **+17.6%** (4.55×→5.35×)  | 45→61/115 |
+
+→ Full logs: `output/hybrid_pool_{lessk1,n1000p30}d{3s10,4s6,4s20,5s6,6s6}/`
+
+### Bài học / Ghi chú cho khóa luận
+
+1. **Callback reseeds all K slots**: Insight quan trọng — K2 không phụ thuộc vào K1 topology trực tiếp. Điều này cho phép tách bạch hoàn toàn "số cây build trong K1" và "số blocks chạy trong K2", mỗi cái được tối ưu độc lập.
+
+2. **Win-win asymmetry**: Dự kiến ban đầu là quality sẽ giảm nhẹ (ít K1 candidates hơn). Thực tế: quality tăng trên TẤT CẢ 5 configs. Nguyên nhân là CPU builds nhiều trees hơn trong thời gian K1 ngắn hơn, bù đắp dư cho pool.
+
+3. **K1 time linear với K'**: Cả K'=200 và K=1000 đều fit trong 1 wave (A100 capacity ≈ 1404 blocks), nhưng K'=200 ít work per SM hơn → thực sự ~60% nhanh hơn (K'/K = 0.2 × factor). Lợi ích tối đa khi K' << wave capacity.
+
+4. **Kết hợp với Reseed**: Opt-LessK1 và Reseed (Step 3.5) hoạt động cùng nhau — Reseed cải thiện bad slots; LessK1 cho CPU thêm time để build candidates tốt hơn cho pool.
 

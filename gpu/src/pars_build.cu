@@ -1045,14 +1045,16 @@ void gpuStepwiseBuildTrees(
     int poolSize,
     cudaStream_t stream,
     AfterK1Callback after_k1,
-    AfterK2Callback after_k2
+    AfterK2Callback after_k2,
+    int k1_trees
 )
 {
     const int K = mem->K;
+    if (k1_trees <= 0 || k1_trees > K) k1_trees = K;
     long* d_seeds = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_seeds, (size_t)K * sizeof(long)));
+    CUDA_CHECK(cudaMalloc(&d_seeds, (size_t)k1_trees * sizeof(long)));
     CUDA_CHECK(
-        cudaMemcpyAsync(d_seeds, seeds, (size_t)K * sizeof(long), cudaMemcpyHostToDevice, stream)
+        cudaMemcpyAsync(d_seeds, seeds, (size_t)k1_trees * sizeof(long), cudaMemcpyHostToDevice, stream)
     );
     CUDA_CHECK(cudaMemsetAsync(
         mem->d_parsScore, 0, (size_t)K * mem->parsScorePerTree * sizeof(unsigned int), stream
@@ -1073,7 +1075,7 @@ void gpuStepwiseBuildTrees(
         printf("\n[GPU] --------------------------------------------\n");
             printf("[GPU]   buildTreesKernel<STATES=%d,NTAXA=%d>\n", S, NT);
             printf(
-                "[GPU]         K=%d  sprDist=%d  shared=%.1f KB\n", K, sprDist,
+                "[GPU]         K=%d  K1=%d  sprDist=%d  shared=%.1f KB\n", K, k1_trees, sprDist,
                 sharedBytes / 1024.0
             );
 
@@ -1082,7 +1084,7 @@ void gpuStepwiseBuildTrees(
             cudaEventCreate(&k1_start);
             cudaEventCreate(&k1_end);
             cudaEventRecord(k1_start, stream);
-            buildParsimonyTreesKernel<S, NT><<<dim3(K), dim3(kWarpSize), 0, stream>>>(
+            buildParsimonyTreesKernel<S, NT><<<dim3(k1_trees), dim3(kWarpSize), 0, stream>>>(
                 mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, d_seeds,
                 mem->width, sprDist, mem->d_postSprScores,
                 mem->parsVectPerTree, mem->parsScorePerTree

@@ -46,10 +46,11 @@ python3 ../output/summarize.py             # → output/results.xlsx
 | `-gpu_device N` | **1** | CUDA device ID sử dụng. `cudaSetDevice(N)` được gọi tại đầu `gpuInitCandidateTrees` |
 | `-numpars K` | 100 | Số cây parsimony ban đầu. GPU dùng **K−1 blocks** (tree index 1..K-1) |
 | `-sprdist N` | 6¹ | SPR radius dùng cho Phase 2 (initial SPR) và Phase 3 (NNI+SPR) |
-| `-gpu_hc_iter N` | **100** | Safety cap cho số vòng lặp tối đa của Phase 3. Primary stopping là `-gpu_stop` |
-| `-gpu_stop N` | **6** | Early stopping: dừng Phase 3 sau N iterations liên tiếp không cải thiện. **Primary stopping mechanism.** 0 = tắt |
+| `-gpu_stop N` | **6** | Stopping criterion duy nhất: dừng Phase 3 sau N iterations liên tiếp không cải thiện. **0 = infinite loop (tránh dùng).** |
 | `-gpu_nni_strength X` | **0.1** | Strength NNI perturbation trong Phase 3: `numNNI = X×(N−3)`, min=1. Even iterations của Phase 3 |
 | `-gpu_top_pct X` | **0.1** | Opt-G2 two-kernel: chỉ top X% cây (postSprParsimony thấp nhất) mới chạy Phase 3. ≤0 = tắt (single-kernel) |
+| `-gpu_pool_size N` | 20 | Số pool slots cho topology restart trong K2 (production: 30) |
+| `-gpu_k1_ratio X` | **1.0** | K'=max(pool_size, K×X) trees built in K1. 0 hoặc ≥1 = build tất cả K. Production: **0.2** |
 | `-seed N` | random | RNG seed cho tất cả K trees |
 
 ¹ Default thực tế phụ thuộc vào context; benchmark GPU thường dùng `-sprdist 3`.
@@ -63,8 +64,10 @@ python3 ../output/summarize.py             # → output/results.xlsx
 #### Recommended benchmark command
 ```bash
 ./mpboot-avx -s <dataset> -use_gpu -seed 1 \
-    -numpars 400 -sprdist 3
-# Defaults: gpu_device=1, gpu_hc_iter=100, gpu_stop=6, gpu_nni_strength=0.1, gpu_top_pct=0.1
+    -numpars 1000 -sprdist 6 -gpu_stop 6 -gpu_pool_size 30 -gpu_k1_ratio 0.2
+# Defaults: gpu_device=1, gpu_stop=6, gpu_nni_strength=0.1, gpu_top_pct=0.1
+# Sweet spot confirmed (115 datasets × 5 configs): k1_ratio=0.2 → 5.35× total speedup (vs 4.55× baseline)
+# -gpu_k1_ratio 1.0 (default) = K'=K (backward compat, same as not passing the flag)
 ```
 
 #### Thông tin kernel (in lúc chạy) — format mới 2026-05-15
@@ -135,6 +138,7 @@ Called from `IQTree::initCandidateTreesParsimony()` when `--use_gpu` is passed.
   - Tips: `nodep[num] = num - 1` (fixed).
   - Inner: DFS-encountered face; analogous to CPU `tr->nodep[num]`.
 - `back_vf[vf]` = the back-neighbor's vface (analogous to PLL's `p->back`).
+- **Note**: `best_back_vf` đã bị xóa (2026-05-17). Topology tốt nhất nay lưu trong pool (`d_poolBackVf` trong `GpuParsimonyMem`).
 
 **Inner node boundary rules** (easy to confuse):
 - By **vface**: inner if `vf >= N` (tips have `vf = 0..N-1`).
@@ -311,7 +315,7 @@ createTiAndEvaluateParsimony(pars_tree, score_tree, topo, sh, p, N, /*full=*/tru
 
 ---
 
-## 4. Current GPU Implementation Status (2026-05-12)
+## 4. Current GPU Implementation Status (2026-05-17)
 
 ### ✅ Fully working
 
@@ -427,15 +431,69 @@ Parsimony quality unchanged (2/10 differ by ±2 = stochasticity).
 
 **Insight**: Most trees converge well before `numSearchIter` (e.g. 10) iterations. Running extra iterations wastes compute when no improvement is found.
 
-**Fix**: Add `no_improve_count` counter in Phase 3 for-loop. At end of each iteration, if `sh.randomMP >= best_before` (no improvement vs start of this iteration) → increment; else reset. When `no_improve_count >= 2`: lane 0 sets `sh.bcast[0] = 1`, `__syncwarp()`, all lanes `break`.
-
-**Key invariant**: `topo->best_back_vf[]` is always saved on any improvement (line 910-913), so early-exit doesn't affect downloaded topology quality.
+**Fix**: Add `no_improve_count` counter in Phase 3 for-loop. At end of each iteration, if `sh.randomMP >= best_before` (no improvement vs start of this iteration) → increment; else reset. When `no_improve_count >= gpu_stop`: lane 0 sets `sh.bcast[0] = 1`, `__syncwarp()`, all lanes `break`.
 
 **Benchmark** (10 datasets, seed=1, numpars=200, gpu_hc_iter=10, sprdist=3):
 average **−32.4% ms/tree** across N=55..395. Range: −17% to −57%.
 Actual iterations used: 2–8 (vs 10 hardcoded). Quality: 9/10 same or better.
 
 **File**: `gpu/src/pars_build.cu` — Phase 3 for-loop (~10 lines added).
+
+### ✅ Dead code removal — Refactor #3 (2026-05-17)
+
+**Thay đổi**: Xóa toàn bộ code không dùng sau khi kiến trúc 2-kernel (K1/K2) ổn định:
+- `BuildSharedT`: xóa timing fields (`t_build`, `t_phase2`, `t_p3_nni_spr`, `t_p3_ratchet`, `n_p3_even`, `n_p3_odd`) + dead Opt-C/sym fields (`last_odd_hash`, `restore_on_next_odd`, `sym_do_ratchet`)
+- `GpuTopology`: xóa `best_back_vf[kMaxVFaces]` (−12.8 KB per struct)
+- `numSearchIter` bị xóa toàn bộ chuỗi từ CLI đến kernel. Phase 3 dùng `for(;;)` với `gpu_stop` là stopping criterion duy nhất
+- CLI flag `-gpu_hc_iter` bị xóa
+
+**Kết quả NCU** (K=200, dna_M10434 544 taxa, A100):
+| Kernel | Regs/thread | Block Limit Reg | Theor. Occupancy |
+|--------|------------|-----------------|-----------------|
+| K1 `buildParsimonyTreesKernel` | **96** (↓ từ 155) | 20 | **20.31%** |
+| K2 `buildPhase3Kernel` | **151** | 12 | 18.75% |
+
+K1 giảm mạnh 155→96 regs. K2 vẫn 151 regs (register-bound, Phase 3 có nhiều live variables hơn).
+
+### ✅ K' < K: Build fewer trees in K1 — Opt-LessK1 (2026-05-17)
+
+**Insight**: `hybrid_cb` (callback sau K1) đã reseed **toàn bộ K slots** từ pool (Step 5:
+`for (k=0; k<Kc_full; k++)` với `Kc_full = mem->K`). K2 dùng `needs_recompute=1` path —
+không đọc K1 topology trực tiếp. K1 trees chỉ được dùng để chọn vào pool (Step 3).
+
+**Fix**: Chỉ build K'=max(pool_size, K×ratio) trees trong K1:
+```cpp
+// gpu_init_trees.cu: compute k1_trees before hybrid_cb
+int k1_trees = (k1_ratio <= 0.0f || k1_ratio >= 1.0f)
+               ? K : std::max(pool_size, (int)(K * k1_ratio));
+
+// hybrid_cb Step 2/3: dùng Kc_scores = k1_trees (only valid K1 results)
+const int Kc_scores = k1_trees;
+const int Kc_full   = cb_mem->K;  // Step 5: reseed ALL K
+
+// pars_build.cu K1 launch: dim3(k1_trees) thay vì dim3(K)
+buildParsimonyTreesKernel<S, NT><<<dim3(k1_trees), dim3(kWarpSize), 0, stream>>>(...);
+// K2 launch unchanged: dim3(K)
+```
+
+**Win-win effect**: K1 ngắn hơn → CPU builds ~50% more trees trong callback window →
+pool quality tốt hơn → K2 vừa nhanh hơn vừa tìm được cây tốt hơn.
+
+**Benchmark** (K=1000, pool=30, k1_ratio=0.2, 115 datasets per config):
+
+| Config (sprdist, stop) | speedup K'=K | speedup K'=0.2K | Δtotal | K1 Δ | GPU wins |
+|------------------------|-------------|-----------------|--------|------|---------|
+| d3, s10 | 8.04× | **10.11×** | +25.8% | −59.7% | 57→64/115 |
+| d4, s6  | 6.70× | **8.21×**  | +22.5% | −59.6% | 53→64/115 |
+| d4, s20 | 5.82× | **7.41×**  | +27.4% | −59.8% | 52→65/115 |
+| d5, s6  | 5.46× | **6.61×**  | +21.1% | −59.4% | 48→58/115 |
+| d6, s6  | 4.55× | **5.35×**  | +17.6% | −58.8% | 45→61/115 |
+
+**Files**: `tools.h/cpp` (gpu_k1_ratio field+parse), `pars_build.cuh` (k1_trees param),
+`pars_build.cu` (K1 launch `dim3(k1_trees)`, seeds sized to k1_trees),
+`gpu_init_trees.cu` (k1_trees compute, Kc_scores/Kc_full split in hybrid_cb).
+
+---
 
 ### Fixed bugs (cumulative)
 
