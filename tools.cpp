@@ -826,10 +826,10 @@ void parseArg(int argc, char *argv[], Params &params) {
     params.write_local_optimal_trees = false;
 
 	params.use_gpu = false;
-	params.gpu_nni_strength   = 0.1f;
+	params.gpu_nni_strength   = 0.05f;
 	params.gpu_pool_size = 20;
-	params.gpu_pool_stop = 100;
-	params.gpu_worker = -1;
+	params.gpu_pool_stop = 3;
+	params.gpu_worker = 400;
 	params.gpu_device = 0;
 
 	if (params.nni5) {

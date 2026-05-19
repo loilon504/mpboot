@@ -1,9 +1,4 @@
-#include <algorithm>
-#include <climits>
-#include <cmath>
-#include <functional>
 #include <type_traits>
-#include <vector>
 
 #include "gpu/include/pars_build.cuh"
 #include "gpu/include/pars_tree.cuh"
@@ -573,22 +568,6 @@ __device__ void gpuRandomNNIs(
     __syncwarp();
 }
 
-// ─── Opt-C: warp-parallel topology fingerprint (used for sprdist=3 stagnation detection) ──
-__device__ __forceinline__ uint32_t computeTopoFingerprint(
-    const GpuTopology* __restrict__ topo, int lane
-)
-{
-    uint32_t h = 0u;
-    for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
-    {
-        h ^= (uint32_t)((vf + 1) * 2654435761u) ^ (uint32_t)((topo->back_vf[vf] + 2) * 2246822519u);
-    }
-    for (int offset = 16; offset > 0; offset >>= 1)
-    {
-        h ^= __shfl_xor_sync(0xffffffff, h, offset);
-    }
-    return h;
-}
 
 // ─── Phase 3 device helper (shared by buildParsimonyTreesKernel + buildPhase3Kernel) ──
 template <int STATES, typename SharedT>
@@ -609,7 +588,6 @@ __device__ void runPhase3(
     int* pool_back_vf,          // [pool_size * kMaxVFaces] topology per physical slot
     int* pool_filled,           // device ptr: number of filled slots (0..pool_size)
     int* pool_slot_locks,       // device ptr: per-slot spinlocks [pool_size]
-    int* pool_accessible,       // device ptr: accessible window; starts at 10, +1 per insert
     int* pool_stop,             // device ptr: no-improve counter; reset on new global best, +1 otherwise
     int  pool_stop_thresh,      // stop K2 when pool_stop >= this (from -gpu_pool_stop, default 100)
     unsigned int* global_best   // device ptr: global best parsimony across all warps
@@ -631,7 +609,7 @@ __device__ void runPhase3(
             if (lane == 0)
             {
                 int filled = *pool_filled;
-                int accessible = *pool_accessible;
+                int accessible = 10 + outer;
                 if (accessible > pool_size) accessible = pool_size;
                 if (accessible > filled)    accessible = filled;
                 sh.bcast[2] = -1;
@@ -835,7 +813,6 @@ __device__ void runPhase3(
                         {
                             atomicAdd(pool_filled, 1);  // grew pool
                         }
-                        atomicAdd(pool_accessible, 1);  // grow window by 1 (capped on read)
                         sh.bcast[4] = worst_slot;
                         // Acquire per-slot lock to protect back_vf copy from concurrent restart reads
                         while (atomicCAS(&pool_slot_locks[worst_slot], 0, 1) != 0)
@@ -1099,7 +1076,6 @@ __global__ void buildPhase3Kernel(
     int* pool_back_vf,          // [pool_size * kMaxVFaces] population pool topologies
     int* pool_filled,           // device ptr: number of filled slots
     int* pool_slot_locks,       // device ptr: per-slot spinlocks [pool_size]
-    int* pool_accessible,       // device ptr: accessible window; starts at 10, +1 per insert
     int* pool_stop,             // device ptr: no-improve counter
     int  pool_stop_thresh,      // stop when pool_stop >= this
     unsigned int* global_best   // device ptr: global best parsimony across all warps
@@ -1128,33 +1104,9 @@ __global__ void buildPhase3Kernel(
     }
     __syncwarp();
 
-    // Hybrid: CPU-uploaded tree has stale parsVect; nodep[] is pre-initialized by cpuToGpuTopology.
-    // Must: (1) recompute parsVect from topology, (2) set inner nodep[] in DFS order.
-    // if (topo->needs_recompute)
-    // {
-    //     // Step 1: recompute parsVect from the CPU tree's back_vf topology (full traversal)
-    //     unsigned int recomputed = createTiAndEvaluateParsimony<SharedT, STATES>(
-    //         pars_tree, score_tree, topo, sh, topo->start_vface, N, /*full=*/true, width
-    //     );
-
-    //     // Step 2: set inner nodep[] so Phase 3 SPR loop can iterate topo->nodep[i]
-    //     if (lane == 0) { gpuNodeRectifierPars(topo, sh, N); }
-    //     __syncwarp();
-    //     if (lane == 0)
-    //     {
-    //         sh.randomMP = recomputed;
-    //         sh.randomMPHits = 1;
-    //         sh.bestParsimony = recomputed;
-    //         topo->bestParsimony = recomputed;
-    //         topo->postSprParsimony = recomputed;
-    //         topo->needs_recompute = 0;
-    //     }
-    //     __syncwarp();
-    // }
-
     runPhase3<STATES>(
         pars_tree, score_tree, topo, sh, sw_k, N, sprDist, numNNI, lane, k, width,
-        pool_size, pool_scores, pool_back_vf, pool_filled, pool_slot_locks, pool_accessible,
+        pool_size, pool_scores, pool_back_vf, pool_filled, pool_slot_locks,
         pool_stop, pool_stop_thresh, global_best
     );
 }
@@ -1247,7 +1199,7 @@ void gpuStepwiseBuildTrees(
             mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, mem->width,
             sprDist, numNNI, mem->parsVectPerTree, mem->parsScorePerTree, poolSize,
             mem->d_poolScores, mem->d_poolBackVf, mem->d_poolFilled, mem->d_poolSlotLocks,
-            mem->d_poolAccessible, mem->d_poolStop, poolStopThresh, mem->d_globalBest
+            mem->d_poolStop, poolStopThresh, mem->d_globalBest
         );
         cudaEventRecord(k2_end, stream);
         CUDA_CHECK(cudaGetLastError());

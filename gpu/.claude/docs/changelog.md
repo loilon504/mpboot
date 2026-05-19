@@ -94,6 +94,48 @@ khi tất cả 32 lanes thuộc cùng một warp.
 
 ---
 
+## NCU Profiling — Shared memory bottleneck (2026-05-18)
+
+**Ngày**: 2026-05-18
+**File liên quan**: `/output/ncu/w400p20d6s3/` (6 `.ncu-rep` files)
+**Method**: `ncu --launch-count 2 --set default` trên 6 hard datasets (N=219–504), config w400p20d6s3 (gpu_worker=400, pool=20, sprdist=6, stop=3, numpars=200)
+
+### Kết quả đo
+
+| Kernel | Grid | Regs | Occ limit (regs) | Occ limit (smem) | Waves/SM | Theor. Occ% |
+|--------|------|------|-----------------|-----------------|----------|-------------|
+| K1 `buildParsimonyTreesKernel<4,800>` | 200 | 96 | 20/SM | **13/SM** | 0.14 | **20.31%** |
+| K2 `buildPhase3Kernel<4,800>` | 400 | 128 | 16/SM | **13/SM** | 0.28 | **20.31%** |
+
+Kết quả nhất quán cho tất cả 6 datasets (kernel template NTAXA=800 cố định).
+
+### Phân tích
+
+**Bottleneck là shared memory, không phải registers:**
+- `smem_static = 11.584 KB/block` → A100 cho tối đa 13 blocks/SM (≈ 167 KB / 12.672 KB allocated)
+- K2 regs=128: reg limit = 16/SM, nhưng smem stricter (13 < 16)
+- Cả K1 lẫn K2 đều bị giới hạn bởi smem → Theor. Occ = 13/64 = **20.31%**
+
+**GPU không saturated với w400:**
+- K2 waves/SM = 0.28: 400 blocks / (108 SMs × 13 blocks/SM) = **chưa đến 1 wave**
+- Để đạt ≥ 1 wave: cần ≥ 108 × 13 = **1,404 blocks** (gpu_worker ≈ 1400)
+- w400 lãng phí ~72% GPU capacity
+
+**NTAXA=800 template cố định** → smem được cấp cho worst-case dù N thực nhỏ hơn (219–504).
+Với GPU_NTAXA_TEMPLATE=ON (Opt-P L3), các dataset nhỏ dùng bucket NTAXA=256/128 → smem nhỏ hơn → nhiều blocks/SM hơn.
+
+### Gợi ý tối ưu tiếp theo
+
+- Cắt 1.3 KB shared memory → 14 blocks/SM (21.9% occ, +6%)
+- Dùng gpu_worker ≥ 1400 để đạt 1 wave đầy đủ (hiện w400 chỉ 28% GPU)
+- Bật `GPU_NTAXA_TEMPLATE=ON` cho production với dataset nhỏ
+
+### Bài học
+
+Profiling trên nhiều datasets khác nhau nhưng cùng template → kết quả giống hệt nhau. Điều này xác nhận rằng bottleneck là **cấu trúc dữ liệu** (smem cố định theo NTAXA template), không phải workload của dataset cụ thể.
+
+---
+
 ## Opt-S — Per-slot pool spinlocks: giảm thundering herd contention
 
 **Ngày**: 2026-05-18
@@ -156,7 +198,7 @@ Tương tự như phân biệt `mutex` (global) vs `per-bucket lock` trong hash 
 
 ---
 
-## Refactor #2 — Pool restart simplification (pool_size ≤ 32)
+## Refactor #2 — Pool restart simplification (pool_size ≤ 60)
 
 **Ngày**: 2026-05-18
 **File liên quan**: `gpu/src/pars_build.cu`
@@ -164,34 +206,37 @@ Tương tự như phân biệt `mutex` (global) vs `per-bucket lock` trong hash 
 ### Thay đổi
 
 Old: warp-parallel k-th min selection (complex scattered lane work, ~70 dòng)
-New: lane-0 O(pool_size²) selection-sort với `uint32_t used` bitmask (~20 dòng)
+New: lane-0 O(pool_size²) selection-sort với `unsigned long long used` bitmask (~20 dòng)
 
 ```cpp
 // Lane-0 selection-sort: chọn rank order_idx trong accessible slots
-uint32_t used = 0;
+unsigned long long used = 0;
 int found_slot = -1;
 for (int rank = 0; rank <= order_idx; rank++) {
     unsigned int best = 0xFFFFFFFFu; int best_slot = -1;
     for (int i = 0; i < accessible; i++) {
-        if ((used >> i) & 1u) continue;
+        if ((used >> i) & 1ULL) continue;
         if (pool_scores[i] < best) { best = pool_scores[i]; best_slot = i; }
     }
-    used |= (1u << best_slot);
+    used |= (1ULL << best_slot);
     found_slot = best_slot;
 }
 ```
 
-**Điều kiện đủ**: pool_size ≤ 32 → uint32_t bitmask đủ; O(pool_size²) ≤ 1024 ops → overhead nhỏ.
+**Điều kiện đủ**: pool_size ≤ 60 → `unsigned long long` (64-bit) bitmask đủ; O(pool_size²) ≤ 3600 ops → overhead nhỏ.  
+(Ban đầu dùng `uint32_t` chỉ hỗ trợ pool_size ≤ 32; đổi sang `unsigned long long` để hỗ trợ pool_size ≤ 60.)
+
+Đồng thời: `accessible = 10 + outer` (thay vì `*pool_accessible` atomic counter) — window tăng tuyến tính theo iteration outer, đơn giản hơn và không cần sync.
 
 ### Effect on registers
 
 K2 regs: **151 → 128** sau khi simplify (warp-parallel code tạo nhiều temp registers hơn).
-Block Limit Reg: 12 → 16 blocks/SM. Nhưng Theor. Occ vẫn 20.31% vì shared memory bottleneck (12.9 KB/block).
+Block Limit Reg: 12 → 16 blocks/SM. Nhưng Theor. Occ vẫn 20.31% vì shared memory bottleneck (11.584 KB/block).
 
 ### Bài học
 
 Đôi khi giải pháp đơn giản (sequential lane-0) hiệu quả hơn giải pháp phức tạp (warp-parallel) khi:
-1. Input size nhỏ (pool_size ≤ 32 — không đủ để amortize warp overhead)
+1. Input size nhỏ (pool_size ≤ 60 — không đủ để amortize warp overhead)
 2. Compiler tối ưu sequential code tốt hơn (ít live variables → ít registers)
 
 ---

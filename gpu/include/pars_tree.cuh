@@ -46,7 +46,6 @@ struct GpuTopology
     unsigned int preSprParsimony;   // parsimony after stepwise addition (before initial SPR)
     unsigned int postSprParsimony;  // parsimony after initial SPR (before hill-climbing)
     long savedSeed;                  // RNG state saved at end of Phase 2; restored by buildPhase3Kernel
-    int insert_vface;              // insertNode as vface (-1 = NULL)
     int start_vface;               // tr->start as vface
     int num_vfaces;                // = mxtips + 3*(mxtips-1)
 
@@ -62,10 +61,6 @@ struct GpuTopology
 
     // NOTE: number[], next_vf[], nnxt_vf[] removed — kernel uses pure arithmetic
     //   (vfToNum, vfNextFace, vfNnxtFace) and CPU-side p->number/p->next are stable after init.
-
-    // Hybrid CPU-GPU: set to 1 when a CPU-built tree is uploaded into this slot.
-    // buildPhase3Kernel recomputes parsVect from topology before running Phase 3.
-    int needs_recompute;
 };
 
 // ─── Parsimony memory for K trees ─────────────────────────────────────────────
@@ -91,7 +86,6 @@ struct GpuParsimonyMem
     int* d_poolBackVf;            // [pool_size][kMaxVFaces] topology snapshots
     int*     d_poolFilled;        // number of filled slots (0..pool_size)
     int*     d_poolSlotLocks;     // per-slot spinlocks [pool_size] (0=free, 1=held)
-    int*     d_poolAccessible;    // accessible window [0..pool_size]; starts at 10, +1 per insert
     int*          d_poolStop;     // global no-improve counter; reset to 0 on new global best, +1 otherwise; stop when >= pool_size
     unsigned int* d_globalBest;   // global best parsimony across all warps
 

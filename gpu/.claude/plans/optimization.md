@@ -24,7 +24,7 @@
 | **Reseed** | **Reseed bad GPU slots từ threshold pool (hybrid_cb Step 3.5)** | **0/37 regressions, 14/37 improved, +14.5% time (N≈200)** |
 | **Dead code removal** | **Xóa timing fields, best_back_vf, numSearchIter, gpu_hc_iter** | **K1: 155→96 regs; GpuTopology −12.8 KB; API đơn giản hơn** |
 | **K' < K (Opt-LessK1)** | **Build K'=max(pool,0.2K) trees trong K1; K2 vẫn K blocks** | **−60% K1 time; +17–28% total speedup; GPU wins +13–25%** |
-| **Pool restart simplify** | **Lane-0 O(pool_size²) selection-sort, uint32_t bitmask** | **K2 regs 151→128; simpler code** |
+| **Pool restart simplify** | **Lane-0 O(pool_size²) selection-sort, unsigned long long bitmask (pool_size ≤ 60); accessible=10+outer** | **K2 regs 151→128; simpler code** |
 | **Opt-S: Per-slot locks** | **pool_lock→pool_slot_locks[pool_size]; thundering herd fix** | **Contention 1000→50 blocks/lock (pool=20)** |
 
 ---
@@ -62,32 +62,41 @@
 
 ---
 
-## Profiling Findings (2026-05-17 — sau dead code removal)
+## Profiling Findings
 
-**Method**: NCU `--set basic --launch-count 2` trên A100-SXM4-80GB, dna_M10434 (544 taxa), K=200
+### NCU 2026-05-18 — w400p20d6s3, 6 hard datasets (N=219–504), A100
+
+**Method**: `ncu --launch-count 2 --set default` per dataset trên device 1–6
+→ Reports: `/output/ncu/w400p20d6s3/*.ncu-rep`
+
+| Kernel | Grid | Regs | Occ limit (regs) | Occ limit (smem) | Waves/SM | Theor. Occ% |
+|--------|------|------|-----------------|-----------------|----------|-------------|
+| K1 `buildParsimonyTreesKernel<4,800>` | 200 | **96** | 20/SM | **13/SM** | 0.14 | **20.31%** |
+| K2 `buildPhase3Kernel<4,800>` | 400 | **128** | 16/SM | **13/SM** | 0.28 | **20.31%** |
+
+**Key findings**:
+- Bottleneck là **shared memory** (11.584 KB/block → 13 blocks/SM), không phải registers
+- K2 reg limit = 16/SM sau pool restart simplify (regs 151→128), nhưng smem vẫn stricter
+- w400: waves/SM = 0.28 → **GPU chưa saturated**; cần ≥ 1404 blocks (gpu_worker ≥ 1400) cho 1 wave
+- NTAXA=800 template cố định → smem không phụ thuộc N thực → kết quả giống hệt nhau trên tất cả datasets
+- Để tăng lên 14 blocks/SM (21.9% occ): cần cắt ~1.3 KB shared memory (11.584 → ≤10.25 KB)
+
+### NCU 2026-05-17 — sau dead code removal, K=200, dna_M10434 (544 taxa)
+
+**Method**: NCU `--set basic --launch-count 2` trên A100-SXM4-80GB
 
 | Kernel | Regs/thread | Block Limit Reg | Block Limit Smem | Theor. Occ | Achieved Occ (K=200/600/1000) |
 |--------|------------|-----------------|-----------------|-----------|-------------------------------|
 | K1 `buildParsimonyTreesKernel` | **96** (↓ từ 155) | 20 | 13 | **20.31%** | 2.83% / 7.98% / 13.20% |
-| K2 `buildPhase3Kernel` | **151** | **12** | 13 | **18.75%** | 2.34% / 5.64% / 9.22% |
+| K2 `buildPhase3Kernel` | **151** → **128**¹ | 12 → **16**¹ | 13 | 18.75% → **20.31%**¹ | 2.34% / 5.64% / 9.22% |
 
-**Bottleneck K2**: 151 regs × 32 threads = 4832 regs/block; A100 có 65536 regs/SM → Block Limit Reg = 12 → 18.75% occupancy ceiling.  
-Target: giảm K2 xuống ≤128 regs → Block Limit Reg = 16 → **25% occupancy**.
+¹ Sau pool restart simplification (2026-05-18)
 
 **Scaling với K** (K1 / K2):
-- Duration: K=200→7.31s/9.63s; K=600→10.80s/12.11s; K=1000→13.53s/14.03s  
-  (sublinear — GPU waves overlap tốt hơn khi K lớn)
+- Duration: K=200→7.31s/9.63s; K=600→10.80s/12.11s; K=1000→13.53s/14.03s (sublinear — waves overlap)
 - Compute throughput K=1000: K1=9.39%, K2=4.71% — K2 stall nhiều hơn (divergence trong NNI/SPR loop)
-- K2 SM active/elapsed ratio thấp hơn K1 (~44% vs ~78%) → warps stall do divergent branch trong Phase 3
 
-**Profiling cũ** (2026-05-13, ptxas trước dead code removal):
-
-| Kernel | STATES | Regs/thread cũ | Regs/thread mới |
-|--------|--------|----------------|-----------------|
-| buildParsimonyTreesKernel | 4 | ~155 | **96** (−38%) |
-| buildPhase3Kernel | 4 | 148 | **151** (+2%) |
-
-→ Full NCU report: `/tmp/ncu_both_reg.ncu-rep`, `/tmp/ncu_K600.ncu-rep`, `/tmp/ncu_K1000.ncu-rep`
+→ Full NCU reports: `/tmp/ncu_both_reg.ncu-rep`, `/tmp/ncu_K600.ncu-rep`, `/tmp/ncu_K1000.ncu-rep`
 
 ---
 
@@ -97,15 +106,18 @@ Target: giảm K2 xuống ≤128 regs → Block Limit Reg = 16 → **25% occupan
 
 **Vấn đề**: Scan block trong pool restart dùng warp-parallel k-th min (phức tạp, scattered lane work).
 
-**Fix**: Lane-0 chạy O(pool_size²) selection-sort với `uint32_t used` bitmask:
-- pool_size ≤ 32 → bitmask fits in 1 uint32_t
+**Fix**: Lane-0 chạy O(pool_size²) selection-sort với `unsigned long long used` bitmask:
+- pool_size ≤ 60 → bitmask fits in 1 `unsigned long long` (64-bit); dùng `1ULL <<`
+- (Ban đầu `uint32_t` chỉ hỗ trợ ≤ 32; đổi sang `unsigned long long` để hỗ trợ ≤ 60)
 - Setup block (bcast[3]=accessible, bcast[5]=order_idx) giữ nguyên
 - Scan block thay toàn bộ bằng lane-0 sequential sort
 
-**Effect**: K2 registers **151 → 128** (theo NCU); Block Limit Reg 12→16; Theor. Occ 18.75%→25%.
-(Thực tế Achieved Occ vẫn bị giới hạn bởi shared memory: 12.9 KB/block → 12 blocks/SM → 18.75%).
+**accessible = 10 + outer** (thay `*pool_accessible`): window tăng tuyến tính theo iteration, không cần atomic counter sync. Tất cả warps đều thực thi cùng nhau → không cần phân tán window.
 
-**File**: `gpu/src/pars_build.cu` — pool restart scan block (~70 dòng).
+**Effect**: K2 registers **151 → 128** (theo NCU); Block Limit Reg 12→16.
+Theor. Occ vẫn **20.31%** vì shared memory là bottleneck (11.584 KB/block → 13 blocks/SM < 16).
+
+**File**: `gpu/src/pars_build.cu` — pool restart scan block.
 
 ---
 
@@ -247,112 +259,6 @@ for (int b = lane; b < width; b += kWarpSize * 2) {
 
 ---
 
-#### Opt-O: Incremental parsimony update sau SPR move
-
-**Vấn đề hiện tại**:
-
-Sau `applyMove(rm, ins)`, code gọi `createTiAndNewviewParsimony(rm, ...)` — đây là DFS từ `rm`
-đi qua tất cả descendants với `xpars=0`. Với xPars system, chỉ một số ít node thực sự stale,
-nhưng cây sau NNI perturbation (odd iter) hoặc nhiều applyMove liên tiếp có nhiều node stale.
-
-**Ý tưởng — Incremental path update**:
-
-Sau SPR move (rm, ins), chỉ node `rm` và các ancestors của `rm` đến root bị stale.
-Path lên root có độ dài O(depth) ≈ O(log N) cho balanced tree, tệ nhất O(N) cho caterpillar.
-
-```
-Trước move:
-    A --- B --- C --- rm --- D
-                      |
-                     tip_p
-
-Sau applyMove(rm, ins):
-    A --- B --- C --- (trống)    rm re-inserted tại ins
-                \
-                 D (kết nối trực tiếp với C)
-```
-
-Path bị ảnh hưởng: chỉ `rm` và path từ nơi rm được chèn vào lên đến tổ tiên chung.
-
-**Phân tích độ khó**:
-
-GPU không có con trỏ parent → cần DFS ngược. Với `ti[]` được tạo bởi
-`computeTraversalInfoParsimony`, thứ tự là bottom-up (post-order). Incremental update cần biết
-ancestor path → **cần lưu thêm parent[] array** hoặc traverse lại.
-
-**Option A** (simpler): Sau applyMove, chỉ mark `xpars[rm]=0` và tất cả ancestors dọc đường
-lên `start_vface`. Walk up: bắt đầu từ `back_vf[rm]` (parent of rm sau move), tiếp tục theo
-`back_vf` của từng face đến khi reach `start_vface`. Mark tất cả stale. Cost: O(depth) marks,
-sau đó `computeTraversalInfoParsimony` lazy-refresh đúng những gì cần.
-
-**Option B** (aggressive): Tính lại parsVect và score_tree NGAY trên path từ rm lên root, không
-cần `computeTraversalInfoParsimony`. Tiết kiệm DFS overhead nhưng phức tạp hơn.
-
-**Tác động thực tế**:
-- Sau testInsert (undo-based): KHÔNG cần incremental — undo restore topology, xpars được
-  quản lý trong pre-refresh block. Opt-O chỉ liên quan đến `applyMove` (khi tìm được move tốt).
-- `applyMove` chỉ gọi khi `sh.bestParsimony < sh.randomMP` → ít lần/iteration
-- Timing data: `apply=0.05%` của SPR search time → **Opt-O không đáng để optimize**
-
-**Kết luận**: Opt-O không nên implement. `applyMove` chiếm <0.1% thời gian, lợi ích gần như zero.
-Đề xuất: **hủy Opt-O**.
-
----
-
-### 🔴 Phức tạp, rủi ro cao
-
-#### Opt-J: parsVect caching vào shared memory *(bị bác)*
-Giảm occupancy, phức tạp, rủi ro chưa rõ benefit vượt chi phí.
-
----
-
-## Opt-R: Restore best_back_vf trước mỗi Phase 3 perturbation (2026-05-14)
-
-**Phát hiện**: Iteration i bắt đầu từ end-state của iteration i-1 (có thể tệ hơn best), gây "topology drift". Fix: warp-parallel copy `best_back_vf → back_vf` đầu mỗi even (NNI) VÀ odd (Ratchet) iteration.
-
-```cpp
-for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
-    topo->back_vf[vf] = topo->best_back_vf[vf];
-__syncwarp();
-```
-
-**Kết quả** (10 datasets, −gpu_top_pct -1):
-- Avg speedup vs baseline: **−38.0%** ms/tree (tất cả 10 datasets cải thiện)
-- Ratchet improvement rate: 35% → 52% (N=295), 52% → 70% (N=699)
-
-**File**: `gpu/src/pars_build.cu` — `runPhase3`
-
----
-
-## GPU vs CPU Benchmark tổng hợp — gpu_final_800 (2026-05-14)
-
-**Config**: numpars=400, sprdist=3, gpu_stop=4, gpu_top_pct=0.1, seed=1, 115 datasets  
-**Includes**: Tất cả optimizations (Opt-P, Opt-M, Opt-Q1+Q2, Opt-R)  
-→ Full results: `output/gpu_final_800/`
-
-| Metric | gpu_np400 (trước Opt-R) | gpu_final_800 (Opt-R) |
-|--------|------------------------|----------------------|
-| Avg speedup vs CPU | 2.28× | **3.66×** |
-| Max speedup | 6.69× | **12.88×** |
-| N≥400: speedup | 3.5–6.7× | **5–10×** |
-| GPU quality better | 33/115 (29%) | **40/115 (35%)** |
-| GPU worse quality | 25/115 (22%) | **20/115 (17%)** |
-| Avg Δparsimony (GPU−CPU) | −0.13 | **−0.22** |
-
-## GPU vs CPU Benchmark tổng hợp — gpu_np400 (2026-05-13, trước Opt-R)
-
-**Config**: numpars=400, sprdist=3, gpu_stop=4, seed=1, 115 datasets (N=50–767)  
-→ Full results: [benchmark/gpu_vs_cpu_np400_115datasets.md](../benchmark/gpu_vs_cpu_np400_115datasets.md)
-
-| Metric | Value |
-|--------|-------|
-| Avg speedup vs CPU | **2.28×** |
-| N≥400: speedup | **3.5–6.7×** |
-| N≤60: speedup | 0.7–1.3× (overhead dominant) |
-| GPU quality better | 33/115 (29%) |
-| Same quality | 57/115 (50%) |
-| Avg Δparsimony | **−0.13** (GPU nhỉnh hơn) |
-
 ## Phase 3 Effectiveness Analysis (2026-05-13)
 
 10 datasets, numpars=200, gpu_stop=4:
@@ -402,29 +308,6 @@ Rectify vẫn được gọi ở iter 2+ (khi topology thực sự thay đổi s
 
 ## Phase 3 Algorithm Experiments (2026-05-14 → 2026-05-15)
 
-### Strategy 0: Remove hot-loop timing fields
-- Removed fine-grained timing vars from `BuildSharedT` (t_line2291, t_search, etc.)
-- Result: 148 → **136 regs** → 15 blocks/SM (was 13)
-- **File**: `gpu/include/pars_tree.cuh`, `gpu/src/pars_build.cu`
-
-### Phase 3 Variants Explored
-
-| Variant | Description | Result |
-|---------|-------------|--------|
-| Opt-C | Stagnation detection: hash post-Ratchet topology, conditional restore | **Best for sprdist=3** |
-| Symmetric Adaptive | NNI/Ratchet switching with restore-on-switch | Best for sprdist≥4 |
-| Combined v2 | Opt-C@sprdist=3, Symmetric@sprdist>3 (runtime switch) | **CURRENT DEFAULT** |
-
-### Combined v2 Benchmark (115 datasets, seed=1, numpars=400, top_pct=0.1)
-
-| Config | Wor | AvgΔ | Total | Tot spd |
-|--------|-----|------|-------|---------|
-| d3 s4 p0.1 (Opt-C auto) | 16 | +0.27 | ~21m | 5.20× |
-| d5 s6 p0.1 (Sym auto) | **2** | +3.64 | 37m | 2.93× |
-| d6 s4 p0.1 (Sym auto) | 5 | +3.88 | 39m | 2.78× |
-
-→ Details: `/gpu/.claude/benchmark/phase3_variants_comparison.md`
-
 ### Current Defaults (2026-05-17, updated post-LessK1)
 - `gpu_stop = 6` — **sweet spot** (benchmark 115 datasets: 4.55× total speedup K'=K, 5.35× với K'=0.2K)
 - `gpu_top_pct = 0.1`
@@ -448,26 +331,3 @@ Rectify vẫn được gọi ở iter 2+ (khi topology thực sự thay đổi s
 **Bug fixes trong quá trình implement**:
 - Bug #10: ODR violation `sizeof(SearchInfo)` khác nhau giữa CXX TU (clang++) và CUDA TU (gcc) → fix bằng `#if __cplusplus >= 201103L` trong `tools.h`
 - Bug #11: `hybrid_cb2` 5 crash độc lập do PLL state conflict + unsafe function calls → fix bằng loại bỏ toàn bộ PLL parsimony, dùng `PhyloTree::computeParsimony()` only
-
----
-
-## Hybrid Benchmark — hybrid4 (2026-05-16)
-
-**Setup**: 20 datasets (N=50–640, 7 protein + 13 DNA), seed=1, 5 configs × run trên device 1–5 (A100).
-
-| Config | numpars | sprdist | gpu_stop | Mean speedup | Quality vs CPU |
-|--------|---------|---------|----------|-------------|----------------|
-| n200d3s4 | 200 | 3 | 4 | **3.62×** | 8↑ / 10= / 2↓ |
-| n200d4s6 | 200 | 4 | 6 | 2.64× | **12↑ / 7= / 1↓** |
-| n200d5s6 | 200 | 5 | 6 | 2.12× | **12↑ / 7= / 1↓** |
-| n400d4s6 | 400 | 4 | 6 | 1.99× | **12↑ / 7= / 1↓** |
-| n400d5s6 | 400 | 5 | 6 | 1.66× | **12↑ / 7= / 1↓** |
-
-**Insights**:
-- **Sweet spot**: `n200d4s6` — 2.64× speedup, 95% win/tie vs CPU. sprdist=5 cho cùng quality nhưng chậm hơn 25%.
-- **Speed vs quality**: `n200d3s4` nhanh nhất (3.62×) nhưng chỉ 73% win/tie — sprdist=3 không đủ cho N>300.
-- **n400 không worth it**: 2× trees nhưng quality tăng ≤2 điểm, mất 40–50% tốc độ.
-- **Timing regression nhỏ vs hybrid3**: [7] loop mới thêm K lần `computeParsimony` — overhead ~20% cho N≤100, không đáng kể cho N≥200. Trade-off chấp nhận được vì đổi lấy tính đúng đắn.
-- **dna_M7964 (N=640)**: GPU thua CPU ở d3s4 (~20 điểm), cần sprdist≥4. n400d5s6 xấp xỉ bằng CPU.
-
-→ Full logs: `output/hybrid4_{n200d3s4,n200d4s6,n200d5s6,n400d4s6,n400d5s6}/`

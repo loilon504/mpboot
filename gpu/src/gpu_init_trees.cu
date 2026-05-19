@@ -181,7 +181,6 @@ int mpbootGpu(
                 ct.topo.postSprParsimony = score;
                 ct.topo.bestParsimony = score;
                 ct.topo.savedSeed = params.ran_seed + (long)cpu_trees.size() * 31337L;
-                ct.topo.needs_recompute = 1;
                 cpu_trees.push_back(ct);
 
             }
@@ -264,15 +263,14 @@ int mpbootGpu(
                 printf("\n");
             }
 
-            // Step 4b: Init fill counter + per-slot spinlocks + accessible window
+            // Step 4b: Init fill counter + per-slot spinlocks
             {
-                int h_filled = actual_pool, h_acc = 10, h_stop = 0;
+                int h_filled = actual_pool, h_stop = 0;
                 unsigned int h_inf = 0xFFFFFFFFu;
-                CUDA_CHECK(cudaMemcpy(cb_mem->d_poolFilled,     &h_filled, sizeof(int),          cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemset(cb_mem->d_poolSlotLocks,  0, (size_t)cb_mem->pool_size * sizeof(int)));
-                CUDA_CHECK(cudaMemcpy(cb_mem->d_poolAccessible, &h_acc,    sizeof(int),          cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(cb_mem->d_poolStop,       &h_stop,   sizeof(int),          cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy(cb_mem->d_globalBest,     &h_inf,    sizeof(unsigned int), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(cb_mem->d_poolFilled,    &h_filled, sizeof(int),          cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemset(cb_mem->d_poolSlotLocks, 0, (size_t)cb_mem->pool_size * sizeof(int)));
+                CUDA_CHECK(cudaMemcpy(cb_mem->d_poolStop,      &h_stop,   sizeof(int),          cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(cb_mem->d_globalBest,    &h_inf,    sizeof(unsigned int), cudaMemcpyHostToDevice));
             }
 
             // Step 5: Reseed ALL K GPU slots from pool (round-robin)
@@ -290,7 +288,6 @@ int mpbootGpu(
                     h_topo.bestParsimony    = ps;
                     h_topo.preSprParsimony  = ps;
                     h_topo.savedSeed        = params.ran_seed + (long)k * 31337L;
-                    h_topo.needs_recompute  = 1;
                     h_topo.n_improved_even  = h_topo.n_improved_odd = 0;
                     h_topo.n_total_even     = h_topo.n_total_odd    = 0;
                     uploadTopology(cb_mem, k, &h_topo, cb_stream);

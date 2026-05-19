@@ -1,6 +1,5 @@
 #include <cassert>
 #include <cstring>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -38,11 +37,9 @@ void cpuToGpuTopology(
     out->nextnode = tr->nextnode;
     out->bestParsimony = tr->bestParsimony;
     out->start_vface = vface_of(tr, tr->start);
-    out->insert_vface = vface_of(tr, tr->insertNode);
     out->num_vfaces = num_vf;
     out->n_improved_even  = out->n_improved_odd = 0;
     out->n_total_even     = out->n_total_odd    = 0;
-    out->needs_recompute  = 0;
 
     const nodeptr base = tr->nodeBaseAddress;
     for (int vf = 0; vf < num_vf; ++vf)
@@ -88,7 +85,7 @@ void gpuTopoToCpu(
     tr->nextnode = in->nextnode;
     tr->bestParsimony = in->bestParsimony;
     tr->start = (in->start_vface >= 0) ? (base + in->start_vface) : nullptr;
-    tr->insertNode = (in->insert_vface >= 0) ? (base + in->insert_vface) : nullptr;
+    tr->insertNode = nullptr;
 }
 
 // ─── gpuParsimonyMemAlloc ─────────────────────────────────────────────────────
@@ -129,19 +126,17 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     // Init pool scores to UINT_MAX (empty)
     CUDA_CHECK(cudaMemset(mem->d_poolScores, 0xFF, (size_t)pool_size * sizeof(unsigned int)));
 
-    // Fill counter + per-slot spinlocks + accessible window
-    CUDA_CHECK(cudaMalloc(&mem->d_poolFilled,     sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&mem->d_poolSlotLocks,  (size_t)pool_size * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&mem->d_poolAccessible, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&mem->d_poolStop,       sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&mem->d_globalBest,     sizeof(unsigned int)));
-    int h_zero = 0, h_acc = 10;
+    // Fill counter + per-slot spinlocks
+    CUDA_CHECK(cudaMalloc(&mem->d_poolFilled,    sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&mem->d_poolSlotLocks, (size_t)pool_size * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&mem->d_poolStop,      sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&mem->d_globalBest,    sizeof(unsigned int)));
+    int h_zero = 0;
     unsigned int h_inf = 0xFFFFFFFFu;
-    CUDA_CHECK(cudaMemcpy(mem->d_poolFilled,     &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(mem->d_poolSlotLocks,  0, (size_t)pool_size * sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(mem->d_poolAccessible, &h_acc,  sizeof(int),          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(mem->d_poolStop,       &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(mem->d_globalBest,     &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(mem->d_poolFilled,  &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(mem->d_poolSlotLocks, 0, (size_t)pool_size * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(mem->d_poolStop,    &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(mem->d_globalBest,  &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
 
     CUDA_CHECK(cudaMemset(mem->d_parsVect,    0, parsVectBytes));
     CUDA_CHECK(cudaMemset(mem->d_parsScore,   0, parsScoreBytes));
@@ -194,7 +189,6 @@ void gpuParsimonyMemFree(
     }
     if (mem->d_poolFilled)     cudaFree(mem->d_poolFilled);
     if (mem->d_poolSlotLocks)  cudaFree(mem->d_poolSlotLocks);
-    if (mem->d_poolAccessible) cudaFree(mem->d_poolAccessible);
     if (mem->d_poolStop)       cudaFree(mem->d_poolStop);
     if (mem->d_globalBest)     cudaFree(mem->d_globalBest);
     delete mem;

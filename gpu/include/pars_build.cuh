@@ -7,7 +7,6 @@ namespace mpbootgpu
 {
 
 // CPU-built tree data for hybrid mode: topology pre-converted to GPU format.
-// needs_recompute is set to 1 so buildPhase3Kernel re-evaluates parsVect.
 struct CpuTreeData
 {
     GpuTopology  topo;

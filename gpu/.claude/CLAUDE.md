@@ -43,13 +43,15 @@ python3 ../output/summarize.py             # → output/results.xlsx
 | Flag | Default | Ý nghĩa |
 |------|---------|---------|
 | `-use_gpu` | off | Bật GPU mode — gọi `gpuInitCandidateTrees()` thay vì CPU stepwise |
-| `-gpu_device N` | **1** | CUDA device ID sử dụng. `cudaSetDevice(N)` được gọi tại đầu `gpuInitCandidateTrees` |
+| `-gpu_device N` | **0** | CUDA device ID sử dụng. `cudaSetDevice(N)` được gọi tại đầu `gpuInitCandidateTrees` |
 | `-numpars K` | 100 | Số cây parsimony ban đầu. GPU dùng **K−1 blocks** (tree index 1..K-1) |
 | `-sprdist N` | 6¹ | SPR radius dùng cho Phase 2 (initial SPR) và Phase 3 (NNI+SPR) |
 | `-gpu_stop N` | **6** | Stopping criterion duy nhất: dừng Phase 3 sau N iterations liên tiếp không cải thiện. **0 = infinite loop (tránh dùng).** |
-| `-gpu_nni_strength X` | **0.1** | Strength NNI perturbation trong Phase 3: `numNNI = X×(N−3)`, min=1. Even iterations của Phase 3 |
+| `-gpu_nni_strength X` | **0.05** | Strength NNI perturbation trong Phase 3: `numNNI = X×(N−3)`, min=1. Even iterations của Phase 3 |
 | `-gpu_top_pct X` | **0.1** | Opt-G2 two-kernel: chỉ top X% cây (postSprParsimony thấp nhất) mới chạy Phase 3. ≤0 = tắt (single-kernel) |
-| `-gpu_pool_size N` | 20 | Số pool slots cho topology restart trong K2 (production: 30) |
+| `-gpu_pool_size N` | **20** | Số pool slots cho topology restart trong K2 |
+| `-gpu_pool_stop N` | **3** | Dừng K2 sau N outer iterations liên tiếp không cải thiện global best |
+| `-gpu_worker N` | **400** | Số K2 blocks (workers); -1 = same as k1_count. Tăng → nhiều trees song song hơn |
 | `-gpu_k1_ratio X` | **1.0** | K'=max(pool_size, K×X) trees built in K1. 0 hoặc ≥1 = build tất cả K. Production: **0.2** |
 | `-seed N` | random | RNG seed cho tất cả K trees |
 
@@ -65,7 +67,7 @@ python3 ../output/summarize.py             # → output/results.xlsx
 ```bash
 ./mpboot-avx -s <dataset> -use_gpu -seed 1 \
     -numpars 1000 -sprdist 6 -gpu_stop 6 -gpu_pool_size 30 -gpu_k1_ratio 0.2
-# Defaults: gpu_device=1, gpu_stop=6, gpu_nni_strength=0.1, gpu_top_pct=0.1
+# Defaults: gpu_device=0, gpu_stop=6, gpu_nni_strength=0.05, gpu_pool_stop=3, gpu_worker=400, gpu_top_pct=0.1
 # Sweet spot confirmed (115 datasets × 5 configs): k1_ratio=0.2 → 5.35× total speedup (vs 4.55× baseline)
 # -gpu_k1_ratio 1.0 (default) = K'=K (backward compat, same as not passing the flag)
 ```
@@ -504,6 +506,28 @@ for (int rank = 0; rank <= order_idx; rank++) {
 | K2 `buildPhase3Kernel` | **128** | 20.31% | 13.29% | 0.71 |
 
 Shared memory (12.9 KB/block) là bottleneck chiếm dụng (không phải registers). Bottleneck còn lại: `gpuRandomNNIs` 31 lanes idle.
+
+**NCU profiling chi tiết** (config w400p20d6s3, 6 hard datasets N=219–504, A100, 2026-05-18):
+```
+ncu --launch-count 2 --set default -o <out> ./mpboot-avx -s <ds> -use_gpu -seed 1
+    -numpars 200 -sprdist 6 -gpu_pool_size 20 -gpu_worker 400 -gpu_device <dev>
+    -gpu_nni_strength 0.05 -gpu_pool_stop 3
+```
+| Kernel | Grid | Regs | Occ limit regs | Occ limit smem | Waves/SM | Theor. Occ% |
+|--------|------|------|---------------|---------------|----------|-------------|
+| K1 `buildParsimonyTreesKernel<4,800>` | 200 | **96** | 20/SM | **13/SM** | 0.14 | **20.31%** |
+| K2 `buildPhase3Kernel<4,800>` | 400 | **128** | 16/SM | **13/SM** | 0.28 | **20.31%** |
+
+Kết quả nhất quán cho tất cả 6 datasets (kernel template `NTAXA=800` cố định bất kể N thực tế).
+
+**Phân tích bottleneck**:
+- `smem_static = 11.584 KB/block` → A100 cho tối đa **13 blocks/SM** → theor. occ 13/64 = **20.31%**
+- K2 regs=128 → reg limit = 16/SM, nhưng smem vẫn stricter (13 < 16)
+- **Bottleneck là shared memory, không phải registers** cho cả K1 lẫn K2
+- K2 waves/SM = 0.28: với 400 blocks trên 108 SMs × 13 blocks/SM = **chưa đến 1 wave** → GPU không saturated
+- Để đạt ≥1 wave cần ≥ 108 × 13 = **1,404 blocks** (gpu_worker ≈ 1400)
+- NTAXA=800 template → smem được cấp cho worst-case dù N thực nhỏ hơn nhiều
+- Để tăng từ 13 → 16 blocks/SM (25% occ): cần cắt smem từ 11.584 → ≤ 10.25 KB (~1.3 KB)
 
 ### ✅ K' < K: Build fewer trees in K1 — Opt-LessK1 (2026-05-17)
 
