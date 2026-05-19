@@ -50,8 +50,8 @@ python3 ../output/summarize.py             # → output/results.xlsx
 | `-gpu_nni_strength X` | **0.05** | Strength NNI perturbation trong Phase 3: `numNNI = X×(N−3)`, min=1. Even iterations của Phase 3 |
 | `-gpu_top_pct X` | **0.1** | Opt-G2 two-kernel: chỉ top X% cây (postSprParsimony thấp nhất) mới chạy Phase 3. ≤0 = tắt (single-kernel) |
 | `-gpu_pool_size N` | **20** | Số pool slots cho topology restart trong K2 |
-| `-gpu_pool_stop N` | **3** | Dừng K2 sau N outer iterations liên tiếp không cải thiện global best |
 | `-gpu_worker N` | **400** | Số K2 blocks (workers); -1 = same as k1_count. Tăng → nhiều trees song song hơn |
+| `-gpu_worker_stop N` | **1** | Stop threshold multiplier cho `gpuHillClimbing`: `unsuccess_thresh = unsuccess_iteration + K×N`. Tăng → khoan dung hơn khi K lớn |
 | `-gpu_k1_ratio X` | **1.0** | K'=max(pool_size, K×X) trees built in K1. 0 hoặc ≥1 = build tất cả K. Production: **0.2** |
 | `-seed N` | random | RNG seed cho tất cả K trees |
 
@@ -67,7 +67,7 @@ python3 ../output/summarize.py             # → output/results.xlsx
 ```bash
 ./mpboot-avx -s <dataset> -use_gpu -seed 1 \
     -numpars 1000 -sprdist 6 -gpu_stop 6 -gpu_pool_size 30 -gpu_k1_ratio 0.2
-# Defaults: gpu_device=0, gpu_stop=6, gpu_nni_strength=0.05, gpu_pool_stop=3, gpu_worker=400, gpu_top_pct=0.1
+# Defaults: gpu_device=0, gpu_stop=6, gpu_nni_strength=0.05, gpu_worker=400, gpu_worker_stop=1, gpu_top_pct=0.1
 # Sweet spot confirmed (115 datasets × 5 configs): k1_ratio=0.2 → 5.35× total speedup (vs 4.55× baseline)
 # -gpu_k1_ratio 1.0 (default) = K'=K (backward compat, same as not passing the flag)
 ```
@@ -579,6 +579,31 @@ pool quality tốt hơn → K2 vừa nhanh hơn vừa tìm được cây tốt h
 | #6 `__syncwarp;` missing `()` in SPR loop (race on nodep[]) | ✅ Fixed 2026-05-11 |
 | #7 `q_num >= N` in `doAddTraverse` (should be `> N`) | ✅ Fixed 2026-05-11 |
 | #8 `node_num >= N` in stepwise DFS (should be `> N`) | ✅ Fixed 2026-05-11 |
+
+### ✅ `gpuBootstrapSearch` → `gpuHillClimbing`: hợp nhất bootstrap và non-bootstrap (2026-05-19)
+
+**Vấn đề**: GPU non-bootstrap không có outer loop tương đương `doTreeSearch` của CPU — K2 chỉ chạy 1 lần.
+
+**Fix**: Đổi tên `gpuBootstrapSearch` → `gpuHillClimbing`; hàm nay xử lý cả hai mode:
+
+| | Bootstrap (`-bb`) | Non-bootstrap |
+|---|---|---|
+| Treels → | `saveCurrentTree()` (REPS weighted) | `candidateTrees.update()` |
+| Improvement signal | max `treels_logl` | `iqtree.bestScore` |
+| logl_cutoff update | ✓ | ✗ |
+| Correlation convergence | ✓ | ✗ |
+| Max iteration bound B | `gbo_replicates` | không giới hạn |
+| Stopping | `reps - last_impr > thresh \|\| reps > B` | `reps - last_impr > thresh` |
+
+**Stopping threshold**: `unsuccess_thresh = params.unsuccess_iteration + K * params.gpu_worker_stop`
+- `K * gpu_worker_stop` bù đắp cho K workers trong 1 round sinh ra K cây tương quan (không độc lập như CPU)
+
+**`mpbootGpu`** thay đổi:
+- `max_treels = K * 10` luôn (không còn điều kiện bootstrap)
+- `k2_max_outer = 0` luôn (skip K2 hoàn toàn, để `gpuHillClimbing` quản lý)
+- Xóa step [7] non-bootstrap (pool → candidateTrees nay nằm cuối `gpuHillClimbing`)
+
+**Caller** (`phyloanalysis.cpp`): `need_boot_loop` → `need_hc_loop = params.maximum_parsimony` (cả bootstrap lẫn non-bootstrap đều gọi `gpuHillClimbing`)
 
 ### Open issues
 

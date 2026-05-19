@@ -1425,19 +1425,19 @@ void runBasicMpbootGpu(Params &params, IQTree &iqtree, int numInitTrees) {
         cout << "\nUsing GPU for parallel parsimony tree building\n";
         vector<string> gpuTrees(numInitTrees);
         mpbootgpu::GpuParsimonyMem* boot_gpu_mem = nullptr;
-        const bool need_boot_loop = (params.gbo_replicates > 0 && params.maximum_parsimony);
+        const bool need_hc_loop = params.maximum_parsimony;
         mpbootgpu::mpbootGpu(params, iqtree, numInitTrees, gpuTrees,
-                             need_boot_loop ? &boot_gpu_mem : nullptr);
-        if (need_boot_loop && boot_gpu_mem != nullptr) {
-            // Init GPU bootstrap memory HERE (before gpuBootstrapSearch needs it)
-            if (!iqtree.boot_samples_pars.empty()) {
+                             need_hc_loop ? &boot_gpu_mem : nullptr);
+        if (need_hc_loop && boot_gpu_mem != nullptr) {
+            // Bootstrap: upload per-sample site weights before hill-climbing
+            if (params.gbo_replicates > 0 && !iqtree.boot_samples_pars.empty()) {
                 int nunit = (int)(iqtree.getAlnNPattern() + VCSIZE_USHORT);
                 iqtree.gpu_boot_mem_ = mpbootgpu::gpuBootstrapMemAlloc(
                     params.gbo_replicates, (int)iqtree.getAlnNPattern(), nunit);
                 mpbootgpu::gpuUploadBootSamples(iqtree.gpu_boot_mem_, iqtree.boot_samples_pars);
             }
-            // GPU bootstrap main loop: replaces doTreeSearch() for -use_gpu -bb
-            mpbootgpu::gpuBootstrapSearch(params, iqtree, boot_gpu_mem);
+            // GPU hill-climbing outer loop (bootstrap and non-bootstrap)
+            mpbootgpu::gpuHillClimbing(params, iqtree, boot_gpu_mem);
             mpbootgpu::gpuParsimonyMemFree(boot_gpu_mem);
             // gpu_boot_mem_ freed in ~IQTree or "Do tree search" section
         }
@@ -1792,7 +1792,7 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 
 	if (params.use_gpu)
 	{
-		// Note: runBasicMpbootGpu also calls gpuBootstrapSearch (for -bb) and
+		// Note: runBasicMpbootGpu calls gpuHillClimbing (for both -bb and non-bb) and
 		// initializes iqtree.gpu_boot_mem_ internally before the search loop.
 		runBasicMpbootGpu(params, iqtree, numInitTrees);
 	} else if (params.min_iterations > 0) {
@@ -1861,7 +1861,7 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 
 	/****************** Do tree search ***************************/
 	if (params.use_gpu) {
-		// Bootstrap search already ran inside runBasicMpbootGpu via gpuBootstrapSearch().
+		// Hill-climbing already ran inside runBasicMpbootGpu via gpuHillClimbing().
 		// Free GPU bootstrap memory if still allocated.
 		if (iqtree.gpu_boot_mem_) {
 			mpbootgpu::gpuBootstrapMemFree(iqtree.gpu_boot_mem_);

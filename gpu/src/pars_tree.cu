@@ -129,13 +129,13 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     // Fill counter + per-slot spinlocks
     CUDA_CHECK(cudaMalloc(&mem->d_poolFilled,    sizeof(int)));
     CUDA_CHECK(cudaMalloc(&mem->d_poolSlotLocks, (size_t)pool_size * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&mem->d_poolStop,      sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&mem->d_poolHashes,    (size_t)pool_size * sizeof(unsigned int)));
     CUDA_CHECK(cudaMalloc(&mem->d_globalBest,    sizeof(unsigned int)));
     int h_zero = 0;
     unsigned int h_inf = 0xFFFFFFFFu;
     CUDA_CHECK(cudaMemcpy(mem->d_poolFilled,  &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(mem->d_poolSlotLocks, 0, (size_t)pool_size * sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(mem->d_poolStop,    &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(mem->d_poolHashes, 0xFF, (size_t)pool_size * sizeof(unsigned int)));
     CUDA_CHECK(cudaMemcpy(mem->d_globalBest,  &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
 
     // Treels buffer (optional, for bootstrap round output)
@@ -208,7 +208,7 @@ void gpuParsimonyMemFree(
     }
     if (mem->d_poolFilled)     cudaFree(mem->d_poolFilled);
     if (mem->d_poolSlotLocks)  cudaFree(mem->d_poolSlotLocks);
-    if (mem->d_poolStop)       cudaFree(mem->d_poolStop);
+    if (mem->d_poolHashes)     cudaFree(mem->d_poolHashes);
     if (mem->d_globalBest)     cudaFree(mem->d_globalBest);
     if (mem->d_treelsScores)   cudaFree(mem->d_treelsScores);
     if (mem->d_treelsBackVf)   cudaFree(mem->d_treelsBackVf);
@@ -325,10 +325,7 @@ void downloadPoolBackVf(const GpuParsimonyMem* mem, int slot, int* h_back_vf)
 
 void resetPoolRound(GpuParsimonyMem* mem)
 {
-    int h_zero = 0;
-    // unsigned int h_inf = 0xFFFFFFFFu;
-    CUDA_CHECK(cudaMemcpy(mem->d_poolStop,   &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
-    // CUDA_CHECK(cudaMemcpy(mem->d_globalBest, &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(mem->d_poolHashes, 0xFF, (size_t)mem->pool_size * sizeof(unsigned int)));
 }
 
 }  // namespace mpbootgpu

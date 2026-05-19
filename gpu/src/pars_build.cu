@@ -504,72 +504,74 @@ __device__ void gpuRandomNNIs(
         return;
     }
 
-    int num_edges = 0;
+    // Store only canonical p_vf per inner node (N-1 entries).
+    // q_vf is looked up dynamically from back_vf[p_vf] each iteration so it always
+    // reflects the CURRENT topology — avoids stale-edge corruption after prior NNIs.
+    int num_inner = 0;
     for (int p_num = N + 1; p_num <= 2 * N - 1; p_num++)
-    {
-        int p_vf = nodepVf(p_num, N), q_vf = topo->back_vf[p_vf];
-        int q_num = vfToNum(q_vf, N);
-        if (q_num > N && p_num < q_num)
-        {
-            sh.stack[num_edges * 2] = p_vf;
-            sh.stack[num_edges * 2 + 1] = q_vf;
-            num_edges++;
-        }
-    }
+        sh.stack[num_inner++] = (int16_t)nodepVf(p_num, N);
+    if (num_inner == 0) { __syncwarp(); return; }
 
-    for (int i = num_edges - 1; i > 0; i--)
-    {
-        int j = (int)(gpuRandum(&sh.seed) * (i + 1));
-        if (j != i)
-        {
-            int tp = sh.stack[i * 2], tq = sh.stack[i * 2 + 1];
-            sh.stack[i * 2] = sh.stack[j * 2];
-            sh.stack[i * 2 + 1] = sh.stack[j * 2 + 1];
-            sh.stack[j * 2] = tp;
-            sh.stack[j * 2 + 1] = tq;
-        }
-    }
-
-    int bitset_words = (2 * N) / 32 + 1;
+    const int bitset_words = (2 * N) / 32 + 1;  // ≤ 51 ≤ kMaxSprStack=64
     for (int w = 0; w < bitset_words; w++)
-    {
         sh.stackMaxt[w] = 0;
-    }
 
-    int applied = 0;
-    for (int i = 0; i < num_edges && applied < numNNI; i++)
+    // CPU-style: random pick per NNI, reset bitset on conflict (mirrors doRandomNNIs).
+    // Guarantees exactly numNNI loop iterations; skips an iteration only if q is a tip.
+    for (int i = 0; i < numNNI; i++)
     {
-        int p_vf = sh.stack[i * 2], q_vf = sh.stack[i * 2 + 1];
-        int p_num = vfToNum(p_vf, N), q_num = vfToNum(q_vf, N);
+        int idx = (int)(gpuRandum(&sh.seed) * num_inner);
+        if (idx >= num_inner) idx = num_inner - 1;
+
+        int p_vf  = sh.stack[idx];
+        int q_vf  = topo->back_vf[p_vf];  // current neighbor — always up-to-date
+        int p_num = vfToNum(p_vf, N);
+        int q_num = vfToNum(q_vf, N);
+
+        // NNI requires inner-inner edge; skip (don't count) if q is a tip
+        if (q_num <= N) continue;
+
         int pw = (p_num - 1) >> 5, pb = (p_num - 1) & 31;
         int qw = (q_num - 1) >> 5, qb = (q_num - 1) & 31;
 
-        if (!(sh.stackMaxt[pw] & (1u << pb)) && !(sh.stackMaxt[qw] & (1u << qb)))
+        // Conflict → reset bitset (CPU: usedNodes.clear()), then apply anyway
+        if ((sh.stackMaxt[pw] & (1u << pb)) || (sh.stackMaxt[qw] & (1u << qb)))
+            for (int w = 0; w < bitset_words; w++) sh.stackMaxt[w] = 0;
+
+        int pf0 = vfNnxtFace(p_vf, N), qf1 = vfNextFace(q_vf, N), qf0 = vfNnxtFace(q_vf, N);
+        int b = topo->back_vf[pf0];
+
+        if ((int)(gpuRandum(&sh.seed) * 2) == 0)
         {
-            int pf0 = vfNnxtFace(p_vf, N), qf1 = vfNextFace(q_vf, N), qf0 = vfNnxtFace(q_vf, N);
-            int b = topo->back_vf[pf0];
-            if ((int)(gpuRandum(&sh.seed) * 2) == 0)
+            int c = topo->back_vf[qf1];
+            // Guards: -1 = null pointer; c==pf0 = self-loop at pf0
+            if (b != -1 && c != -1 && c != pf0)
             {
-                int c = topo->back_vf[qf1];
                 gpuHookup(topo->back_vf, pf0, c);
                 gpuHookup(topo->back_vf, qf1, b);
             }
-            else
+        }
+        else
+        {
+            int d = topo->back_vf[qf0];
+            // Guards: -1 = null pointer; d==pf0 = self-loop at pf0
+            if (b != -1 && d != -1 && d != pf0)
             {
-                int d = topo->back_vf[qf0];
                 gpuHookup(topo->back_vf, pf0, d);
                 gpuHookup(topo->back_vf, qf0, b);
             }
-            sh.stackMaxt[pw] |= (1u << pb);
-            sh.stackMaxt[qw] |= (1u << qb);
-            applied++;
         }
+        sh.stackMaxt[pw] |= (1u << pb);
+        sh.stackMaxt[qw] |= (1u << qb);
     }
     __syncwarp();
 }
 
 
 // ─── Phase 3 device helper (shared by buildParsimonyTreesKernel + buildPhase3Kernel) ──
+// Runs exactly one iteration: pool restart → NNI or ratchet → SPR → pool insert → treels write.
+// Worker parity (blockIdx.x % 2): even = NNI, odd = ratchet — fixed per worker, not per iteration.
+// CPU calling loop controls how many times the kernel is launched.
 template <int STATES, typename SharedT>
 __device__ void runPhase3(
     parsimonyNumber* pars_tree,
@@ -584,14 +586,12 @@ __device__ void runPhase3(
     int k,
     int width,
     int pool_size,
-    unsigned int* pool_scores,  // [pool_size] parsimony score per physical slot (UINT_MAX=empty)
-    int* pool_back_vf,          // [pool_size * kMaxVFaces] topology per physical slot
-    int* pool_filled,           // device ptr: number of filled slots (0..pool_size)
-    int* pool_slot_locks,       // device ptr: per-slot spinlocks [pool_size]
-    int* pool_stop,             // device ptr: no-improve counter; reset on new global best, +1 otherwise
-    int  pool_stop_thresh,      // stop K2 when pool_stop >= this (from -gpu_pool_stop, default 100)
-    unsigned int* global_best,  // device ptr: global best parsimony across all warps
-    int  max_outer_iters,       // max outer iterations (-1 = unbounded)
+    unsigned int* pool_scores,    // [pool_size] parsimony score per physical slot (UINT_MAX=empty)
+    int* pool_back_vf,            // [pool_size * kMaxVFaces] topology per physical slot
+    int* pool_filled,             // device ptr: number of filled slots (0..pool_size)
+    int* pool_slot_locks,         // device ptr: per-slot spinlocks [pool_size]
+    unsigned int* pool_hashes,    // [pool_size] topology hash per slot (0xFFFFFFFF=empty)
+    unsigned int* global_best,    // device ptr: global best parsimony across all warps
     unsigned int* treels_scores,  // [max_treels] or nullptr — bootstrap output buffer
     int*   treels_back_vf,        // [max_treels × kMaxVFaces] or nullptr
     int*   treels_filled,         // atomic fill counter or nullptr
@@ -599,201 +599,176 @@ __device__ void runPhase3(
     int    max_treels             // treels buffer capacity
 )
 {
-    for (int outer = 0; max_outer_iters < 0 || outer < max_outer_iters; outer++)
+    // ── Step 1: Pool restart — random slot in [0, pool_size) ─────────────────
+    if (pool_scores != nullptr)
     {
-        if (pool_stop != nullptr && *pool_stop >= pool_stop_thresh)
-        {
-            return;
-        }
-
-        // ── Step 1: Pool restart every iteration ─────────────────────────────
-        // Lane 0 computes accessible/order_idx (no lock needed for scan).
-        // All 32 lanes do warp-parallel k-th min scan over pool_scores[].
-        // Lock is acquired only when copying back_vf. Supports pool_size ≤ kWarpSize²=1024.
-        if (pool_scores != nullptr)
-        {
-            if (lane == 0)
-            {
-                int filled = *pool_filled;
-                int accessible = 10 + outer;
-                if (accessible > pool_size) accessible = pool_size;
-                if (accessible > filled)    accessible = filled;
-                sh.bcast[2] = -1;
-                sh.bcast[3] = 0;  // 0 = skip scan; >0 = accessible
-                if (accessible > 0)
-                {
-                    sh.bcast[3] = accessible;
-                    sh.bcast[5] = (int)(((unsigned)k * 2654435761u + (unsigned)outer * 1013904223u)
-                                        >> 8)
-                                  % (unsigned)accessible;  // order_idx
-                }
-            }
-            __syncwarp();
-
-            // Lane-0 k-th min: O(pool_size²), pool_size ≤ 60 → ≤ 3600 ops.
-            if (lane == 0 && sh.bcast[3] > 0)
-            {
-                const int accessible = sh.bcast[3];
-                const int order_idx  = sh.bcast[5];
-                unsigned long long used = 0;
-                int found_slot = -1;
-                for (int rank = 0; rank <= order_idx; rank++)
-                {
-                    unsigned int best = 0xFFFFFFFFu;
-                    int best_slot = -1;
-                    for (int i = 0; i < accessible; i++)
-                    {
-                        if ((used >> i) & 1ULL) continue;
-                        unsigned int s = pool_scores[i];
-                        if (s < best) { best = s; best_slot = i; }
-                    }
-                    if (best_slot < 0) break;
-                    used |= (1ULL << best_slot);
-                    found_slot = best_slot;
-                }
-                sh.bcast[2] = found_slot;
-                if (found_slot >= 0)
-                {
-                    sh.randomMP = pool_scores[found_slot];
-                    sh.randomMPHits = 1;
-                    topo->bestParsimony = sh.randomMP;
-                }
-            }
-            __syncwarp();
-
-            if (sh.bcast[2] >= 0)
-            {
-                // Acquire per-slot lock for back_vf copy (score reads above were lockless).
-                int phys_slot = sh.bcast[2];
-                if (lane == 0)
-                {
-                    while (atomicCAS(&pool_slot_locks[phys_slot], 0, 1) != 0)
-                    {
-                    }
-                }
-                __syncwarp();
-                const int* src = pool_back_vf + (size_t)phys_slot * kMaxVFaces;
-                for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
-                {
-                    topo->back_vf[vf] = src[vf];
-                    topo->xpars[vf] = 0;
-                }
-                __syncwarp();
-
-                if (lane == 0)
-                {
-                    atomicExch(&pool_slot_locks[phys_slot], 0);  // release after copy complete
-                }
-                __syncwarp();
-
-                if (lane == 0) { gpuNodeRectifierPars(topo, sh, N); }
-                __syncwarp();
-            }
-        }
-
-        // ── Step 2: Strict alternating NNI (even) / Ratchet (odd) ────────────
-        // Ratchet perturbs current tree directly.
-        const bool iter_is_nni = (outer % 2 == 0);
-        if (iter_is_nni)
-        {
-            gpuRandomNNIs<SharedT>(topo, sh, N, numNNI, lane);
-
-            unsigned int pm = createTiAndEvaluateParsimony<SharedT, STATES>(
-                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width
-            );
-            if (lane == 0)
-            {
-                sh.randomMP = pm;
-                sh.randomMPHits = 1;
-            }
-            __syncwarp();
-
-            if (pool_stop != nullptr && *pool_stop >= pool_stop_thresh) break;
-            gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
-        }
-        else
-        {
-            if (lane == 0)
-            {
-                for (int b = 0; b < width; b++)
-                {
-                    sw_k[b] = (gpuRandum(&sh.seed) < 0.5) ? 2u : 1u;
-                }
-                sh.site_weights = sw_k;
-            }
-            __syncwarp();
-
-            unsigned int pm1 = createTiAndEvaluateParsimony<SharedT, STATES>(
-                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width
-            );
-            if (lane == 0)
-            {
-                sh.randomMP = pm1;
-                sh.randomMPHits = 1;
-            }
-            __syncwarp();
-
-            if (pool_stop != nullptr && *pool_stop >= pool_stop_thresh)
-            {
-                if (lane == 0) sh.site_weights = nullptr;
-                __syncwarp();
-                break;
-            }
-            gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
-
-            if (lane == 0)
-            {
-                sh.site_weights = nullptr;
-            }
-            __syncwarp();
-
-            unsigned int pm2 = createTiAndEvaluateParsimony<SharedT, STATES>(
-                pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width
-            );
-            if (lane == 0)
-            {
-                sh.randomMP = pm2;
-                sh.randomMPHits = 1;
-            }
-            __syncwarp();
-
-            if (pool_stop != nullptr && *pool_stop >= pool_stop_thresh) break;
-            gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
-        }
-
-        // ── Step 3: Stagnation tracking + sorted pool insert ─────────────────
         if (lane == 0)
         {
-            if (iter_is_nni)
+            sh.bcast[2] = -1;
+            int filled = *pool_filled;
+            if (filled > 0)
             {
-                topo->n_total_even++;
-            }
-            else
-            {
-                topo->n_total_odd++;
-            }
-
-            const unsigned int best_before = topo->bestParsimony;
-            if (sh.randomMP < best_before)
-            {
-                topo->bestParsimony = sh.randomMP;
-                if (iter_is_nni)
+                // Random starting slot based on blockIdx.x; linear probe for non-empty slot.
+                unsigned int rv = (unsigned int)(blockIdx.x * 2654435761u ^ 1013904223u);
+                rv = rv ^ (rv >> 16);
+                for (int attempt = 0; attempt < pool_size; attempt++)
                 {
-                    topo->n_improved_even++;
-                }
-                else
-                {
-                    topo->n_improved_odd++;
+                    int slot = (int)((rv + (unsigned int)attempt) % (unsigned int)pool_size);
+                    if (pool_scores[slot] != 0xFFFFFFFFu)
+                    {
+                        sh.bcast[2] = slot;
+                        sh.randomMP = pool_scores[slot];
+                        sh.randomMPHits = 1;
+                        topo->bestParsimony = sh.randomMP;
+                        break;
+                    }
                 }
             }
         }
         __syncwarp();
 
-        // Pool update: scan for worst slot (no lock), atomicCAS to claim, lock for back_vf copy.
+        if (sh.bcast[2] >= 0)
+        {
+            int phys_slot = sh.bcast[2];
+            if (lane == 0)
+            {
+                while (atomicCAS(&pool_slot_locks[phys_slot], 0, 1) != 0) {}
+            }
+            __syncwarp();
+            const int* src = pool_back_vf + (size_t)phys_slot * kMaxVFaces;
+            for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
+            {
+                topo->back_vf[vf] = src[vf];
+                topo->xpars[vf] = 0;
+            }
+            __syncwarp();
+            if (lane == 0)
+            {
+                atomicExch(&pool_slot_locks[phys_slot], 0);
+            }
+            __syncwarp();
+
+            if (lane == 0) { gpuNodeRectifierPars(topo, sh, N); }
+            __syncwarp();
+        }
+    }
+
+    // ── Step 2: Even workers → NNI, odd workers → ratchet (fixed per worker) ─
+    const bool iter_is_nni = (blockIdx.x % 2 == 0);
+    if (iter_is_nni)
+    {
+        gpuRandomNNIs<SharedT>(topo, sh, N, numNNI, lane);
+
+        unsigned int pm = createTiAndEvaluateParsimony<SharedT, STATES>(
+            pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width
+        );
         if (lane == 0)
         {
-            sh.bcast[4] = -1;
-            if (pool_scores != nullptr)
+            sh.randomMP = pm;
+            sh.randomMPHits = 1;
+        }
+        __syncwarp();
+
+        gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
+    }
+    else
+    {
+        if (lane == 0)
+        {
+            for (int b = 0; b < width; b++)
+            {
+                sw_k[b] = (gpuRandum(&sh.seed) < 0.5) ? 2u : 1u;
+            }
+            sh.site_weights = sw_k;
+        }
+        __syncwarp();
+
+        unsigned int pm1 = createTiAndEvaluateParsimony<SharedT, STATES>(
+            pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width
+        );
+        if (lane == 0)
+        {
+            sh.randomMP = pm1;
+            sh.randomMPHits = 1;
+        }
+        __syncwarp();
+
+        gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
+
+        if (lane == 0)
+        {
+            sh.site_weights = nullptr;
+        }
+        __syncwarp();
+
+        unsigned int pm2 = createTiAndEvaluateParsimony<SharedT, STATES>(
+            pars_tree, score_tree, topo, sh, topo->start_vface, N, true, width
+        );
+        if (lane == 0)
+        {
+            sh.randomMP = pm2;
+            sh.randomMPHits = 1;
+        }
+        __syncwarp();
+
+        gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
+    }
+
+    // ── Step 3: Stagnation tracking + pool insert with hash dedup ────────────
+    if (lane == 0)
+    {
+        if (iter_is_nni)
+        {
+            topo->n_total_even++;
+        }
+        else
+        {
+            topo->n_total_odd++;
+        }
+
+        const unsigned int best_before = topo->bestParsimony;
+        if (sh.randomMP < best_before)
+        {
+            topo->bestParsimony = sh.randomMP;
+            if (iter_is_nni)
+            {
+                topo->n_improved_even++;
+            }
+            else
+            {
+                topo->n_improved_odd++;
+            }
+        }
+    }
+    __syncwarp();
+
+    // Pool update: dedup via hash, then scan for worst slot, CAS-claim, lock for back_vf copy.
+    if (lane == 0)
+    {
+        sh.bcast[4] = -1;
+        if (pool_scores != nullptr)
+        {
+            // Compute topology hash (Knuth multiplicative hash over all back_vf entries)
+            unsigned int new_hash = 0;
+            for (int vf = 0; vf < topo->num_vfaces; vf++)
+                new_hash = new_hash * 2654435761u ^ (unsigned int)topo->back_vf[vf];
+
+            // Check for duplicate: skip insert if same hash already present with valid score.
+            // Race-condition false negatives are acceptable — pool diversity may lose one slot.
+            bool is_dup = false;
+            if (pool_hashes != nullptr)
+            {
+                for (int i = 0; i < pool_size; i++)
+                {
+                    if (pool_hashes[i] == new_hash && pool_scores[i] != 0xFFFFFFFFu)
+                    {
+                        is_dup = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!is_dup)
             {
                 // Find worst slot (max score) without holding lock
                 int worst_slot = 0;
@@ -809,7 +784,6 @@ __device__ void runPhase3(
                 }
                 if (sh.randomMP < worst_score)
                 {
-                    // atomicCAS: claim the slot atomically (no lock needed for score)
                     unsigned int old = atomicCAS(
                         (unsigned int*)&pool_scores[worst_slot], worst_score, sh.randomMP
                     );
@@ -817,96 +791,75 @@ __device__ void runPhase3(
                     {
                         if (old == 0xFFFFFFFFu)
                         {
-                            atomicAdd(pool_filled, 1);  // grew pool
+                            atomicAdd(pool_filled, 1);
                         }
                         sh.bcast[4] = worst_slot;
-                        // Acquire per-slot lock to protect back_vf copy from concurrent restart reads
-                        while (atomicCAS(&pool_slot_locks[worst_slot], 0, 1) != 0)
-                        {
-                        }
+                        while (atomicCAS(&pool_slot_locks[worst_slot], 0, 1) != 0) {}
+                        // Write hash inside lock so concurrent dedup checks see it atomically
+                        if (pool_hashes != nullptr)
+                            pool_hashes[worst_slot] = new_hash;
                     }
                 }
             }
         }
-        __syncwarp();
+    }
+    __syncwarp();
 
-        // All 32 lanes copy topology; lock still held by lane 0 when bcast[4] >= 0.
-        // Holding the lock prevents another warp from evicting and reusing the same
-        // physical slot before this warp finishes writing pool_back_vf[phys].
-        if (sh.bcast[4] >= 0)
+    // All 32 lanes copy topology; lock still held by lane 0 when bcast[4] >= 0.
+    if (sh.bcast[4] >= 0)
+    {
+        int* dst = pool_back_vf + (size_t)sh.bcast[4] * kMaxVFaces;
+        for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
         {
-            int* dst = pool_back_vf + (size_t)sh.bcast[4] * kMaxVFaces;
-            for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
-            {
-                dst[vf] = topo->back_vf[vf];
-            }
-            __syncwarp();
-        }
-        __syncwarp();
-
-        // Release per-slot spinlock after topology copy is complete
-        if (sh.bcast[4] >= 0 && lane == 0)
-        {
-            atomicExch(&pool_slot_locks[sh.bcast[4]], 0);
-        }
-        __syncwarp();
-
-        // ── Treels write: add current tree to bootstrap output buffer if score ≤ cutoff ──
-        // No lock needed: each slot is assigned uniquely via atomicAdd → no two warps collide.
-        if (treels_scores != nullptr && treels_filled != nullptr && treels_cutoff != nullptr)
-        {
-            if (lane == 0)
-            {
-                sh.bcast[6] = -1;
-                unsigned int cutoff = *((volatile unsigned int*)treels_cutoff);
-                if (sh.randomMP <= cutoff)
-                {
-                    int slot = atomicAdd(treels_filled, 1);
-                    if (slot < max_treels)
-                    {
-                        treels_scores[slot] = sh.randomMP;
-                        sh.bcast[6] = slot;
-                    }
-                    // slot ≥ max_treels: buffer full, skip (counter already incremented, harmless)
-                }
-            }
-            __syncwarp();
-            if (sh.bcast[6] >= 0)
-            {
-                int* dst = treels_back_vf + (size_t)sh.bcast[6] * kMaxVFaces;
-                for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
-                    dst[vf] = topo->back_vf[vf];
-                __syncwarp();
-            }
-            __syncwarp();
-        }
-
-        // Pool convergence: +1/iter (not +k2_workers/iter) so threshold is independent of worker count.
-        // All warps update global_best; only warp 0 increments the iter counter.
-        // Reset uses atomicCAS to guard against resurrecting the counter after block 0 has exited:
-        //   once pool_stop >= thresh, no block may reset it to 0 — all blocks will then exit.
-        if (lane == 0 && global_best != nullptr)
-        {
-            if (sh.randomMP < *global_best)
-            {
-                atomicMin(global_best, sh.randomMP);
-                if (pool_stop != nullptr)
-                {
-                    // Only reset if block 0 hasn't yet triggered exit.
-                    // If CAS fails under contention, we conservatively skip the reset;
-                    // this may cause a 1-iter-early stop, which is acceptable.
-                    unsigned int s = *((volatile unsigned int*)pool_stop);
-                    if (s < (unsigned int)pool_stop_thresh)
-                        atomicCAS((unsigned int*)pool_stop, s, 0u);
-                }
-            }
-            else if (blockIdx.x == 0 && pool_stop != nullptr)
-            {
-                atomicAdd(pool_stop, 1);  // +1 per outer iter, independent of k2_workers
-            }
+            dst[vf] = topo->back_vf[vf];
         }
         __syncwarp();
     }
+    __syncwarp();
+
+    // Release per-slot spinlock after topology copy is complete
+    if (sh.bcast[4] >= 0 && lane == 0)
+    {
+        atomicExch(&pool_slot_locks[sh.bcast[4]], 0);
+    }
+    __syncwarp();
+
+    // ── Treels write: add current tree to bootstrap output buffer if score ≤ cutoff ──
+    // No lock needed: each slot assigned uniquely via atomicAdd → no two warps collide.
+    if (treels_scores != nullptr && treels_filled != nullptr && treels_cutoff != nullptr)
+    {
+        if (lane == 0)
+        {
+            sh.bcast[6] = -1;
+            unsigned int cutoff = *((volatile unsigned int*)treels_cutoff);
+            if (sh.randomMP <= cutoff)
+            {
+                int slot = atomicAdd(treels_filled, 1);
+                if (slot < max_treels)
+                {
+                    treels_scores[slot] = sh.randomMP;
+                    sh.bcast[6] = slot;
+                }
+            }
+        }
+        __syncwarp();
+        if (sh.bcast[6] >= 0)
+        {
+            int* dst = treels_back_vf + (size_t)sh.bcast[6] * kMaxVFaces;
+            for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
+                dst[vf] = topo->back_vf[vf];
+            __syncwarp();
+        }
+        __syncwarp();
+    }
+
+    // Update global best
+    if (lane == 0 && global_best != nullptr)
+    {
+        if (sh.randomMP < *global_best)
+            atomicMin(global_best, sh.randomMP);
+    }
+    __syncwarp();
 }
 
 // ─── Kernel ───────────────────────────────────────────────────────────────────
@@ -1108,14 +1061,12 @@ __global__ void buildPhase3Kernel(
     size_t parsVectPerTree,
     size_t parsScorePerTree,
     int pool_size,
-    unsigned int* pool_scores,  // [pool_size] population pool scores (UINT_MAX=empty)
-    int* pool_back_vf,          // [pool_size * kMaxVFaces] population pool topologies
-    int* pool_filled,           // device ptr: number of filled slots
-    int* pool_slot_locks,       // device ptr: per-slot spinlocks [pool_size]
-    int* pool_stop,             // device ptr: no-improve counter
-    int  pool_stop_thresh,      // stop when pool_stop >= this
-    unsigned int* global_best,  // device ptr: global best parsimony across all warps
-    int  max_outer_iters,       // max outer iterations (-1 = unbounded)
+    unsigned int* pool_scores,    // [pool_size] population pool scores (UINT_MAX=empty)
+    int* pool_back_vf,            // [pool_size * kMaxVFaces] population pool topologies
+    int* pool_filled,             // device ptr: number of filled slots
+    int* pool_slot_locks,         // device ptr: per-slot spinlocks [pool_size]
+    unsigned int* pool_hashes,    // [pool_size] topology hash per slot (0xFFFFFFFF=empty)
+    unsigned int* global_best,    // device ptr: global best parsimony across all warps
     unsigned int* treels_scores,
     int*   treels_back_vf,
     int*   treels_filled,
@@ -1148,9 +1099,8 @@ __global__ void buildPhase3Kernel(
 
     runPhase3<STATES>(
         pars_tree, score_tree, topo, sh, sw_k, N, sprDist, numNNI, lane, k, width,
-        pool_size, pool_scores, pool_back_vf, pool_filled, pool_slot_locks,
-        pool_stop, pool_stop_thresh, global_best, max_outer_iters,
-        treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels
+        pool_size, pool_scores, pool_back_vf, pool_filled, pool_slot_locks, pool_hashes,
+        global_best, treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels
     );
 }
 
@@ -1162,7 +1112,6 @@ void gpuStepwiseBuildTrees(
     int sprDist,
     int numNNI,
     int poolSize,
-    int poolStopThresh,
     cudaStream_t stream,
     AfterK1Callback after_k1,
     AfterK2Callback after_k2,
@@ -1250,7 +1199,7 @@ void gpuStepwiseBuildTrees(
             mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, mem->width,
             sprDist, numNNI, mem->parsVectPerTree, mem->parsScorePerTree, poolSize,
             mem->d_poolScores, mem->d_poolBackVf, mem->d_poolFilled, mem->d_poolSlotLocks,
-            mem->d_poolStop, poolStopThresh, mem->d_globalBest, max_outer_iters,
+            mem->d_poolHashes, mem->d_globalBest,
             mem->d_treelsScores, mem->d_treelsBackVf, mem->d_treelsFilled,
             mem->d_treelsCutoff, mem->max_treels
         );

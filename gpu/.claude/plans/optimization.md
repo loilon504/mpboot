@@ -10,7 +10,7 @@
 | Opt-H | Early stopping Phase 3 (gpu_stop) | −32.4% ms/tree |
 | ~~Opt-G~~ | ~~Selective Phase 3 atomicMin margin~~ | **Xoá — disabled by default, code phức tạp** |
 | Opt-G2 (→ -gpu_top_pct) | Selective Phase 3 two-kernel exact top-X% | default=10%, giảm Phase 3 overhead |
-| Opt-I | NNI strength configurable (gpu_nni_strength) | Baseline alignment |
+| Opt-I | NNI strength configurable (gpu_nni_strength); rewrite on-the-fly q_vf + CPU-style bitset reset | strength=0.5 works; all EXIT=0; no regression |
 | Opt-K | gpu_stop default 2 → 4 | Quality tốt hơn trên N≥295 |
 | Opt-B | Subtree prune trong SPR DFS (per-edge lb check) | ~22% prune rate, avg 1.31× speedup |
 | Opt-B+ | Tighter lb: thêm score_tree[tip_p] | **~30% prune rate, avg 1.49× speedup, 10/10 faster** |

@@ -1939,3 +1939,152 @@ K1 ngắn hơn → CPU builds ~50% more trees trong callback window → pool qua
 
 4. **Kết hợp với Reseed**: Opt-LessK1 và Reseed (Step 3.5) hoạt động cùng nhau — Reseed cải thiện bad slots; LessK1 cho CPU thêm time để build candidates tốt hơn cho pool.
 
+---
+
+## Refactor — `gpuBootstrapSearch` → `gpuHillClimbing`: hợp nhất bootstrap và non-bootstrap (2026-05-19)
+
+**Ngày**: 2026-05-19
+**File liên quan**: `gpu/src/gpu_init_trees.cu`, `gpu/include/gpu_init_trees.cuh`, `mpboot/phyloanalysis.cpp`
+
+### Vấn đề trước khi refactor
+
+Trước refactor, GPU có hai luồng xử lý riêng biệt:
+- **Bootstrap (`-bb`)**: `mpbootGpu` chạy K1 only → `gpuBootstrapSearch` chạy vòng lặp K2 với REPS eval + convergence check
+- **Non-bootstrap**: `mpbootGpu` chạy K1 + K2 (một pass) → pool → `candidateTrees` (step [7])
+
+Non-bootstrap **không có outer loop** tương đương `doTreeSearch` của CPU. K2 chỉ chạy 1 lần rồi dừng — không tận dụng pool để tiếp tục tìm kiếm.
+
+### Thay đổi
+
+**`mpbootGpu`:**
+- Luôn allocate treels buffer (`max_treels = K * 10`, không còn điều kiện `gbo_replicates > 0`)
+- Luôn skip K2 (`k2_max_outer = 0`) — outer loop được chuyển sang `gpuHillClimbing`
+- Xóa step [7] (non-bootstrap pool → candidateTrees) — nay nằm trong `gpuHillClimbing`
+
+**`gpuBootstrapSearch` → `gpuHillClimbing`:**
+- Thêm `is_bootstrap = (params.gbo_replicates > 0)` để phân nhánh logic
+- Thêm `tag` (`"[GPU Bootstrap]"` hoặc `"[GPU HillClimb]"`) cho log
+- **Treels registration**: bootstrap → `saveCurrentTree()` (REPS weighted logl), non-bootstrap → `candidateTrees.update() + setBestTree()`
+- **Improvement tracking**: bootstrap → max của `treels_logl`, non-bootstrap → `iqtree.bestScore`
+- **logl_cutoff update**: bootstrap only
+- **Convergence check** (bootstrap correlation): bootstrap only
+- **Stopping condition**: `total_replicates - last_impr_at > unsuccess_thresh || (is_bootstrap && total_replicates > B)`
+  - Non-bootstrap chỉ dùng `unsuccess_thresh`, không giới hạn B
+- Pool → `candidateTrees` ở cuối hàm: dùng cho cả hai mode (xử lý giống nhau)
+
+**`phyloanalysis.cpp`:**
+- `need_boot_loop = (gbo_replicates > 0 && maximum_parsimony)` → `need_hc_loop = maximum_parsimony`
+- Bootstrap sample upload được guard bởi `params.gbo_replicates > 0`
+- Gọi `gpuHillClimbing` thay `gpuBootstrapSearch` cho cả hai mode
+
+### Stopping condition cho non-bootstrap
+
+```cpp
+const int unsuccess_thresh = params.unsuccess_iteration + K * params.gpu_worker_stop;
+// Dừng khi: total_replicates - last_impr_at > unsuccess_thresh
+// last_impr_at được cập nhật khi iqtree.bestScore cải thiện
+```
+
+Tương tự CPU `doTreeSearch` với `SC_UNSUCCESS_ITERATION`: dừng sau `unsuccess_iteration` replicates không tìm được cây tốt hơn. `+ K * gpu_worker_stop` bù đắp cho việc K workers trong một round sinh ra K cây tương quan (từ cùng pool state) — không hoàn toàn độc lập như CPU.
+
+### Lý do `total_replicates` thay vì `treels_logl.size()`
+
+`saveCurrentTree` dedup theo Newick string → `treels_logl.size()` chỉ tăng khi có topology MỚI. `total_replicates += n_treels` đếm tổng số cây được xử lý qua `saveCurrentTree` (kể cả duplicate), tương đương `curIt` của CPU trong `doTreeSearch`.
+
+### Ghi chú kiến trúc
+
+Refactor này làm cho GPU K2 outer loop hoàn toàn song song về chức năng với CPU `doTreeSearch`:
+- CPU: `do { rearrange all nodes } while (improved)` → dừng khi không improve sau `unsuccess_iteration` attempts
+- GPU: `for (;;) { K2 round → check improvement }` → dừng khi `total_replicates - last_impr_at > unsuccess_thresh`
+
+---
+
+## Refactor — `gpuRandomNNIs`: rewrite theo CPU-style random pick + on-the-fly q_vf (2026-05-19)
+
+**Ngày**: 2026-05-19
+**File liên quan**: `gpu/src/pars_build.cu` (hàm `gpuRandomNNIs`, ~line 495–570)
+
+### Vấn đề trước khi rewrite
+
+Cài đặt cũ dùng **Fisher-Yates shuffle toàn bộ edge list** rồi iterate tuần tự, bỏ qua cạnh bị conflict (cả 2 endpoint đã marked trong bitset):
+
+```cuda
+// Cũ: shuffle (p_vf, q_vf) pairs → iterate → skip on conflict
+for (int i = 0; i < num_edges; i++) {
+    int p_vf = sh.stack[idx * 2], q_vf = sh.stack[idx * 2 + 1];
+    if (conflict) continue;     // bỏ cạnh, không đảm bảo numNNI moves
+    apply_nni(...);
+}
+```
+
+**Hậu quả với `gpu_nni_strength=0.5`**: `numNNI ≈ N/2`. Sau ~N/4 moves, hơn nửa nodes đã marked → hầu hết cạnh còn lại đều conflict → iterator duyệt hết list với `applied << numNNI`. GPU thực chất không perturbate đủ số NNI moves yêu cầu.
+
+### Root cause của crash khi rewrite đơn giản
+
+Khi thử thay bằng random-pick-per-NNI (CPU pattern), lưu cặp `(p_vf, q_vf)` trong `sh.stack[]` → crash `CUDA illegal memory access`:
+
+**Vấn đề**: NNI đầu tiên thay đổi `back_vf[]` → `q_vf` trong cặp đã lưu không còn là neighbor thực của `p_vf` nữa. Random pick có thể chọn lại cùng cặp → `gpuHookup` inconsistent → topology bị corrupt → DFS crash.
+
+Hai loại corruption được phát hiện:
+1. **Null pointer** (`back_vf[pf0] = -1`): Node 2N-1 (node cuối cùng build) chưa được fully initialized → pf0's back có thể là −1.
+2. **Self-loop** (`back_vf[pf0] = pf0`): Nếu `pf0 ↔ qf1` đã connected trực tiếp, hookup option 1 sẽ tạo `back_vf[pf0] = pf0` → DFS infinite loop → `sh.tiStack` overflow → crash.
+
+### Fix: on-the-fly `q_vf` từ `back_vf[p_vf]`
+
+**Nguyên lý**: Lưu chỉ `p_vf` (canonical face của mỗi inner node, N-1 entries). Mỗi NNI iteration, tra cứu `q_vf = topo->back_vf[p_vf]` động — luôn phản ánh topology hiện tại sau các NNI trước đó.
+
+```cuda
+// Step 1: store only p_vf per inner node (N-1 entries)
+for (int p_num = N + 1; p_num <= 2 * N - 1; p_num++)
+    sh.stack[num_inner++] = (int16_t)nodepVf(p_num, N);
+
+// Step 3: random pick + on-the-fly q_vf lookup
+for (int i = 0; i < numNNI; i++) {
+    int p_vf = sh.stack[idx];
+    int q_vf = topo->back_vf[p_vf];  // ← luôn up-to-date
+    int q_num = vfToNum(q_vf, N);
+    if (q_num <= N) continue;         // skip tip neighbors
+
+    // Conflict → reset bitset (CPU: usedNodes.clear()), apply anyway
+    if (conflict) for (int w = 0; w < bitset_words; w++) sh.stackMaxt[w] = 0;
+
+    // Guards: -1 (null), c==pf0 / d==pf0 (self-loop)
+    if (b != -1 && c != -1 && c != pf0) { gpuHookup(...); }
+}
+```
+
+### So sánh cài đặt cũ vs mới
+
+| | Cũ (Fisher-Yates) | Mới (CPU-style) |
+|---|---|---|
+| Upfront work | O(N) RNG shuffle | Không shuffle |
+| Edge storage | `(p_vf, q_vf)` pairs | Chỉ `p_vf` (N-1 entries) |
+| `q_vf` | Lưu static từ trước NNI | Tra cứu động `back_vf[p_vf]` mỗi iter |
+| On conflict | Skip, tiếp tục list | Reset bitset, apply anyway |
+| Guarantee | applied ≤ numNNI | numNNI iterations (skip chỉ khi q là tip) |
+| strength=0.5 | Falls short of numNNI | Đủ numNNI ✓ |
+| Stale edge | Không có (iterate in-order) | Không có (on-the-fly lookup) |
+
+### Kết quả thực nghiệm
+
+| Strength | Best parsimony | EXIT |
+|----------|---------------|------|
+| 0.0 | 6662 | 0 ✓ |
+| 0.1 | 6662 | 0 ✓ |
+| 0.3 | 6662 | 0 ✓ |
+| 0.5 | 6662 | 0 ✓ |
+
+(N=295, seed=1, sprdist=6, numpars=200, CPU ref=6682)
+
+Không có regression. `gpu_nni_strength=0.5` hoạt động đúng (trước: crash hoặc apply << numNNI moves).
+
+### Bài học / Ghi chú cho khóa luận
+
+1. **Stale pointer trong GPU**: Khác CPU (có virtual memory), GPU topology dùng integer index (`back_vf[vf]`). Sau khi NNI thay đổi `back_vf[]`, bất kỳ index nào lưu giá trị cũ của `back_vf` đều trở thành "stale pointer" — dẫn đến topology corruption không rõ ràng. Giải pháp: không lưu "edge" (pair of nodes), mà lưu "anchor" (1 node) rồi tra cứu neighbor động.
+
+2. **Self-loop trong ring topology**: GPU topology là vòng có hướng (face[0]→face[1]→face[2]→face[0]). NNI có thể tạo self-loop nếu hai face đang được swap đã connected trực tiếp (`back_vf[pf0] = qf1`). Guard `c != pf0` / `d != pf0` ngăn trường hợp này.
+
+3. **On-the-fly lookup vs lưu pair**: Trong thuật toán online (có update giữa chừng), lưu thêm 1 field và tra cứu dynamic thường an toàn hơn lưu cặp pre-computed. Trade-off: 1 global memory read thêm per iteration, nhưng correctness được đảm bảo.
+
+4. **CPU `doRandomNNIs` pattern**: CPU reset `usedNodes` map khi conflict → apply anyway (iqtree.cpp:1091). GPU replicate đúng pattern này bằng bitset clear. Kết quả: đúng `numNNI` moves, không bị thiếu ở strength cao.
+

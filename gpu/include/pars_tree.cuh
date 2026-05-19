@@ -86,7 +86,7 @@ struct GpuParsimonyMem
     int* d_poolBackVf;            // [pool_size][kMaxVFaces] topology snapshots
     int*     d_poolFilled;        // number of filled slots (0..pool_size)
     int*     d_poolSlotLocks;     // per-slot spinlocks [pool_size] (0=free, 1=held)
-    int*          d_poolStop;     // global no-improve counter; reset to 0 on new global best, +1 otherwise; stop when >= pool_size
+    unsigned int* d_poolHashes;   // [pool_size] topology hash per slot (0xFFFFFFFF = empty)
     unsigned int* d_globalBest;   // global best parsimony across all warps
 
     // Treels buffer (bootstrap round output): workers write here if score ≤ d_treelsCutoff
@@ -224,7 +224,7 @@ void downloadPoolBackVf(
     const GpuParsimonyMem* mem, int slot, int* h_back_vf
 );
 
-// Reset pool_stop counter to 0 and global_best to UINT_MAX (call before each K2 round).
+// Reset pool topology hashes to 0xFFFFFFFF (call before each K2 bootstrap round).
 void resetPoolRound(GpuParsimonyMem* mem);
 
 // ─── Validation kernel (Phase 1 test) ─────────────────────────────────────────

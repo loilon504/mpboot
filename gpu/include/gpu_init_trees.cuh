@@ -34,15 +34,14 @@ int mpbootGpu(
     GpuParsimonyMem** out_mem = nullptr
 );
 
-// GPU bootstrap main loop: replaces CPU doTreeSearch() for -use_gpu -bb.
-// Runs K2 rounds of SPR+NNI search, evaluates REPS on GPU after each round,
-// and checks bootstrap convergence on CPU.
+// GPU iterative hill-climbing loop. Runs K2 rounds of SPR+NNI search from the pool.
+//   Bootstrap (-bb): treels → saveCurrentTree (REPS eval), convergence check.
+//   Non-bootstrap:   treels → candidateTrees, stops when no improvement.
 // Preconditions:
-//   - mem: GPU parsimony memory (K2 pool already populated from K1 run)
-//   - iqtree.gpu_boot_mem_ != nullptr (bootstrap samples uploaded)
+//   - mem: GPU parsimony memory (pool populated from K1 run in mpbootGpu)
+//   - Bootstrap: iqtree.gpu_boot_mem_ != nullptr (bootstrap samples uploaded)
 //   - _allocateParsimonyDataStructures called
-// stream = 0 (default CUDA stream)
-void gpuBootstrapSearch(
+void gpuHillClimbing(
     const Params& params,
     IQTree&        iqtree,
     GpuParsimonyMem* mem

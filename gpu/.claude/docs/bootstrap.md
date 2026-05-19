@@ -1,4 +1,150 @@
-# Bootstrap trong MPBoot — Ví dụ minh hoạ
+# Bootstrap trong MPBoot
+
+---
+
+## Flow tổng thể — Từ alignment đến `.contree`
+
+### Điểm khác biệt cốt lõi vs Standard Bootstrap
+
+**Standard bootstrap** (IQ-TREE, RAxML): với mỗi trong B replicates → build 1 cây mới từ đầu (O(B × tree_search)).
+
+**MPBoot**: build K candidate trees **một lần** từ alignment gốc, rồi **tái dùng** để vote cho từng replicate bằng RELL approximation (O(tree_search) + O(B × P) dot products).
+
+### Phase 1 — Build candidate trees (K1 kernel)
+
+```
+GPU: buildParsimonyTreesKernel
+  Grid = (K, 1, 1), mỗi block = 1 cây
+  Stepwise addition + SPR hill-climbing
+  → K cây tốt, lưu vào iqtree.treels (StringIntMap: newick → tree_id)
+```
+
+Sau K1 + outer loop (`gpuHillClimbing`), `treels` chứa toàn bộ unique candidate trees tìm được trong suốt quá trình.
+
+### Phase 2 — REPS scoring: gắn mỗi replicate với cây tốt nhất
+
+Với mỗi candidate tree `t`, GPU tính dot product:
+
+```
+rell[sample] = Σ_p  pattern_pars[t][p] × boot_weight[sample][p]
+```
+
+**RELL approximation** (Kishino et al. 1990): thay vì re-evaluate cây trên resampled alignment, dùng dot-product site-parsimony × bootstrap site weights.
+
+Kernel là `REPSKernel` ([pars_bootstrap.cu](../src/pars_bootstrap.cu)):
+
+```
+Grid  = (B=1000, 1, 1) — 1 block per replicate
+Block = (32,     1, 1) — 1 warp
+Mỗi block: rell[i] = Σ_p d_pattern_pars[p] × d_boot_samples[i×nunit + p]
+```
+
+`d_boot_samples[B × nunit]` upload **1 lần** lúc đầu (`gpuUploadBootSamples`).
+`d_pattern_pars` upload **mỗi candidate tree** (pattern parsimony của tree đó).
+
+**Online update** (mỗi candidate tree `t`, sau khi download `h_rell[0..B-1]`):
+
+```cpp
+for each sample s:
+    if h_rell[s] <= boot_logl[s]:          // tree t tốt hơn hoặc bằng
+        if h_rell[s] < boot_logl[s]:
+            boot_trees_parsimony[s].clear() // reset — chỉ giữ best
+            boot_logl[s] = h_rell[s]
+        boot_trees_parsimony[s].insert(t)   // multiple hits OK
+```
+
+→ `boot_trees_parsimony[s]` = set tree_id best cho replicate `s`.
+
+### Phase 3 — Tổng hợp weights
+
+`summarizeBootstrapParsimonyWeight()` ([iqtree.cpp:4124](../../iqtree.cpp#L4124)):
+
+```cpp
+for (int s = 0; s < B; s++) {
+    scale = B / boot_trees_parsimony[s].size();  // chia đều nếu multiple hits
+    for (tree_id in boot_trees_parsimony[s]):
+        btree_weights[tree_id] += scale;
+}
+```
+
+`btree_weights[t]` = tổng replicate-votes cho tree `t`. Sum = B (mỗi replicate đóng góp đúng 1 phần).
+
+### Phase 4 — Consensus từ splits
+
+`summarizeBootstrap(params, btrees)` ([iqtree.cpp:3899](../../iqtree.cpp#L3899)):
+
+**4a. Decompose tất cả cây thành bipartitions:**
+```cpp
+trees.convertSplits(taxname, sg, hash_ss, SW_COUNT, -1, false);
+```
+Với mỗi internal branch của tree `t` có `btree_weights[t]` → cộng weight vào split tương ứng trong `SplitGraph sg`. Mỗi **split** = bipartition: chia N taxa thành 2 tập (bitmask).
+
+**4b. Normalize:**
+```cpp
+sg.scaleWeight(1.0 / sum_weights);  // → [0, 1]
+sg.scaleWeight(100.0);              // → [0, 100] %
+```
+
+**4c. `.suptree` — best tree + support values:**
+```cpp
+mytree.createBootstrapSupport(taxname, trees, sg, hash_ss);
+```
+Lấy cây parsimony tốt nhất, tra cứu từng internal branch trong `sg` → ghi support % lên branch.
+
+**4d. `.contree` — majority-rule consensus:**
+`computeConsensusTree()` chỉ giữ splits có support > 50%, xây cây mới thoả tất cả splits đó (có thể multifurcating nếu splits xung đột).
+
+### Sơ đồ tổng thể
+
+```
+Alignment gốc
+    │
+    ├─ K1 kernel ──► K candidate trees (treels)
+    │                    │
+    │        ┌───────────┘
+    │        │  REPSKernel (mỗi candidate tree × B replicates)
+    │        │  rell[s] = Σ parsimony[p] × boot_weight[s][p]
+    │        │
+    │        ▼
+    │  boot_trees_parsimony[s] = best tree(s) per replicate
+    │        │
+    │        ▼
+    │  btree_weights[t] = Σ_s (replicate votes)
+    │        │
+    │        ▼
+    │  convertSplits → SplitGraph (bipartitions + frequencies %)
+    │        │
+    │        ├──► .suptree  (best tree + support annotated)
+    │        └──► .contree  (majority-rule consensus)
+    │
+    └─ .splits.nex (tất cả splits)
+```
+
+### Key code locations
+
+| Function | File | Vai trò |
+|----------|------|---------|
+| `REPSKernel` | `gpu/src/pars_bootstrap.cu` | GPU dot-product B replicates × 1 candidate tree |
+| `gpuREPSEval()` | `gpu/src/pars_bootstrap.cu` | Upload pattern_pars + launch REPSKernel + download |
+| `gpuHillClimbing()` | `gpu/src/gpu_init_trees.cu` | Outer loop: K2 → saveCurrentTree → REPS update |
+| `saveCurrentTree()` | `iqtree.cpp:3288` | Thêm cây vào `treels` + `treels_logl` |
+| `summarizeBootstrap(Params&)` | `iqtree.cpp:4047` | Entry: dispatch to ParsimonyWeight or Weight |
+| `summarizeBootstrapParsimonyWeight()` | `iqtree.cpp:4124` | Tổng hợp btree_weights từ boot_trees_parsimony |
+| `summarizeBootstrap(Params&, MTreeSet&)` | `iqtree.cpp:3899` | convertSplits → createBootstrapSupport → .suptree/.contree |
+
+### nsys profiling (bb=1000, gpu_worker=200, N=295)
+
+| Kernel | Instances | Total | % GPU | Avg/call |
+|--------|-----------|-------|-------|---------|
+| K2 `buildPhase3Kernel` | 10 | 12.19 s | 89.1% | 1.22 s |
+| K1 `buildParsimonyTreesKernel` | 1 | 1.48 s | 10.8% | 1.48 s |
+| `REPSKernel` | **581** | ~3 ms | **0.02%** | 5.18 µs |
+
+581 REPS calls = 581 unique candidate trees được evaluated. **REPSKernel không phải bottleneck.**
+
+---
+
+## Ví dụ minh hoạ — 4 taxa, 10 sites
 
 Dùng ví dụ **4 taxa, 10 sites** để trace qua toàn bộ algorithm.
 
@@ -345,3 +491,57 @@ d_boot_samples[B × P]:  layout [replicate][pattern]
 d_pattern_pars[P]:  broadcast (constant per kernel launch)
   → fits in L1 cache (~20KB cho P=5000 × uint16_t)
 ```
+
+---
+
+## Bước 8: Cây output khi `-bb` — từ `treels`, không phải `candidateTrees`
+
+### Nguồn dữ liệu
+
+Khi `-bb` được dùng, **`candidateTrees` không được populate**. Thay vào đó:
+
+| Cấu trúc | Nội dung |
+|---|---|
+| `treels` (StringIntMap) | topology Newick string → index |
+| `treels_logl` (DoubleVector) | parsimony score của từng topology |
+| `candidateTrees` | **trống** (bị clear trước khi search) |
+
+Mỗi iteration, `saveCurrentTree(score)` (`iqtree.cpp:3288`) thêm cây vào `treels` nếu topology chưa có (dedup theo Newick string).
+
+### Flow từ `treels` đến `.treefile`
+
+```
+[tree search]
+  saveCurrentTree(-(double)pars)       ← mỗi candidate tree
+      treels[newick_str] = idx
+      treels_logl[idx]  = score
+
+[sau search — phyloanalysis.cpp:1963]
+  iqtree.summarizeBootstrap(params)    ← iqtree.cpp:4047
+      đọc tất cả cây trong treels
+      tính bootstrap weight cho từng topology
+          (mỗi replicate i vote cho cây có REPS thấp nhất)
+      createBootstrapSupport()         ← tạo consensus tree với support values
+      readTree(consensus_stream)       ← load consensus vào current tree object
+
+[phyloanalysis.cpp:1969]
+  iqtree.printResultTree()             ← iqtree.cpp:4402
+      in current tree (= consensus) ra .treefile
+```
+
+### Điểm quan trọng
+
+- `.treefile` là **consensus tree** có support values — KHÔNG phải cây có parsimony tốt nhất đơn thuần
+- Cây được chọn theo **bootstrap weight** (số replicate support), không phải max `treels_logl`
+- GPU `gpuHillClimbing` gọi `saveCurrentTree()` → cây GPU vào `treels` → `summarizeBootstrap()` xử lý giống hệt CPU
+- Chất lượng output cuối phụ thuộc vào **độ đa dạng + chất lượng tổng thể của cây trong `treels`**, không chỉ best score
+
+### Key lines (iqtree.cpp)
+
+| Dòng | Function | Vai trò |
+|------|----------|---------|
+| 3288 | `saveCurrentTree()` | Thêm cây vào `treels` + `treels_logl` |
+| 4047 | `summarizeBootstrap(Params&)` | Tính bootstrap weight, tạo consensus |
+| 3907 | `max_element(tree_weights)` | Chọn topology thắng nhiều replicates nhất |
+| 3968 | `readTree(tree_stream)` | Load consensus vào current tree object |
+| 4402 | `printResultTree()` | Ghi ra `.treefile` |
