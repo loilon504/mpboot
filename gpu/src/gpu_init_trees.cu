@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "gpu/include/gpu_init_trees.cuh"
+#include "gpu/include/pars_bootstrap.cuh"
 #include "gpu/include/pars_build.cuh"
 #include "gpu/include/pars_tree.cuh"
 #include "gpu/include/utils.cuh"
@@ -32,7 +33,8 @@ static inline double msSince(
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
 int mpbootGpu(
-    const Params& params, IQTree& iqtree, int numInitTrees, std::vector<std::string>& candidateTrees
+    const Params& params, IQTree& iqtree, int numInitTrees, std::vector<std::string>& candidateTrees,
+    GpuParsimonyMem** out_mem
 )
 {
     struct StdoutUnbuf
@@ -73,7 +75,11 @@ int mpbootGpu(
 
     // ── [2] Allocate GPU memory ───────────────────────────────────────────────
     t0 = std::chrono::high_resolution_clock::now();
-    GpuParsimonyMem* mem = gpuParsimonyMemAlloc(K_alloc, mxtips, width, states, params.gpu_pool_size);
+    // Treels buffer: bootstrap K2 writes all good trees each round for REPS eval.
+    // Size = K * 10 (up to ~10 outer iters per K2 round × K workers).
+    const int max_treels_boot = (params.gbo_replicates > 0) ? K * 10 : 0;
+    GpuParsimonyMem* mem = gpuParsimonyMemAlloc(K_alloc, mxtips, width, states,
+                                                params.gpu_pool_size, max_treels_boot);
     printf("[GPU]   [2]      %-28s: %8.3f s\n", "GPU memory alloc", msSince(t0) / 1e3);
 
     // ── [3] Upload tip parsVect ───────────────────────────────────────────────
@@ -510,9 +516,12 @@ int mpbootGpu(
     float build_ms = ev_time(
         [&]
         {
+            // Bootstrap mode: skip K2 (each bootstrap round runs K1 with per-sample weights).
+            const int k2_max_outer = (params.gbo_replicates > 0) ? 0 : -1;
             gpuStepwiseBuildTrees(
                 mem, seeds.data(), K, params.sprDist, numNNI,
-                pool_size, params.gpu_pool_stop, stream, hybrid_cb, hybrid_cb2, k2_workers
+                pool_size, params.gpu_pool_stop, stream, hybrid_cb, hybrid_cb2,
+                k2_workers, k2_max_outer
             );
         }
     );
@@ -527,8 +536,10 @@ int mpbootGpu(
     printf("[GPU]\n");
 
     // ── [6b] Pre/post-SPR parsimony summary + phase effectiveness ───────────
+    // Skip in bootstrap mode: K2 not run here, stats would show 0/0.
+    // Pool → candidateTrees is done at end of gpuBootstrapSearch instead.
     unsigned int best_hc = UINT_MAX;
-    {
+    if (params.gbo_replicates == 0) {
         unsigned int best_pre = UINT_MAX, worst_pre = 0;
         unsigned int best_spr = UINT_MAX, worst_spr = 0;
         unsigned int worst_hc = 0;
@@ -602,11 +613,11 @@ int mpbootGpu(
         }
     }
 
-    // ── [7] Download + Newick + register into candidateTrees ─────────────────
-    // Capture CPU best parsimony before [7] loop may update bestScore via setBestTree
-    unsigned int best_cpu_pars = (iqtree.bestScore < 0) ? (unsigned int)(-iqtree.bestScore) : 0;
-
+    // ── [7] Download + Newick + register into candidateTrees (non-bootstrap only) ─
+    // In bootstrap mode, pool → candidateTrees is done at end of gpuBootstrapSearch.
     int built = 0;
+    if (params.gbo_replicates == 0) {
+    unsigned int best_cpu_pars = (iqtree.bestScore < 0) ? (unsigned int)(-iqtree.bestScore) : 0;
     double t_download = 0, t_topo = 0, t_newick = 0;
 
     {
@@ -667,10 +678,218 @@ int mpbootGpu(
     printf(
         "[GPU]   best CPU tree: %-7u  best GPU tree: %u\n", best_cpu_pars, best_hc
     );
+    } // end if (params.gbo_replicates == 0)
     printf("[GPU] ═══════════════════════════════════════════════════════\n\n");
+    (void)best_hc;
 
-    gpuParsimonyMemFree(mem);
+    if (out_mem != nullptr) {
+        *out_mem = mem;  // caller takes ownership, responsible for gpuParsimonyMemFree
+    } else {
+        gpuParsimonyMemFree(mem);
+    }
     return built;
+}
+
+// ─── gpuBootstrapSearch ───────────────────────────────────────────────────────
+// Replaces CPU doTreeSearch() for -use_gpu -bb.
+// Each round: K1 runs with per-worker bootstrapped site weights → diverse trees → REPS eval.
+void gpuBootstrapSearch(
+    const Params& params,
+    IQTree&        iqtree,
+    GpuParsimonyMem* mem
+)
+{
+    cudaStream_t stream = 0;
+    const int K          = mem->K;
+    const int B          = params.gbo_replicates;
+    const int sprDist    = params.sprDist;
+    const int numNNI     = std::max(1, (int)(params.gpu_nni_strength * (mem->mxtips - 3)));
+    const int pool_size  = mem->pool_size;
+    const int width      = mem->width;
+    const int step_iter  = params.step_iterations;
+    // Convergence check every step_iter_rounds rounds (mirrors CPU every step_iter/2 iters).
+    const int step_iter_rounds = std::max(1, std::max(1, step_iter / 2) / K);
+
+    iqtree.params->store_candidate_trees = true;
+
+    // Template topology for treels reconstruction (back_vf only stored in treels;
+    // other fields come from here). start_vface=0 → tr->start=tip1; start->back = valid Newick root.
+    GpuTopology h_tpl;
+    downloadTopology(mem, 0, &h_tpl, stream);
+    h_tpl.start_vface = 0;
+    memset(h_tpl.xpars, 0, sizeof(h_tpl.xpars));
+
+    // Reusable host buffer for batch-downloading treels back_vf each round.
+    const int max_treels = mem->max_treels;
+    std::vector<int> h_treels_bvf;
+    if (max_treels > 0)
+        h_treels_bvf.resize((size_t)max_treels * kMaxVFaces);
+
+    double cur_correlation = 0.0;
+    int round = 0, total_done = 0;
+    double best_logl_seen = -1e30;
+    int no_improve_rounds = 0;
+
+    printf("[GPU Bootstrap] K2-treels: B=%d K=%d pool=%d min_cor=%.4f\n",
+           B, K, pool_size, params.min_correlation);
+    fflush(stdout);
+
+    for (;;) {
+        auto t_round = std::chrono::high_resolution_clock::now();
+
+        // ── Reset treels with current logl_cutoff → GPU filters bad trees ────────
+        // logl_cutoff < 0 (= -parsimony); GPU cutoff = unsigned parsimony threshold.
+        // If logl_cutoff == 0.0 (not yet activated), use ∞ (accept all).
+        const unsigned int boot_cutoff = (iqtree.logl_cutoff != 0.0)
+            ? (unsigned int)(-(double)iqtree.logl_cutoff)
+            : 0xFFFFFFFFu;
+        resetTreelsRound(mem, boot_cutoff);
+        resetPoolRound(mem);
+
+        // ── Run K2 from pool (k1_count=0 skips K1) ───────────────────────────
+        gpuStepwiseBuildTrees(
+            mem, nullptr, /*k1_count=*/0, sprDist, numNNI,
+            pool_size, params.gpu_pool_stop, stream,
+            nullptr, nullptr, K, /*max_outer_iters=*/1
+        );
+
+        // ── Download treels → REPS eval ───────────────────────────────────────
+        int h_filled = 0;
+        CUDA_CHECK(cudaMemcpy(&h_filled, mem->d_treelsFilled, sizeof(int), cudaMemcpyDeviceToHost));
+        const int n_treels = std::min(h_filled, max_treels);
+
+        if (n_treels > 0 && max_treels > 0) {
+            CUDA_CHECK(cudaMemcpy(h_treels_bvf.data(), mem->d_treelsBackVf,
+                       (size_t)n_treels * kMaxVFaces * sizeof(int), cudaMemcpyDeviceToHost));
+
+            GpuTopology h_topo = h_tpl;
+            for (int t = 0; t < n_treels; t++) {
+                memcpy(h_topo.back_vf, h_treels_bvf.data() + (size_t)t * kMaxVFaces,
+                       h_tpl.num_vfaces * sizeof(int));
+
+                gpuTopoToCpu(&h_topo, iqtree.pllInst);
+                pllTreeToNewick(
+                    iqtree.pllInst->tree_string, iqtree.pllInst, iqtree.pllPartitions,
+                    iqtree.pllInst->start->back, PLL_TRUE, PLL_TRUE, PLL_FALSE, PLL_FALSE,
+                    PLL_FALSE, PLL_SUMMARIZE_LH, PLL_FALSE, PLL_FALSE
+                );
+                std::string newick(iqtree.pllInst->tree_string);
+                if (newick.empty()) continue;
+
+                iqtree.readTreeString(newick);
+                iqtree.initializeAllPartialPars();
+                iqtree.clearAllPartialLH();
+                int pars = iqtree.computeParsimony();
+
+                bool saved = iqtree.params->spr_parsimony;
+                iqtree.params->spr_parsimony = false;
+                iqtree.saveCurrentTree(-(double)pars);
+                iqtree.params->spr_parsimony = saved;
+            }
+        }
+
+        total_done += K;
+        round++;
+
+        // ── Track global best improvement across rounds ───────────────────────
+        if (!iqtree.treels_logl.empty()) {
+            double cur_best = *std::max_element(iqtree.treels_logl.begin(), iqtree.treels_logl.end());
+            if (cur_best > best_logl_seen + 1e-6) {
+                best_logl_seen = cur_best;
+                no_improve_rounds = 0;
+            } else {
+                no_improve_rounds++;
+            }
+        }
+
+        // ── Update logl_cutoff (mirrors CPU: top cutoff_percent%, activate at 1000 trees) ──
+        if (iqtree.treels_logl.size() > 0) {
+            DoubleVector logl = iqtree.treels_logl;
+            nth_element(logl.begin(),
+                        logl.begin() + logl.size() * params.cutoff_percent / 100,
+                        logl.end(), std::greater<double>());
+            iqtree.logl_cutoff = logl[logl.size() * params.cutoff_percent / 100];
+        }
+
+        // ── Convergence check (only after ≥1000 replicates, mirrors logl_cutoff threshold) ──
+        if (round % step_iter_rounds == 0 && total_done >= 0) {
+            SplitGraph* sg = new SplitGraph;
+            iqtree.summarizeBootstrap(*sg);
+            iqtree.boot_splits.push_back(sg);
+            while (iqtree.boot_splits.size() > 2) {
+                delete iqtree.boot_splits.front();
+                iqtree.boot_splits.erase(iqtree.boot_splits.begin());
+            }
+            if (iqtree.boot_splits.size() >= 2)
+                cur_correlation = iqtree.computeBootstrapCorrelation();
+        }
+
+        double round_sec = msSince(t_round) / 1e3;
+        printf("[GPU Bootstrap] Round %-3d  done=%-5d  filled=%-5d  treels=%-5zu  no_impr=%d  cor=%.4f  t=%.2fs\n",
+               round, total_done, h_filled, iqtree.treels_logl.size(), no_improve_rounds, cur_correlation, round_sec);
+        fflush(stdout);
+
+        if (no_improve_rounds >= 3 && cur_correlation >= params.min_correlation)
+            break;
+    }
+
+    printf("[GPU Bootstrap] Done: %d rounds, %d replicates, cor=%.4f\n",
+           round, total_done, cur_correlation);
+
+    // ── Add GPU pool topologies to candidateTrees (mirrors step [7] of mpbootGpu) ──
+    // After bootstrap K2 rounds, pool holds near-optimal topologies. Register them
+    // as candidate trees so the final best-score report uses GPU-found trees.
+    {
+        pllInstance* tr = iqtree.pllInst;
+        partitionList* pr = iqtree.pllPartitions;
+        const int ps = mem->pool_size;
+
+        std::vector<unsigned int> h_ps(ps, 0xFFFFFFFFu);
+        std::vector<int>          h_pvf((size_t)ps * kMaxVFaces);
+        CUDA_CHECK(cudaMemcpy(h_ps.data(),  mem->d_poolScores,
+            ps * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_pvf.data(), mem->d_poolBackVf,
+            (size_t)ps * kMaxVFaces * sizeof(int), cudaMemcpyDeviceToHost));
+
+        // Find best pool score to filter slots
+        unsigned int best_pool = 0xFFFFFFFFu;
+        for (int i = 0; i < ps; i++)
+            if (h_ps[i] < best_pool) best_pool = h_ps[i];
+
+        GpuTopology tmpl;
+        downloadTopology(mem, 0, &tmpl, stream);
+        cudaStreamSynchronize(stream);
+        tmpl.start_vface = 0;
+        memset(tmpl.xpars, 0, sizeof(tmpl.xpars));
+
+        int n_pool_added = 0;
+        for (int i = 0; i < ps; i++) {
+            if (h_ps[i] == 0xFFFFFFFFu) continue;
+
+            GpuTopology h_topo = tmpl;
+            memcpy(h_topo.back_vf, h_pvf.data() + (size_t)i * kMaxVFaces,
+                   tmpl.num_vfaces * sizeof(int));
+            h_topo.bestParsimony = h_ps[i];
+
+            gpuTopoToCpu(&h_topo, tr);
+            pllTreeToNewick(tr->tree_string, tr, pr, tr->start->back,
+                PLL_TRUE, PLL_TRUE, PLL_FALSE, PLL_FALSE, PLL_FALSE,
+                PLL_SUMMARIZE_LH, PLL_FALSE, PLL_FALSE);
+            std::string tree_str(tr->tree_string);
+            if (tree_str.empty()) continue;
+
+            iqtree.readTreeString(tree_str);
+            iqtree.initializeAllPartialPars();
+            iqtree.clearAllPartialLH();
+            iqtree.curScore = -(double)iqtree.computeParsimony();
+            bool isNew = iqtree.candidateTrees.update(tree_str, iqtree.curScore);
+            if (isNew && iqtree.curScore > iqtree.bestScore)
+                iqtree.setBestTree(tree_str, iqtree.curScore);
+            n_pool_added++;
+        }
+        printf("[GPU Bootstrap] Pool → candidateTrees: %d/%d slots added, best_pool=%u\n",
+               n_pool_added, ps, best_pool);
+    }
 }
 
 }  // namespace mpbootgpu

@@ -32,6 +32,7 @@
 #include "vectorclass/vectormath_common.h"
 #include "parstree.h"
 #include "gpu/include/profiler.hpp"
+#include "gpu/include/pars_bootstrap.cuh"
 
 Params *globalParam;
 Alignment *globalAlignment;
@@ -80,6 +81,7 @@ void IQTree::init() {
     reps_segments = -1;
     segment_upper = NULL;
     original_sample = NULL;
+    gpu_boot_mem_ = nullptr;
 }
 
 IQTree::IQTree(Alignment *aln) : PhyloTree(aln) {
@@ -477,6 +479,11 @@ IQTree::~IQTree() {
     if(original_sample){
     	aligned_free(original_sample);
     	original_sample = NULL;
+    }
+
+    if (gpu_boot_mem_) {
+        mpbootgpu::gpuBootstrapMemFree(gpu_boot_mem_);
+        gpu_boot_mem_ = nullptr;
     }
 
 #if (defined(__SSE3) || defined(__AVX))
@@ -1086,6 +1093,7 @@ void IQTree::doRandomNNIs(int numNNI) {
     NodeVector nodeList1, nodeList2;
     getInternalBranches(nodeList1, nodeList2);
     int numInBran = nodeList1.size();
+    if (numInBran != aln->getNSeq() - 3)
     assert(numInBran == aln->getNSeq() - 3);
     for (int i = 0; i < numNNI; i++) {
         int index = random_int(numInBran);
@@ -1619,7 +1627,6 @@ double IQTree::doTreeSearch() {
     printTree(bestTreeStream, WT_TAXON_ID + WT_BR_LEN);
     printTree(bestTopoStream, WT_TAXON_ID + WT_SORT_TAXA);
     string best_tree_topo = bestTopoStream.str();
-
     stop_rule.addImprovedIteration(1);
     searchinfo.curPerStrength = params->initPerStrength;
 
@@ -3418,11 +3425,20 @@ void IQTree::saveCurrentTree(double cur_logl) {
         int updated = 0;
         int nsamples = (params->maximum_parsimony) ? boot_samples_pars.size() : boot_samples.size();
 
+        // GPU REPS path: evaluate all B replicates in parallel before the sample loop
+        if (gpu_boot_mem_ != nullptr && params->maximum_parsimony && _pattern_pars != nullptr) {
+            mpbootgpu::gpuREPSEval(gpu_boot_mem_, _pattern_pars);
+        }
+
         for (int sample = 0; sample < nsamples; sample++) {
             double rell = 0.0;
             bool skipped = false;
 
 			if (params->maximum_parsimony) {
+				// --- GPU REPS: use pre-computed h_rell ---
+				if (gpu_boot_mem_ != nullptr && _pattern_pars != nullptr) {
+					rell = -(double)gpu_boot_mem_->h_rell[sample];
+				} else {
 				BootValTypePars *boot_sample = boot_samples_pars[sample];
 
 				if(params->auto_vectorize){
@@ -3457,6 +3473,7 @@ void IQTree::saveCurrentTree(double cur_logl) {
 
 					rell = -(double)res;
 				}
+				} // end CPU REPS else-branch
 			} else {
 				// TODO: The following parallel is not very efficient, should wrap the above loop
 	//#ifdef _OPENMP

@@ -57,6 +57,7 @@
 #include "gpu/include/profiler.hpp"
 #include "gpu/include/sprparsimony.hpp"
 #include "gpu/include/gpu_init_trees.cuh"
+#include "gpu/include/pars_bootstrap.cuh"
 #include <chrono>
 #include <iomanip>
 
@@ -1421,11 +1422,25 @@ void runBasicMpbootGpu(Params &params, IQTree &iqtree, int numInitTrees) {
 //    if(params.maximum_parsimony) iqtree.candidateTrees.clear(); // Diep: added this to fix the bug of sorted aln <> orig aln
 
     if (params.use_gpu && params.start_tree == STT_PLL_PARSIMONY) {
-        // GPU path: build all K trees in parallel on GPU.
-        // candidateTrees.update + setBestTree are handled inside mpbootGpu.
         cout << "\nUsing GPU for parallel parsimony tree building\n";
         vector<string> gpuTrees(numInitTrees);
-        mpbootgpu::mpbootGpu(params, iqtree, numInitTrees, gpuTrees);
+        mpbootgpu::GpuParsimonyMem* boot_gpu_mem = nullptr;
+        const bool need_boot_loop = (params.gbo_replicates > 0 && params.maximum_parsimony);
+        mpbootgpu::mpbootGpu(params, iqtree, numInitTrees, gpuTrees,
+                             need_boot_loop ? &boot_gpu_mem : nullptr);
+        if (need_boot_loop && boot_gpu_mem != nullptr) {
+            // Init GPU bootstrap memory HERE (before gpuBootstrapSearch needs it)
+            if (!iqtree.boot_samples_pars.empty()) {
+                int nunit = (int)(iqtree.getAlnNPattern() + VCSIZE_USHORT);
+                iqtree.gpu_boot_mem_ = mpbootgpu::gpuBootstrapMemAlloc(
+                    params.gbo_replicates, (int)iqtree.getAlnNPattern(), nunit);
+                mpbootgpu::gpuUploadBootSamples(iqtree.gpu_boot_mem_, iqtree.boot_samples_pars);
+            }
+            // GPU bootstrap main loop: replaces doTreeSearch() for -use_gpu -bb
+            mpbootgpu::gpuBootstrapSearch(params, iqtree, boot_gpu_mem);
+            mpbootgpu::gpuParsimonyMemFree(boot_gpu_mem);
+            // gpu_boot_mem_ freed in ~IQTree or "Do tree search" section
+        }
     }
 	auto endTime = std::chrono::high_resolution_clock::now();
 	double sec = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count() / 1e6;
@@ -1777,6 +1792,8 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 
 	if (params.use_gpu)
 	{
+		// Note: runBasicMpbootGpu also calls gpuBootstrapSearch (for -bb) and
+		// initializes iqtree.gpu_boot_mem_ internally before the search loop.
 		runBasicMpbootGpu(params, iqtree, numInitTrees);
 	} else if (params.min_iterations > 0) {
         double initTime = getCPUTime();
@@ -1843,8 +1860,14 @@ void runTreeReconstruction(Params &params, string &original_model, IQTree &iqtre
 	}
 
 	/****************** Do tree search ***************************/
-	if (params.use_gpu) {}
-	else if (params.min_iterations > 1) {
+	if (params.use_gpu) {
+		// Bootstrap search already ran inside runBasicMpbootGpu via gpuBootstrapSearch().
+		// Free GPU bootstrap memory if still allocated.
+		if (iqtree.gpu_boot_mem_) {
+			mpbootgpu::gpuBootstrapMemFree(iqtree.gpu_boot_mem_);
+			iqtree.gpu_boot_mem_ = nullptr;
+		}
+	} else if (params.min_iterations > 1) {
 		iqtree.readTreeString(iqtree.bestTreeString);
 		iqtree.doTreeSearch();
 		iqtree.setAlignment(iqtree.aln);

@@ -89,6 +89,13 @@ struct GpuParsimonyMem
     int*          d_poolStop;     // global no-improve counter; reset to 0 on new global best, +1 otherwise; stop when >= pool_size
     unsigned int* d_globalBest;   // global best parsimony across all warps
 
+    // Treels buffer (bootstrap round output): workers write here if score ≤ d_treelsCutoff
+    int    max_treels;              // capacity; 0 = disabled
+    unsigned int* d_treelsScores;   // [max_treels] parsimony score per slot (UINT_MAX = empty)
+    int*   d_treelsBackVf;          // [max_treels × kMaxVFaces] back_vf snapshots
+    int*   d_treelsFilled;          // atomic fill counter (0..max_treels)
+    unsigned int* d_treelsCutoff;   // score ≤ cutoff → write to treels (UINT_MAX = all qualify)
+
     int K;  // number of trees
     int mxtips;
     int width;  // parsimonyLength (compressed blocks)
@@ -178,8 +185,12 @@ void gpuTopoToCpu(const GpuTopology* in, pllInstance* tr);
 
 // Allocate all GPU memory for K trees.
 // mxtips, width, states must match the alignment.
-GpuParsimonyMem* gpuParsimonyMemAlloc(int K, int mxtips, int width, int states, int pool_size = 20);
+GpuParsimonyMem* gpuParsimonyMemAlloc(int K, int mxtips, int width, int states,
+                                       int pool_size = 20, int max_treels = 0);
 void gpuParsimonyMemFree(GpuParsimonyMem* mem);
+
+// Reset treels buffer and set new cutoff threshold (call before each K2 bootstrap round).
+void resetTreelsRound(GpuParsimonyMem* mem, unsigned int cutoff_pars);
 
 // Upload tip parsVect for ALL K trees (shared; tips are read-only).
 // Reorders from CPU [node][state][block] → GPU [node][block][state].
@@ -200,6 +211,21 @@ void downloadTopology(
 void downloadParsScore(
     const GpuParsimonyMem* mem, int k, unsigned int* h_out, cudaStream_t stream = 0
 );
+
+// ─── Pool helpers (bootstrap rounds) ──────────────────────────────────────────
+
+// Download all pool scores into h_out[pool_size]. Synchronous.
+void downloadPoolScores(
+    const GpuParsimonyMem* mem, unsigned int* h_out
+);
+
+// Download back_vf array for pool slot s into h_back_vf[kMaxVFaces]. Synchronous.
+void downloadPoolBackVf(
+    const GpuParsimonyMem* mem, int slot, int* h_back_vf
+);
+
+// Reset pool_stop counter to 0 and global_best to UINT_MAX (call before each K2 round).
+void resetPoolRound(GpuParsimonyMem* mem);
 
 // ─── Validation kernel (Phase 1 test) ─────────────────────────────────────────
 // Runs newview for all (p,q,r) triples in h_ti[0..tiCount-1]

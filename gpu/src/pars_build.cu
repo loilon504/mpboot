@@ -590,10 +590,16 @@ __device__ void runPhase3(
     int* pool_slot_locks,       // device ptr: per-slot spinlocks [pool_size]
     int* pool_stop,             // device ptr: no-improve counter; reset on new global best, +1 otherwise
     int  pool_stop_thresh,      // stop K2 when pool_stop >= this (from -gpu_pool_stop, default 100)
-    unsigned int* global_best   // device ptr: global best parsimony across all warps
+    unsigned int* global_best,  // device ptr: global best parsimony across all warps
+    int  max_outer_iters,       // max outer iterations (-1 = unbounded)
+    unsigned int* treels_scores,  // [max_treels] or nullptr — bootstrap output buffer
+    int*   treels_back_vf,        // [max_treels × kMaxVFaces] or nullptr
+    int*   treels_filled,         // atomic fill counter or nullptr
+    unsigned int* treels_cutoff,  // score ≤ cutoff → write to treels; nullptr = disabled
+    int    max_treels             // treels buffer capacity
 )
 {
-    for (int outer = 0;; outer++)
+    for (int outer = 0; max_outer_iters < 0 || outer < max_outer_iters; outer++)
     {
         if (pool_stop != nullptr && *pool_stop >= pool_stop_thresh)
         {
@@ -845,6 +851,36 @@ __device__ void runPhase3(
         }
         __syncwarp();
 
+        // ── Treels write: add current tree to bootstrap output buffer if score ≤ cutoff ──
+        // No lock needed: each slot is assigned uniquely via atomicAdd → no two warps collide.
+        if (treels_scores != nullptr && treels_filled != nullptr && treels_cutoff != nullptr)
+        {
+            if (lane == 0)
+            {
+                sh.bcast[6] = -1;
+                unsigned int cutoff = *((volatile unsigned int*)treels_cutoff);
+                if (sh.randomMP <= cutoff)
+                {
+                    int slot = atomicAdd(treels_filled, 1);
+                    if (slot < max_treels)
+                    {
+                        treels_scores[slot] = sh.randomMP;
+                        sh.bcast[6] = slot;
+                    }
+                    // slot ≥ max_treels: buffer full, skip (counter already incremented, harmless)
+                }
+            }
+            __syncwarp();
+            if (sh.bcast[6] >= 0)
+            {
+                int* dst = treels_back_vf + (size_t)sh.bcast[6] * kMaxVFaces;
+                for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
+                    dst[vf] = topo->back_vf[vf];
+                __syncwarp();
+            }
+            __syncwarp();
+        }
+
         // Pool convergence: +1/iter (not +k2_workers/iter) so threshold is independent of worker count.
         // All warps update global_best; only warp 0 increments the iter counter.
         // Reset uses atomicCAS to guard against resurrecting the counter after block 0 has exited:
@@ -1078,7 +1114,13 @@ __global__ void buildPhase3Kernel(
     int* pool_slot_locks,       // device ptr: per-slot spinlocks [pool_size]
     int* pool_stop,             // device ptr: no-improve counter
     int  pool_stop_thresh,      // stop when pool_stop >= this
-    unsigned int* global_best   // device ptr: global best parsimony across all warps
+    unsigned int* global_best,  // device ptr: global best parsimony across all warps
+    int  max_outer_iters,       // max outer iterations (-1 = unbounded)
+    unsigned int* treels_scores,
+    int*   treels_back_vf,
+    int*   treels_filled,
+    unsigned int* treels_cutoff,
+    int    max_treels
 )
 {
     __shared__ BuildSharedT<NTAXA> sh;
@@ -1107,7 +1149,8 @@ __global__ void buildPhase3Kernel(
     runPhase3<STATES>(
         pars_tree, score_tree, topo, sh, sw_k, N, sprDist, numNNI, lane, k, width,
         pool_size, pool_scores, pool_back_vf, pool_filled, pool_slot_locks,
-        pool_stop, pool_stop_thresh, global_best
+        pool_stop, pool_stop_thresh, global_best, max_outer_iters,
+        treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels
     );
 }
 
@@ -1123,20 +1166,25 @@ void gpuStepwiseBuildTrees(
     cudaStream_t stream,
     AfterK1Callback after_k1,
     AfterK2Callback after_k2,
-    int k2_workers
+    int k2_workers,
+    int max_outer_iters
 )
 {
-    const int K = mem->K;  // K_alloc = max(k1_count, k2_workers)
-    if (k1_count <= 0 || k1_count > K) k1_count = K;
+    const int K = mem->K;
+    const bool skip_k1 = (k1_count == 0);  // 0 = K2-only (bootstrap rounds)
+    if (!skip_k1 && (k1_count < 0 || k1_count > K)) k1_count = K;
     if (k2_workers <= 0 || k2_workers > K) k2_workers = K;
     long* d_seeds = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_seeds, (size_t)k1_count * sizeof(long)));
-    CUDA_CHECK(cudaMemcpyAsync(
-        d_seeds, seeds, (size_t)k1_count * sizeof(long), cudaMemcpyHostToDevice, stream
-    ));
-    CUDA_CHECK(cudaMemsetAsync(
-        mem->d_parsScore, 0, (size_t)K * mem->parsScorePerTree * sizeof(unsigned int), stream
-    ));
+    if (!skip_k1)
+    {
+        CUDA_CHECK(cudaMalloc(&d_seeds, (size_t)k1_count * sizeof(long)));
+        CUDA_CHECK(cudaMemcpyAsync(
+            d_seeds, seeds, (size_t)k1_count * sizeof(long), cudaMemcpyHostToDevice, stream
+        ));
+        CUDA_CHECK(cudaMemsetAsync(
+            mem->d_parsScore, 0, (size_t)K * mem->parsScorePerTree * sizeof(unsigned int), stream
+        ));
+    }
 
     const int states = mem->states;
     const int mxtips = mem->mxtips;
@@ -1150,45 +1198,48 @@ void gpuStepwiseBuildTrees(
         constexpr int NT = decltype(ntaxa_tag)::value;
         const size_t sharedBytes = sizeof(BuildSharedT<NT>);
 
-        printf("\n[GPU] --------------------------------------------\n");
-        printf("[GPU]   buildTreesKernel<STATES=%d,NTAXA=%d>\n", S, NT);
-        printf(
-            "[GPU]         K1=%d  k2=%d  sprDist=%d  shared=%.1f KB\n", k1_count, k2_workers, sprDist,
-            sharedBytes / 1024.0
-        );
-
-        // Launch K1 async — builds k1_count trees; callback (if any) does cudaStreamQuery loop
-        cudaEvent_t k1_start, k1_end;
-        cudaEventCreate(&k1_start);
-        cudaEventCreate(&k1_end);
-        cudaEventRecord(k1_start, stream);
-        buildParsimonyTreesKernel<S, NT><<<dim3(k1_count), dim3(kWarpSize), 0, stream>>>(
-            mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, d_seeds,
-            mem->width, sprDist, mem->d_postSprScores, mem->parsVectPerTree, mem->parsScorePerTree
-        );
-        cudaEventRecord(k1_end, stream);
-        CUDA_CHECK(cudaGetLastError());
-
-        if (after_k1)
+        if (!skip_k1)
         {
-            // Hybrid: callback builds CPU trees via cudaStreamQuery, syncs, merges, uploads
-            after_k1(stream, mem);
-            // K1 is now fully done (callback called cudaStreamSynchronize)
-        }
-        else
-        {
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            printf("\n[GPU] --------------------------------------------\n");
+            printf("[GPU]   buildTreesKernel<STATES=%d,NTAXA=%d>\n", S, NT);
+            printf(
+                "[GPU]         K1=%d  k2=%d  sprDist=%d  shared=%.1f KB\n", k1_count, k2_workers, sprDist,
+                sharedBytes / 1024.0
+            );
+
+            cudaEvent_t k1_start, k1_end;
+            cudaEventCreate(&k1_start);
+            cudaEventCreate(&k1_end);
+            cudaEventRecord(k1_start, stream);
+            buildParsimonyTreesKernel<S, NT><<<dim3(k1_count), dim3(kWarpSize), 0, stream>>>(
+                mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, d_seeds,
+                mem->width, sprDist, mem->d_postSprScores, mem->parsVectPerTree, mem->parsScorePerTree
+            );
+            cudaEventRecord(k1_end, stream);
+            CUDA_CHECK(cudaGetLastError());
+
+            if (after_k1)
+            {
+                after_k1(stream, mem);
+            }
+            else
+            {
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
+
+            float k1ms = 0.f;
+            cudaEventElapsedTime(&k1ms, k1_start, k1_end);
+            cudaEventDestroy(k1_start);
+            cudaEventDestroy(k1_end);
+            printf("[GPU]         time: %.3f s\n", k1ms / 1e3);
         }
 
-        // K1 timing (event already recorded; K1 is done by now)
-        float k1ms = 0.f;
-        cudaEventElapsedTime(&k1ms, k1_start, k1_end);
-        cudaEventDestroy(k1_start);
-        cudaEventDestroy(k1_end);
-        printf("[GPU]         time: %.3f s\n", k1ms / 1e3);
+        if (max_outer_iters == 0) return;  // bootstrap mode: K1-only, skip K2
 
-        printf("\n[GPU] --------------------------------------------\n");
-        printf("[GPU]   hillClimbingKernel<STATES=%d,NTAXA=%d>\n", S, NT);
+        if (!skip_k1) {
+            printf("\n[GPU] --------------------------------------------\n");
+            printf("[GPU]   hillClimbingKernel<STATES=%d,NTAXA=%d>\n", S, NT);
+        }
 
         // Launch K2 async — AfterK2Callback (if any) runs CPU work while K2 executes
         cudaEvent_t k2_start, k2_end;
@@ -1199,7 +1250,9 @@ void gpuStepwiseBuildTrees(
             mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, mem->width,
             sprDist, numNNI, mem->parsVectPerTree, mem->parsScorePerTree, poolSize,
             mem->d_poolScores, mem->d_poolBackVf, mem->d_poolFilled, mem->d_poolSlotLocks,
-            mem->d_poolStop, poolStopThresh, mem->d_globalBest
+            mem->d_poolStop, poolStopThresh, mem->d_globalBest, max_outer_iters,
+            mem->d_treelsScores, mem->d_treelsBackVf, mem->d_treelsFilled,
+            mem->d_treelsCutoff, mem->max_treels
         );
         cudaEventRecord(k2_end, stream);
         CUDA_CHECK(cudaGetLastError());
@@ -1219,7 +1272,8 @@ void gpuStepwiseBuildTrees(
         cudaEventElapsedTime(&k2ms, k2_start, k2_end);
         cudaEventDestroy(k2_start);
         cudaEventDestroy(k2_end);
-        printf("[GPU]         time: %.3f s\n\n", k2ms / 1e3);
+        if (!skip_k1)
+            printf("[GPU]         time: %.3f s\n\n", k2ms / 1e3);
     };
 
     // Dispatch on NTAXA bucket (Opt-P L3) then STATES.
@@ -1252,7 +1306,7 @@ void gpuStepwiseBuildTrees(
         dispatch_ntaxa(std::integral_constant<int, 4>{});
     }
 
-    CUDA_CHECK(cudaFree(d_seeds));
+    if (d_seeds) CUDA_CHECK(cudaFree(d_seeds));
 }
 
 }  // namespace mpbootgpu

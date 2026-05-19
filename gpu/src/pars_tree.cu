@@ -90,7 +90,7 @@ void gpuTopoToCpu(
 
 // ─── gpuParsimonyMemAlloc ─────────────────────────────────────────────────────
 GpuParsimonyMem* gpuParsimonyMemAlloc(
-    int K, int mxtips, int width, int states, int pool_size
+    int K, int mxtips, int width, int states, int pool_size, int max_treels
 )
 {
     auto* mem = new GpuParsimonyMem();
@@ -137,6 +137,25 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     CUDA_CHECK(cudaMemset(mem->d_poolSlotLocks, 0, (size_t)pool_size * sizeof(int)));
     CUDA_CHECK(cudaMemcpy(mem->d_poolStop,    &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(mem->d_globalBest,  &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
+
+    // Treels buffer (optional, for bootstrap round output)
+    mem->max_treels       = max_treels;
+    mem->d_treelsScores   = nullptr;
+    mem->d_treelsBackVf   = nullptr;
+    mem->d_treelsFilled   = nullptr;
+    mem->d_treelsCutoff   = nullptr;
+    if (max_treels > 0) {
+        CUDA_CHECK(cudaMalloc(&mem->d_treelsScores,
+            (size_t)max_treels * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&mem->d_treelsBackVf,
+            (size_t)max_treels * kMaxVFaces * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&mem->d_treelsFilled, sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&mem->d_treelsCutoff, sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(mem->d_treelsScores, 0xFF,
+            (size_t)max_treels * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemcpy(mem->d_treelsFilled, &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(mem->d_treelsCutoff, &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
+    }
 
     CUDA_CHECK(cudaMemset(mem->d_parsVect,    0, parsVectBytes));
     CUDA_CHECK(cudaMemset(mem->d_parsScore,   0, parsScoreBytes));
@@ -191,7 +210,20 @@ void gpuParsimonyMemFree(
     if (mem->d_poolSlotLocks)  cudaFree(mem->d_poolSlotLocks);
     if (mem->d_poolStop)       cudaFree(mem->d_poolStop);
     if (mem->d_globalBest)     cudaFree(mem->d_globalBest);
+    if (mem->d_treelsScores)   cudaFree(mem->d_treelsScores);
+    if (mem->d_treelsBackVf)   cudaFree(mem->d_treelsBackVf);
+    if (mem->d_treelsFilled)   cudaFree(mem->d_treelsFilled);
+    if (mem->d_treelsCutoff)   cudaFree(mem->d_treelsCutoff);
     delete mem;
+}
+
+// ─── resetTreelsRound ────────────────────────────────────────────────────────
+void resetTreelsRound(GpuParsimonyMem* mem, unsigned int cutoff_pars)
+{
+    if (!mem->d_treelsFilled) return;
+    int h_zero = 0;
+    CUDA_CHECK(cudaMemcpy(mem->d_treelsFilled, &h_zero,     sizeof(int),          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(mem->d_treelsCutoff, &cutoff_pars, sizeof(unsigned int), cudaMemcpyHostToDevice));
 }
 
 // ─── uploadTipParsVect ────────────────────────────────────────────────────────
@@ -268,6 +300,35 @@ void downloadParsScore(
         cudaMemcpyAsync(h_out, src, count * sizeof(unsigned int), cudaMemcpyDeviceToHost, stream)
     );
     CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+// ─── Pool helpers ─────────────────────────────────────────────────────────────
+
+void downloadPoolScores(const GpuParsimonyMem* mem, unsigned int* h_out)
+{
+    CUDA_CHECK(cudaMemcpy(
+        h_out, mem->d_poolScores,
+        (size_t)mem->pool_size * sizeof(unsigned int),
+        cudaMemcpyDeviceToHost
+    ));
+}
+
+void downloadPoolBackVf(const GpuParsimonyMem* mem, int slot, int* h_back_vf)
+{
+    const int* src = mem->d_poolBackVf + (size_t)slot * kMaxVFaces;
+    CUDA_CHECK(cudaMemcpy(
+        h_back_vf, src,
+        (size_t)kMaxVFaces * sizeof(int),
+        cudaMemcpyDeviceToHost
+    ));
+}
+
+void resetPoolRound(GpuParsimonyMem* mem)
+{
+    int h_zero = 0;
+    // unsigned int h_inf = 0xFFFFFFFFu;
+    CUDA_CHECK(cudaMemcpy(mem->d_poolStop,   &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
+    // CUDA_CHECK(cudaMemcpy(mem->d_globalBest, &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
 }
 
 }  // namespace mpbootgpu
