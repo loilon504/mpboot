@@ -18,6 +18,7 @@ static constexpr int kMaxVFaces = 4 * kMaxTaxa;  // vface IDs = offsets into nod
 // Node numbers go 1..2N-1
 static constexpr int kMaxNodes = 2 * kMaxTaxa;
 static constexpr int kMaxStates = 32;  // DNA
+static constexpr unsigned int kSankoffInf = 0x3FFFFFFFu;  // large but safe: won't overflow when added to cost
 static constexpr int kWarpSize = 32;
 // Opt-P: reduced stack for SPR doAddTraverse + NNI bitset
 // NNI bitset needs ceil(2*kMaxTaxa/32)+1 = 51 words; SPR stack depth ≤ 2*sprDist ≈ 12
@@ -78,6 +79,7 @@ struct GpuParsimonyMem
     unsigned int* d_parsScore;    // [K][2N+1]
     GpuTopology* d_topos;         // [K] topology per tree (global mem)
     unsigned int* d_siteWeights;  // [K][width] per-block weights; 1=normal, 2=ratchet-doubled
+    unsigned int* d_ratchetScratch;  // [K][width] Sankoff ratchet scratch (freq*{1,2}); nullptr=Fitch
     unsigned int* d_postSprScores; // [K] postSprParsimony scores, filled by Phase 2; used by Opt-G2 two-kernel
 
     // Population pool for hill-climbing restarts (Phase 3)
@@ -98,13 +100,16 @@ struct GpuParsimonyMem
 
     int K;  // number of trees
     int mxtips;
-    int width;  // parsimonyLength (compressed blocks)
+    int width;  // parsimonyLength (Fitch blocks) OR numPatterns (Sankoff); used in kernels uniformly
     int states;
+
+    // Sankoff mode: d_cost_matrix != nullptr
+    unsigned int* d_cost_matrix;  // device ptr to [states×states] cost matrix; nullptr = Fitch
 
     size_t nodesPerTree;        // = 2*mxtips + 1 (0-indexed; slot 0 unused)
     size_t parsVectPerTree;     // = nodesPerTree * width * states  (elements)
     size_t parsScorePerTree;    // = nodesPerTree                    (elements)
-    size_t siteWeightsPerTree;  // = width (elements)
+    size_t siteWeightsPerTree;  // = width (elements). Fitch: ratchet weights; Sankoff: pattern frequencies
 };
 
 // ─── Shared memory per block ──────────────────────────────────────────────────
@@ -159,6 +164,10 @@ struct alignas(16) BuildSharedT
     // ── [MEDIUM] Ratchet / site weights ──────────────────────────────────────
     const unsigned int* site_weights;  // nullptr = uniform weight 1
 
+    // ── [Sankoff] Cost matrix pointer (nullptr = Fitch uniform mode) ─────────
+    bool use_sankoff;                    // true = Sankoff parsimony
+    const unsigned int* cost_matrix;     // device ptr to [states×states] cost matrix
+
     // ── [BUILD-ONLY] Phase 0-1 scalars (not touched during SPR) ─────────────
     int insertVf;
     int startVf;
@@ -185,8 +194,11 @@ void gpuTopoToCpu(const GpuTopology* in, pllInstance* tr);
 
 // Allocate all GPU memory for K trees.
 // mxtips, width, states must match the alignment.
+// cost_matrix: if non-null, enables Sankoff mode. width must be numPatterns (= parsimonyLength * 32).
+// cost_matrix points to a [nstates × nstates] host array; copied to device inside.
 GpuParsimonyMem* gpuParsimonyMemAlloc(int K, int mxtips, int width, int states,
-                                       int pool_size = 20, int max_treels = 0);
+                                       int pool_size = 20, int max_treels = 0,
+                                       const unsigned int* cost_matrix = nullptr, int nstates = 0);
 void gpuParsimonyMemFree(GpuParsimonyMem* mem);
 
 // Reset treels buffer and set new cutoff threshold (call before each K2 bootstrap round).
@@ -314,9 +326,10 @@ __device__ __forceinline__ unsigned int newviewParsimony(
 )
 {
     int lane = threadIdx.x & 31;
-    // Ratchet: if sh.site_weights is set, multiply partial scores by site_weights[b].
-    // Pointer is uniform across all lanes — no warp divergence on the check.
+    // Fitch: sh.site_weights = ratchet weights (nullptr = uniform). Multiply partial scores.
+    // Sankoff: sh.site_weights = pattern frequencies (from aln->at(ptn).frequency).
     const unsigned int* sw = sh.site_weights;
+    const unsigned int* cm = sh.cost_matrix;  // nullptr in Fitch mode
 
     for (int i = sh.tiSize - 3; i >= 3; i -= 3)
     {
@@ -332,33 +345,62 @@ __device__ __forceinline__ unsigned int newviewParsimony(
 
         for (int b = lane; b < width; b += kWarpSize)
         {
-            parsimonyNumber t_N = 0;
-            parsimonyNumber t_A[STATES], o_A[STATES];
-
-            #pragma unroll
-            for (int s = 0; s < STATES; ++s)
+            if (!sh.use_sankoff)
             {
-                parsimonyNumber lv = q_base[b * STATES + s];
-                parsimonyNumber rv = r_base[b * STATES + s];
-                t_A[s] = lv & rv;
-                o_A[s] = lv | rv;
-                t_N |= t_A[s];
-            }
-            t_N = ~t_N;
+                // Fitch: bitwise, each b = 32 sites packed
+                parsimonyNumber t_N = 0;
+                parsimonyNumber t_A[STATES], o_A[STATES];
 
-            #pragma unroll
-            for (int s = 0; s < STATES; ++s)
+                #pragma unroll
+                for (int s = 0; s < STATES; ++s)
+                {
+                    parsimonyNumber lv = q_base[b * STATES + s];
+                    parsimonyNumber rv = r_base[b * STATES + s];
+                    t_A[s] = lv & rv;
+                    o_A[s] = lv | rv;
+                    t_N |= t_A[s];
+                }
+                t_N = ~t_N;
+
+                #pragma unroll
+                for (int s = 0; s < STATES; ++s)
+                    p_base[b * STATES + s] = t_A[s] | (t_N & o_A[s]);
+
+                score += sw ? sw[b] * __popc(t_N) : __popc(t_N);
+            }
+            else
             {
-                p_base[b * STATES + s] = t_A[s] | (t_N & o_A[s]);
+                // Sankoff: each b = one pattern; elements are costs (not bitmasks)
+                // partial_p[b][i] = min_j(q[b][j] + cost[i][j]) + min_j(r[b][j] + cost[i][j])
+                unsigned int min_site = kSankoffInf;
+                #pragma unroll
+                for (int ii = 0; ii < STATES; ++ii)
+                {
+                    unsigned int best_left = kSankoffInf, best_right = kSankoffInf;
+                    #pragma unroll
+                    for (int jj = 0; jj < STATES; ++jj)
+                    {
+                        unsigned int c = cm[ii * STATES + jj];
+                        unsigned int lv = (unsigned int)q_base[b * STATES + jj];
+                        unsigned int rv = (unsigned int)r_base[b * STATES + jj];
+                        best_left  = min(best_left,  lv + c);
+                        best_right = min(best_right, rv + c);
+                    }
+                    unsigned int cost_ii = best_left + best_right;
+                    p_base[b * STATES + ii] = (parsimonyNumber)cost_ii;
+                    min_site = min(min_site, cost_ii);
+                }
+                score += (sw ? sw[b] : 1u) * min_site;
             }
-
-            score += sw ? sw[b] * __popc(t_N) : __popc(t_N);
         }
         score = warpReduceU32(score);
 
         if (lane == 0)
         {
-            score_tree[p_num] = score + score_tree[q_num] + score_tree[r_num];
+            if (!sh.use_sankoff)
+                score_tree[p_num] = score + score_tree[q_num] + score_tree[r_num];
+            else
+                score_tree[p_num] = score;  // Sankoff: non-cumulative (partial already includes subtree)
         }
     }
     if (!evaluate)
@@ -376,28 +418,52 @@ __device__ __forceinline__ unsigned int newviewParsimony(
 
     for (int b = lane; b < width; b += kWarpSize)
     {
-        parsimonyNumber t_N = 0;
-        parsimonyNumber t_A[STATES], o_A[STATES];
-
-        #pragma unroll
-        for (int s = 0; s < STATES; ++s)
+        if (!sh.use_sankoff)
         {
-            parsimonyNumber lv = q_base[b * STATES + s];
-            parsimonyNumber rv = r_base[b * STATES + s];
-            t_A[s] = lv & rv;
-            o_A[s] = lv | rv;
-            t_N |= t_A[s];
-        }
-        t_N = ~t_N;
+            // Fitch evaluate: cross term (sites where q and r disagree)
+            parsimonyNumber t_N = 0;
+            parsimonyNumber t_A[STATES], o_A[STATES];
 
-        score += sw ? sw[b] * __popc(t_N) : __popc(t_N);
+            #pragma unroll
+            for (int s = 0; s < STATES; ++s)
+            {
+                parsimonyNumber lv = q_base[b * STATES + s];
+                parsimonyNumber rv = r_base[b * STATES + s];
+                t_A[s] = lv & rv;
+                o_A[s] = lv | rv;
+                t_N |= t_A[s];
+            }
+            t_N = ~t_N;
+
+            score += sw ? sw[b] * __popc(t_N) : __popc(t_N);
+        }
+        else
+        {
+            // Sankoff evaluate at edge (q_num, r_num): min_ij(q[i] + cost[i][j] + r[j])
+            // No score_tree terms — partial vectors already encode full subtree costs
+            unsigned int min_edge = kSankoffInf;
+            #pragma unroll
+            for (int ii = 0; ii < STATES; ++ii)
+            {
+                unsigned int qi = (unsigned int)q_base[b * STATES + ii];
+                #pragma unroll
+                for (int jj = 0; jj < STATES; ++jj)
+                {
+                    unsigned int c = cm[ii * STATES + jj];
+                    unsigned int rj = (unsigned int)r_base[b * STATES + jj];
+                    min_edge = min(min_edge, qi + c + rj);
+                }
+            }
+            score += (sw ? sw[b] : 1u) * min_edge;
+        }
     }
     score = warpReduceU32(score);
 
-    if (lane == 0)
-    {
-        return score + score_tree[q_num] + score_tree[r_num];
-    }
+    if (!sh.use_sankoff)
+        score = score + score_tree[q_num] + score_tree[r_num];
+    // Sankoff: score from warpReduce is already the complete edge cost
+    score = __shfl_sync(0xffffffff, score, 0);  // broadcast lane 0 result to all lanes
+    return score;
 }
 
 template <typename SharedT, int STATES>

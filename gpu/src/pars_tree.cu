@@ -90,7 +90,8 @@ void gpuTopoToCpu(
 
 // ─── gpuParsimonyMemAlloc ─────────────────────────────────────────────────────
 GpuParsimonyMem* gpuParsimonyMemAlloc(
-    int K, int mxtips, int width, int states, int pool_size, int max_treels
+    int K, int mxtips, int width, int states, int pool_size, int max_treels,
+    const unsigned int* cost_matrix, int nstates
 )
 {
     auto* mem = new GpuParsimonyMem();
@@ -99,17 +100,23 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     mem->width = width;
     mem->states = states;
     mem->pool_size = pool_size;
+    mem->d_cost_matrix = nullptr;
     mem->nodesPerTree        = (size_t)(2 * mxtips + 1);
     mem->parsVectPerTree     = mem->nodesPerTree * (size_t)width * (size_t)states;
     mem->parsScorePerTree    = mem->nodesPerTree;
-    mem->siteWeightsPerTree  = (size_t)width;
+
+    const bool use_sankoff = (cost_matrix != nullptr && nstates > 0);
+
+    // Site weights: Fitch uses them for ratchet; Sankoff uses them for pattern weights.
+    // Both modes allocate the same size (width elements per tree).
+    mem->siteWeightsPerTree = (size_t)width;
 
     const size_t parsVectBytes      = (size_t)K * mem->parsVectPerTree  * sizeof(parsimonyNumber);
     const size_t parsScoreBytes     = (size_t)K * mem->parsScorePerTree  * sizeof(unsigned int);
     const size_t topoBytes          = (size_t)K * sizeof(GpuTopology);
     const size_t siteWeightsBytes   = (size_t)K * mem->siteWeightsPerTree * sizeof(unsigned int);
 
-    printf("[GPU] Allocating parsimony memory for %d trees:\n", K);
+    printf("[GPU] Allocating parsimony memory for %d trees (%s):\n", K, use_sankoff ? "Sankoff" : "Fitch");
     printf("  parsVect  : %.2f MB\n", parsVectBytes / 1048576.0);
     printf("  parsScore : %.2f MB\n", parsScoreBytes / 1048576.0);
     printf("  topologies: %.2f MB\n", topoBytes / 1048576.0);
@@ -117,7 +124,26 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     CUDA_CHECK(cudaMalloc(&mem->d_parsVect,    parsVectBytes));
     CUDA_CHECK(cudaMalloc(&mem->d_parsScore,   parsScoreBytes));
     CUDA_CHECK(cudaMalloc(&mem->d_topos,       topoBytes));
-    CUDA_CHECK(cudaMalloc(&mem->d_siteWeights, siteWeightsBytes));
+    if (siteWeightsBytes > 0)
+    {
+        CUDA_CHECK(cudaMalloc(&mem->d_siteWeights, siteWeightsBytes));
+    }
+    else
+    {
+        mem->d_siteWeights = nullptr;
+    }
+    mem->d_ratchetScratch = nullptr;
+    if (use_sankoff && siteWeightsBytes > 0)
+        CUDA_CHECK(cudaMalloc(&mem->d_ratchetScratch, siteWeightsBytes));
+
+    // Upload cost matrix for Sankoff mode
+    if (use_sankoff)
+    {
+        CUDA_CHECK(cudaMalloc(&mem->d_cost_matrix, (size_t)nstates * nstates * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemcpy(mem->d_cost_matrix, cost_matrix,
+                              (size_t)nstates * nstates * sizeof(unsigned int),
+                              cudaMemcpyHostToDevice));
+    }
     CUDA_CHECK(cudaMalloc(&mem->d_postSprScores, (size_t)K * sizeof(unsigned int)));
 
     // Pool for population-based hill-climbing restarts
@@ -159,7 +185,8 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
 
     CUDA_CHECK(cudaMemset(mem->d_parsVect,    0, parsVectBytes));
     CUDA_CHECK(cudaMemset(mem->d_parsScore,   0, parsScoreBytes));
-    // Init all site weights to 1 (normal, unweighted mode)
+    // Init all site weights to 1 (normal, unweighted mode); skipped in Sankoff mode
+    if (mem->d_siteWeights)
     {
         unsigned int* h_sw = new unsigned int[(size_t)K * width];
         for (size_t i = 0; i < (size_t)K * width; ++i) h_sw[i] = 1u;
@@ -194,6 +221,10 @@ void gpuParsimonyMemFree(
     {
         cudaFree(mem->d_siteWeights);
     }
+    if (mem->d_ratchetScratch)
+    {
+        cudaFree(mem->d_ratchetScratch);
+    }
     if (mem->d_postSprScores)
     {
         cudaFree(mem->d_postSprScores);
@@ -210,6 +241,7 @@ void gpuParsimonyMemFree(
     if (mem->d_poolSlotLocks)  cudaFree(mem->d_poolSlotLocks);
     if (mem->d_poolHashes)     cudaFree(mem->d_poolHashes);
     if (mem->d_globalBest)     cudaFree(mem->d_globalBest);
+    if (mem->d_cost_matrix)    cudaFree(mem->d_cost_matrix);
     if (mem->d_treelsScores)   cudaFree(mem->d_treelsScores);
     if (mem->d_treelsBackVf)   cudaFree(mem->d_treelsBackVf);
     if (mem->d_treelsFilled)   cudaFree(mem->d_treelsFilled);
@@ -227,9 +259,13 @@ void resetTreelsRound(GpuParsimonyMem* mem, unsigned int cutoff_pars)
 }
 
 // ─── uploadTipParsVect ────────────────────────────────────────────────────────
-// CPU layout per partition, per node:  [state][block]  stride = width
-// GPU layout per node:                 [block][state]  stride = states
-// We reorder for ALL K trees (tips are identical across trees).
+// Fitch mode:
+//   CPU layout per node: [state][block]  stride = parsimonyLength (= width)
+//   GPU layout per node: [block][state]  stride = states
+// Sankoff mode:
+//   CPU layout: Fitch bitmask (parsimonyLength blocks × states × uint32)
+//   GPU layout: [pattern][state] where pattern = b*32+bit, cost = 0 if bit set else kSankoffInf
+//   width in Sankoff mode = parsimonyLength * 32 (= numPatterns, set by caller)
 void uploadTipParsVect(
     GpuParsimonyMem* mem, const pllInstance* tr, const partitionList* pr, cudaStream_t stream
 )
@@ -238,26 +274,60 @@ void uploadTipParsVect(
     const int width = mem->width;
     const int states = mem->states;
     const size_t parsVT = mem->parsVectPerTree;  // elements per tree
+    const bool use_sankoff = (mem->d_cost_matrix != nullptr);
 
     // Build one reordered host buffer for a single tree, then broadcast to all K.
     std::vector<parsimonyNumber> h_buf(parsVT, 0);
 
     // Only partition 0 for now (single-partition case).
-    // For multi-partition, loop over pr->numberOfPartitions and handle offsets.
     const parsimonyNumber* cpu_pars = pr->partitionData[0]->parsVect;
 
-    // Tips have node numbers 1..N; inner nodes 0 and N+1..2N-1 stay zero until GPU computes.
-    for (int tipNum = 1; tipNum <= N; ++tipNum)
+    if (!use_sankoff)
     {
-        for (int b = 0; b < width; ++b)
+        // Fitch: reorder [node][state][block] → [node][block][state]
+        // cpu_pars indexed with parsimonyLength (= width) as stride
+        const int parsimonyLength = width;
+        for (int tipNum = 1; tipNum <= N; ++tipNum)
         {
-            for (int s = 0; s < states; ++s)
+            for (int b = 0; b < parsimonyLength; ++b)
             {
-                // CPU: parsVect[width * states * tipNum + width * s + b]
-                parsimonyNumber
-                    v = cpu_pars[(size_t)width * states * tipNum + (size_t)width * s + b];
-                // GPU: parsVect[tipNum * width * states + b * states + s]
-                h_buf[(size_t)tipNum * width * states + (size_t)b * states + s] = v;
+                for (int s = 0; s < states; ++s)
+                {
+                    parsimonyNumber v = cpu_pars[
+                        (size_t)parsimonyLength * states * tipNum +
+                        (size_t)parsimonyLength * s + b];
+                    h_buf[(size_t)tipNum * parsimonyLength * states + (size_t)b * states + s] = v;
+                }
+            }
+        }
+    }
+    else
+    {
+        // Sankoff: unpack Fitch bitmask into per-pattern cost vectors.
+        // width = numPatterns = parsimonyLength * 32.
+        // parsimonyLength = width / 32 (number of uint32 blocks in CPU Fitch layout).
+        const int parsimonyLength = width / 32;
+        const parsimonyNumber sankoff_inf = (parsimonyNumber)kSankoffInf;
+
+        for (int tipNum = 1; tipNum <= N; ++tipNum)
+        {
+            for (int b = 0; b < parsimonyLength; ++b)
+            {
+                for (int s = 0; s < states; ++s)
+                {
+                    // Fitch bitmask for this tip, state s, block b:
+                    // bit j set => state s is possible at pattern b*32+j
+                    parsimonyNumber mask = cpu_pars[
+                        (size_t)parsimonyLength * states * tipNum +
+                        (size_t)parsimonyLength * s + b];
+
+                    for (int j = 0; j < 32; ++j)
+                    {
+                        int pat = b * 32 + j;
+                        parsimonyNumber cost = ((mask >> j) & 1u) ? 0u : sankoff_inf;
+                        h_buf[(size_t)tipNum * width * states + (size_t)pat * states + s] = cost;
+                    }
+                }
             }
         }
     }

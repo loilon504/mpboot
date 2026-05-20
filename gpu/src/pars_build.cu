@@ -579,6 +579,7 @@ __device__ void runPhase3(
     GpuTopology* topo,
     SharedT& sh,
     unsigned int* sw_k,
+    unsigned int* ratchet_k,
     int N,
     int sprDist,
     int numNNI,
@@ -675,11 +676,21 @@ __device__ void runPhase3(
     {
         if (lane == 0)
         {
-            for (int b = 0; b < width; b++)
+            if (sh.use_sankoff)
             {
-                sw_k[b] = (gpuRandum(&sh.seed) < 0.5) ? 2u : 1u;
+                // Sankoff: multiply original pattern frequencies by ratchet factor {1,2}
+                // ratchet_k = temp buffer; sw_k (original freqs) stays untouched
+                for (int b = 0; b < width; b++)
+                    ratchet_k[b] = sw_k[b] * ((gpuRandum(&sh.seed) < 0.5) ? 2u : 1u);
+                sh.site_weights = ratchet_k;
             }
-            sh.site_weights = sw_k;
+            else
+            {
+                // Fitch: write {1,2} directly into sw_k (uniform baseline, no real freqs)
+                for (int b = 0; b < width; b++)
+                    sw_k[b] = (gpuRandum(&sh.seed) < 0.5) ? 2u : 1u;
+                sh.site_weights = sw_k;
+            }
         }
         __syncwarp();
 
@@ -696,9 +707,7 @@ __device__ void runPhase3(
         gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
 
         if (lane == 0)
-        {
-            sh.site_weights = nullptr;
-        }
+            sh.site_weights = sh.use_sankoff ? sw_k : nullptr;  // restore original weights
         __syncwarp();
 
         unsigned int pm2 = createTiAndEvaluateParsimony<SharedT, STATES>(
@@ -874,7 +883,8 @@ __global__ void buildParsimonyTreesKernel(
     int sprDist,
     unsigned int* d_postSprScores,  // write postSprParsimony[k] for Phase 3 threshold
     size_t parsVectPerTree,
-    size_t parsScorePerTree
+    size_t parsScorePerTree,
+    const unsigned int* d_cost_matrix  // nullptr = Fitch mode
 )
 {
     __shared__ BuildSharedT<NTAXA> sh;
@@ -886,14 +896,16 @@ __global__ void buildParsimonyTreesKernel(
     parsimonyNumber* pars_tree = d_parsVect + (size_t)k * parsVectPerTree;
     unsigned int* score_tree = d_parsScore + (size_t)k * parsScorePerTree;
     GpuTopology* topo = d_topos + k;
-    unsigned int* sw_k = d_siteWeights + (size_t)k * width;
+    unsigned int* sw_k = d_siteWeights ? (d_siteWeights + (size_t)k * width) : nullptr;
     const int N = topo->mxtips;
 
     // ── Phase 0: permutation + 3-tip tree ────────────────────────────────────
     if (lane == 0)
     {
         sh.seed = d_seeds[k];
-        sh.site_weights = nullptr;
+        sh.use_sankoff = (d_cost_matrix != nullptr);
+        sh.cost_matrix = d_cost_matrix;
+        sh.site_weights = sh.use_sankoff ? sw_k : nullptr;
 
         for (int i = 1; i <= N; i++)
         {
@@ -1055,6 +1067,7 @@ __global__ void buildPhase3Kernel(
     unsigned int* __restrict__ d_parsScore,
     GpuTopology* d_topos,
     unsigned int* __restrict__ d_siteWeights,
+    unsigned int* __restrict__ d_ratchetScratch,
     int width,
     int sprDist,
     int numNNI,
@@ -1071,7 +1084,8 @@ __global__ void buildPhase3Kernel(
     int*   treels_back_vf,
     int*   treels_filled,
     unsigned int* treels_cutoff,
-    int    max_treels
+    int    max_treels,
+    const unsigned int* d_cost_matrix  // nullptr = Fitch mode
 )
 {
     __shared__ BuildSharedT<NTAXA> sh;
@@ -1083,7 +1097,8 @@ __global__ void buildPhase3Kernel(
     GpuTopology* topo = d_topos + k;
     parsimonyNumber* pars_tree = d_parsVect + (size_t)k * parsVectPerTree;
     unsigned int* score_tree = d_parsScore + (size_t)k * parsScorePerTree;
-    unsigned int* sw_k = d_siteWeights + (size_t)k * width;
+    unsigned int* sw_k      = d_siteWeights    ? (d_siteWeights    + (size_t)k * width) : nullptr;
+    unsigned int* ratchet_k = d_ratchetScratch ? (d_ratchetScratch + (size_t)k * width) : nullptr;
     const int N = topo->mxtips;
 
     // Restore inter-kernel state from GpuTopology
@@ -1092,13 +1107,15 @@ __global__ void buildPhase3Kernel(
         sh.seed = topo->savedSeed;
         sh.randomMP = topo->postSprParsimony;
         sh.randomMPHits = 1;
-        sh.site_weights = nullptr;
+        sh.use_sankoff = (d_cost_matrix != nullptr);
+        sh.cost_matrix = d_cost_matrix;
+        sh.site_weights = sh.use_sankoff ? sw_k : nullptr;
         sh.bestParsimony = topo->bestParsimony;
     }
     __syncwarp();
 
     runPhase3<STATES>(
-        pars_tree, score_tree, topo, sh, sw_k, N, sprDist, numNNI, lane, k, width,
+        pars_tree, score_tree, topo, sh, sw_k, ratchet_k, N, sprDist, numNNI, lane, k, width,
         pool_size, pool_scores, pool_back_vf, pool_filled, pool_slot_locks, pool_hashes,
         global_best, treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels
     );
@@ -1162,7 +1179,8 @@ void gpuStepwiseBuildTrees(
             cudaEventRecord(k1_start, stream);
             buildParsimonyTreesKernel<S, NT><<<dim3(k1_count), dim3(kWarpSize), 0, stream>>>(
                 mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, d_seeds,
-                mem->width, sprDist, mem->d_postSprScores, mem->parsVectPerTree, mem->parsScorePerTree
+                mem->width, sprDist, mem->d_postSprScores, mem->parsVectPerTree, mem->parsScorePerTree,
+                mem->d_cost_matrix
             );
             cudaEventRecord(k1_end, stream);
             CUDA_CHECK(cudaGetLastError());
@@ -1196,12 +1214,14 @@ void gpuStepwiseBuildTrees(
         cudaEventCreate(&k2_end);
         cudaEventRecord(k2_start, stream);
         buildPhase3Kernel<S, NT><<<dim3(k2_workers), dim3(kWarpSize), 0, stream>>>(
-            mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights, mem->width,
+            mem->d_parsVect, mem->d_parsScore, mem->d_topos, mem->d_siteWeights,
+            mem->d_ratchetScratch, mem->width,
             sprDist, numNNI, mem->parsVectPerTree, mem->parsScorePerTree, poolSize,
             mem->d_poolScores, mem->d_poolBackVf, mem->d_poolFilled, mem->d_poolSlotLocks,
             mem->d_poolHashes, mem->d_globalBest,
             mem->d_treelsScores, mem->d_treelsBackVf, mem->d_treelsFilled,
-            mem->d_treelsCutoff, mem->max_treels
+            mem->d_treelsCutoff, mem->max_treels,
+            mem->d_cost_matrix
         );
         cudaEventRecord(k2_end, stream);
         CUDA_CHECK(cudaGetLastError());

@@ -29,6 +29,8 @@
         std::cout << _gpu_buf;                    \
     } while (0)
 
+extern Params *globalParam;
+
 namespace mpbootgpu
 {
 
@@ -39,6 +41,86 @@ static inline double msSince(
 {
     return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0)
         .count();
+}
+
+// Upload Sankoff tip cost vectors reading from PLL's yVector, filtering to the same informative
+// patterns that compressSankoffDNA() uses (mirrors CPU Sankoff exactly).
+// PLL bitmask encoding: A=bit0, C=bit1, G=bit2, T=bit3. State s compatible iff (bitmask>>s)&1.
+// Undetermined (gap/N) = all bits set = (1<<states)-1.
+static void uploadSankoffTipParsVect(
+    GpuParsimonyMem* mem, const pllInstance* tr, const partitionList* pr, cudaStream_t stream)
+{
+    const int N = mem->mxtips;
+    const int P = mem->width;  // = parsimonyLength (informative patterns, padded)
+    const int states = mem->states;
+    const size_t parsVT = mem->parsVectPerTree;
+    const int lower = (int)pr->partitionData[0]->lower;
+    const int upper = (int)pr->partitionData[0]->upper;
+    const unsigned int undetermined = (1u << states) - 1u;  // all-states bitmask = gap/N
+
+    std::vector<parsimonyNumber> h_buf(parsVT, (parsimonyNumber)kSankoffInf);
+
+    // Replicate CPU isInformative() logic (with globalParam->sort_alignment check):
+    // informative iff > 1 distinct bitmask values < undetermined appear across taxa.
+    const bool all_informative = globalParam && !globalParam->sort_alignment;
+
+    int ptn_gpu = 0;
+    for (int i = lower; i < upper && ptn_gpu < P; ++i) {
+        if (!all_informative) {
+            bool seen[256] = {};
+            for (int j = 1; j <= N; ++j)
+                seen[(unsigned char)tr->yVector[j][i]] = true;
+            int counter = 0;
+            for (unsigned int v = 0; v < undetermined; ++v)
+                if (seen[v]) counter++;
+            if (counter <= 1) continue;  // uninformative: skip
+        }
+
+        parsimonyNumber* row = &h_buf[(size_t)ptn_gpu * states];
+        for (int tipNum = 1; tipNum <= N; ++tipNum) {
+            unsigned char nuc = tr->yVector[tipNum][i];
+            unsigned int bitmask = (unsigned int)nuc;
+            parsimonyNumber* out = &h_buf[(size_t)tipNum * P * states + (size_t)ptn_gpu * states];
+            for (int s = 0; s < states; ++s)
+                out[s] = ((bitmask >> s) & 1u) ? 0u : (parsimonyNumber)kSankoffInf;
+        }
+        (void)row;
+        ptn_gpu++;
+    }
+
+    for (int k = 0; k < mem->K; ++k) {
+        parsimonyNumber* dst = mem->d_parsVect + (size_t)k * parsVT;
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst, h_buf.data(), parsVT * sizeof(parsimonyNumber), cudaMemcpyHostToDevice, stream
+        ));
+    }
+}
+
+// Upload pattern weights for Sankoff mode, reading from CPU's informativePtnWgt
+// (built by compressSankoffDNA to match the same informative pattern set).
+static void uploadSankoffSiteWeights(
+    GpuParsimonyMem* mem, const partitionList* pr, cudaStream_t stream)
+{
+    const int P = mem->width;  // = parsimonyLength
+    const int K = mem->K;
+    std::vector<unsigned int> h_sw(P, 0u);
+    // informativePtnWgt is a flat sequential array (no SIMD interleaving).
+    // Type: parsimonyNumberShort (uint16_t) if sankoff_short_int, else parsimonyNumber (uint32_t).
+    if (globalParam && globalParam->sankoff_short_int) {
+        const uint16_t* ptnWgt = (const uint16_t*)pr->partitionData[0]->informativePtnWgt;
+        for (int p = 0; p < P; ++p)
+            h_sw[p] = (unsigned int)ptnWgt[p];
+    } else {
+        const parsimonyNumber* ptnWgt = pr->partitionData[0]->informativePtnWgt;
+        for (int p = 0; p < P; ++p)
+            h_sw[p] = (unsigned int)ptnWgt[p];
+    }
+    for (int k = 0; k < K; ++k) {
+        unsigned int* dst = mem->d_siteWeights + (size_t)k * P;
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst, h_sw.data(), P * sizeof(unsigned int), cudaMemcpyHostToDevice, stream
+        ));
+    }
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
@@ -75,12 +157,24 @@ int mpbootGpu(
     // ── [1] Allocate CPU parsVect & read metadata ─────────────────────────────
     auto t0 = std::chrono::high_resolution_clock::now();
     _allocateParsimonyDataStructures(tr, pr, PLL_FALSE);
-    const int width = (int)pr->partitionData[0]->parsimonyLength;
+    const int parsimonyLength = (int)pr->partitionData[0]->parsimonyLength;
     const int states = (int)pr->partitionData[0]->states;
+
+    // Detect Sankoff mode: IQTree has a cost_matrix if -cost was specified.
+    // Both Fitch and Sankoff use parsimonyLength as width (informative patterns only,
+    // same as CPU compressSankoffDNA / compressFitchDNA).
+    const bool use_sankoff = (iqtree.cost_matrix != nullptr && iqtree.cost_nstates > 0);
+    const int width = parsimonyLength;
+
     GPU_LOG(
-        "[GPU]   [1]      %-28s: %8.3f s  (width=%d states=%d)\n", "CPU parsimony alloc",
-        msSince(t0) / 1e3, width, states
+        "[GPU]   [1]      %-28s: %8.3f s  (width=%d states=%d%s)\n", "CPU parsimony alloc",
+        msSince(t0) / 1e3, width, states, use_sankoff ? " Sankoff" : ""
     );
+    if (use_sankoff) {
+        const int pll_total = (int)(pr->partitionData[0]->upper - pr->partitionData[0]->lower);
+        GPU_LOG("[GPU]            Sankoff: pll_total_ptn=%d  pll_informative(width)=%d\n",
+                pll_total, width);
+    }
 
     // K2 workers computed early — needed for memory allocation size
     const int k2_workers_early = (params.gpu_worker > 0) ? params.gpu_worker : K;
@@ -92,15 +186,81 @@ int mpbootGpu(
     // Size = K * 10 (up to ~10 outer iters per K2 round × K workers).
     const int max_treels_boot = K * 10;  // always allocate; gpuHillClimbing needs it
     GpuParsimonyMem* mem = gpuParsimonyMemAlloc(
-        K_alloc, mxtips, width, states, params.gpu_pool_size, max_treels_boot
+        K_alloc, mxtips, width, states, params.gpu_pool_size, max_treels_boot,
+        use_sankoff ? iqtree.cost_matrix : nullptr,
+        use_sankoff ? iqtree.cost_nstates : 0
     );
     GPU_LOG("[GPU]   [2]      %-28s: %8.3f s\n", "GPU memory alloc", msSince(t0) / 1e3);
 
     // ── [3] Upload tip parsVect ───────────────────────────────────────────────
     cudaStream_t stream = 0;
     t0 = std::chrono::high_resolution_clock::now();
-    uploadTipParsVect(mem, tr, pr, stream);
+    if (!use_sankoff) {
+        uploadTipParsVect(mem, tr, pr, stream);
+    } else {
+        uploadSankoffTipParsVect(mem, tr, pr, stream);
+        uploadSankoffSiteWeights(mem, pr, stream);
+    }
     GPU_LOG("[GPU]   [3]      %-28s: %8.3f s\n", "Upload tip parsVect (H->D)", msSince(t0) / 1e3);
+
+    // ── [3b] Sankoff debug info ───────────────────────────────────────────────
+    if (use_sankoff) {
+        // Cost matrix
+        GPU_LOG("[GPU]\n[GPU] --- Sankoff debug ---\n");
+        GPU_LOG("[GPU] Cost matrix (%dx%d):\n", states, states);
+        for (int i = 0; i < states; i++) {
+            GPU_LOG("[GPU]   row[%d]: ", i);
+            for (int j = 0; j < states; j++)
+                GPU_LOG("%6u", iqtree.cost_matrix[i * states + j]);
+            GPU_LOG("\n");
+        }
+
+        // Pattern weight stats
+        unsigned int sw_min = UINT_MAX, sw_max = 0, sw_sum = 0;
+        int sw_trivial = 0;
+        for (int p = 0; p < width; p++) {
+            unsigned int w = (unsigned int)iqtree.aln->at(p).frequency;
+            if (w < sw_min) sw_min = w;
+            if (w > sw_max) sw_max = w;
+            sw_sum += w;
+            if (w == 1) sw_trivial++;
+        }
+        GPU_LOG("[GPU] Patterns: %d  weights: min=%u max=%u sum=%u (trivial w=1: %d)\n",
+                width, sw_min, sw_max, sw_sum, sw_trivial);
+
+        // Memory bandwidth estimate per node update
+        // Layout [ptn][state]: stride=STATES between lanes → 4x non-coalesced
+        const double bytes_node_rw = 3.0 * width * states * sizeof(unsigned int);  // 2 reads + 1 write per node
+        const int inner_nodes = 2 * mxtips - 2;
+        const double bytes_per_tree_mb = bytes_node_rw * inner_nodes / 1e6;
+        GPU_LOG("[GPU] Mem/node update: %.1f KB  inner_nodes=%d  mem/tree: %.1f MB\n",
+                bytes_node_rw / 1024.0, inner_nodes, bytes_per_tree_mb);
+        GPU_LOG("[GPU] WARNING: layout [ptn*S+s] → stride=%d between lanes (non-coalesced, ~4x waste)\n", states);
+        GPU_LOG("[GPU] Ops/node: P*S^2=%d*%d=%d min-ops  vs Fitch: width*S=%d*%d=%d\n",
+                width, states * states, width * states * states,
+                width / 32, states, (width / 32) * states);
+
+        // Sample tip vectors: first 3 tips, first 4 patterns
+        GPU_LOG("[GPU] Sample tip cost vectors (tip 1..3, ptn 0..3), fmt: state=[cost,...]:\n");
+        const int show_tips = std::min(3, mxtips);
+        const int show_ptns = std::min(4, width);
+        for (int tip = 1; tip <= show_tips; tip++) {
+            GPU_LOG("[GPU]   tip%d:", tip);
+            for (int ptn = 0; ptn < show_ptns; ptn++) {
+                int s_state = (int)(unsigned char)iqtree.aln->at(ptn)[tip - 1];
+                GPU_LOG(" ptn%d=[", ptn);
+                for (int s = 0; s < states; s++) {
+                    unsigned int cost;
+                    if (s_state < states) cost = (s == s_state) ? 0u : (unsigned int)kSankoffInf;
+                    else cost = 0u;
+                    GPU_LOG("%s%u", s ? "," : "", cost == kSankoffInf ? 9u : cost);  // print 9 for INF
+                }
+                GPU_LOG("](st=%d)", s_state);
+            }
+            GPU_LOG("\n");
+        }
+        GPU_LOG("[GPU] --- end Sankoff debug ---\n[GPU]\n");
+    }
 
     // ── [4] Upload initial topologies ─────────────────────────────────────────
     t0 = std::chrono::high_resolution_clock::now();
