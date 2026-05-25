@@ -7,11 +7,10 @@
 |-----|-----|---------|
 | testInsert pre-refresh | Loại bỏ Fitch step thừa | −24% kernel time |
 | Opt-D | GpuTopology struct shrink | −8.7% ms/tree |
-| Opt-H | Early stopping Phase 3 (gpu_stop) | −32.4% ms/tree |
-| ~~Opt-G~~ | ~~Selective Phase 3 atomicMin margin~~ | **Xoá — disabled by default, code phức tạp** |
-| Opt-G2 (→ -gpu_top_pct) | Selective Phase 3 two-kernel exact top-X% | default=10%, giảm Phase 3 overhead |
+| Opt-H | Early stopping Phase 3 (gpu_stop) | Không còn sử dụng |
+| Opt-G2 (→ -gpu_top_pct) | Selective Phase 3 two-kernel exact top-X% | Không còn sử dụng |
 | Opt-I | NNI strength configurable (gpu_nni_strength); rewrite on-the-fly q_vf + CPU-style bitset reset | strength=0.5 works; all EXIT=0; no regression |
-| Opt-K | gpu_stop default 2 → 4 | Quality tốt hơn trên N≥295 |
+| Opt-K | gpu_stop default 2 → 4 | Không còn sử dụng |
 | Opt-B | Subtree prune trong SPR DFS (per-edge lb check) | ~22% prune rate, avg 1.31× speedup |
 | Opt-B+ | Tighter lb: thêm score_tree[tip_p] | **~30% prune rate, avg 1.49× speedup, 10/10 faster** |
 | Opt-M | Template specialization newviewParsimony<STATES> (4, 20 only) | **avg 2.16× ms/tree (np=200, 50 datasets)** |
@@ -20,12 +19,16 @@
 | Opt-P L3 | BuildSharedT<NTAXA> template (128/256/512/800) + GPU_NTAXA_TEMPLATE flag | Implemented; speedup when K>756 |
 | Opt-Q1 | score_tree zero-init loop removal (dead code) | **−3.4% avg** (10 datasets) |
 | Opt-Q2 | Lazy gpuNodeRectifierPars: skip first do-while iteration | **−13.0% avg** (10/10 datasets) |
-| **Opt-R** | **Restore best_back_vf trước mỗi Phase 3 perturbation** | **avg +60% speedup vs CPU, −38% ms/tree** |
-| **Reseed** | **Reseed bad GPU slots từ threshold pool (hybrid_cb Step 3.5)** | **0/37 regressions, 14/37 improved, +14.5% time (N≈200)** |
+| **Opt-R** | **Restore best_back_vf trước mỗi Phase 3 perturbation** | Không còn sử dụng |
+| **Reseed** | **Reseed bad GPU slots từ threshold pool (hybrid_cb Step 3.5)** | Không còn sử dụng |
 | **Dead code removal** | **Xóa timing fields, best_back_vf, numSearchIter, gpu_hc_iter** | **K1: 155→96 regs; GpuTopology −12.8 KB; API đơn giản hơn** |
 | **K' < K (Opt-LessK1)** | **Build K'=max(pool,0.2K) trees trong K1; K2 vẫn K blocks** | **−60% K1 time; +17–28% total speedup; GPU wins +13–25%** |
 | **Pool restart simplify** | **Lane-0 O(pool_size²) selection-sort, unsigned long long bitmask (pool_size ≤ 60); accessible=10+outer** | **K2 regs 151→128; simpler code** |
 | **Opt-S: Per-slot locks** | **pool_lock→pool_slot_locks[pool_size]; thundering herd fix** | **Contention 1000→50 blocks/lock (pool=20)** |
+| **Sankoff encoding fix** | **uploadSankoffTipParsVect: width=parsimonyLength, tr->yVector PLL bitmask** | **GPU Sankoff đúng, 6662=CPU** |
+| **Sankoff ratchet (d_ratchetScratch)** | **Buffer scratch riêng; iter_is_nni bỏ use_sankoff||** | **K=200 đạt 6662 (cần K=5000 trước)** |
+| **Opt 1: parsVect layout [ptn][state]→[state][ptn]** | **Coalesced warp access; Fitch→memcpy; Sankoff h_buf reindex** | **Fitch 2.5×, Sankoff 2.1× ms/tree** |
+| **Opt 3: Remove dead min_site in Sankoff newview** | **Xóa score_tree accumulation không được đọc** | **Minor; absorbed into Opt 1** |
 
 ---
 
@@ -206,70 +209,6 @@ CPU baseline: `cpu_d6` (sprdist=6, numpars=200), avg 56.70s, avg_score=29022.9.
 
 ---
 
-### 🟡 Trung bình, rủi ro vừa
-
-#### Opt-N: Thread coarsening — xử lý 2 parsimony blocks per lane
-
-**Vấn đề hiện tại**:
-
-`newviewParsimony` inner loop:
-```cpp
-for (int b = lane; b < width; b += kWarpSize)  // mỗi lane xử lý 1 block/iteration
-```
-Với `width=40` (N=295, DNA) và `kWarpSize=32`: mỗi lane xử lý `ceil(40/32)=2` iterations,
-nhưng lần 2 chỉ có 8 lanes active (`b=32..39`) → 24 lanes idle. **Warp utilization thấp.**
-
-Ngoài ra, giữa mỗi `newview` node là `warpReduceU32(score)` + `__syncwarp()` — overhead sync
-tỉ lệ với số node trong `ti[]`.
-
-**Ý tưởng**:
-
-Mỗi lane xử lý **2 blocks** per iteration (`b = lane` và `b = lane + kWarpSize`), tích lũy score:
-```cpp
-// Trước: 1 block/lane
-for (int b = lane; b < width; b += kWarpSize) { ... score += __popc(t_N); }
-
-// Sau: 2 blocks/lane (loop unroll factor 2)
-for (int b = lane; b < width; b += kWarpSize * 2) {
-    // block b
-    ... score += __popc(t_N_b);
-    // block b + kWarpSize (nếu còn trong width)
-    if (b + kWarpSize < width) { ... score += __popc(t_N_b2); }
-}
-```
-
-**Lợi ích kỳ vọng**:
-- Giảm số `warpReduceU32` calls xuống còn 1 per newview node (thay vì 2 với width=40)
-- Tăng arithmetic intensity: mỗi lane làm nhiều FP work hơn giữa 2 sync
-- Với width=40: hiện 2 iters (32 lanes active + 8 lanes active) → sau: 1 iter (8 lanes active, mỗi làm 2 blocks)
-
-**Rủi ro**:
-- Tăng register pressure (`t_A[]`, `o_A[]` cần 2 sets — nhưng có thể reuse)
-- Với STATES=20: `t_A[20]` + `o_A[20]` = 40 registers/set → 2 sets = 80 extra regs → likely spill
-- **An toàn hơn với STATES=4 (DNA)**: 2×(4+4) = 16 extra regs, không spill
-
-**Kế hoạch thực hiện**:
-1. Thêm template param `UNROLL` vào `newviewParsimony<SharedT, STATES, UNROLL=1>`
-2. `UNROLL=2` chỉ cho STATES=4 (DNA); protein giữ UNROLL=1
-3. Dispatch: `if (states==4) launch<4, 2> else launch<20, 1>`
-4. Benchmark DNA datasets (width lớn) trước
-
-**File**: `gpu/include/pars_tree.cuh` (newviewParsimony, warpEvaluateScore)  
-**Effort**: 4–6 giờ + benchmark
-
----
-
-## Phase 3 Effectiveness Analysis (2026-05-13)
-
-10 datasets, numpars=200, gpu_stop=4:
-
-| Phase | Avg improvement rate |
-|-------|---------------------|
-| NNI+SPR (even iters) | 19.2% |
-| Ratchet (odd iters) | **24.5%** |
-
-Ratchet hiệu quả hơn NNI+SPR trong 6/10 dataset. Đặc biệt rõ ở N≥699 (Ratchet ~52–56% vs NNI+SPR ~28–36%).
-
 ## Phase 3 Micro-optimizations (2026-05-14)
 
 | Opt | Tên | Kết quả |
@@ -288,46 +227,3 @@ Rectify vẫn được gọi ở iter 2+ (khi topology thực sự thay đổi s
 **File**: `gpu/src/pars_build.cu` — `gpuSPRHillClimb` (lines 322-338)
 
 ---
-
-## Thứ tự ưu tiên đề xuất
-
-1. ~~Opt-K~~ ✅  2. ~~Opt-B / Opt-B+~~ ✅  3. ~~Opt-M~~ ✅  4. ~~Opt-P L1+L2b+L3~~ ✅  5. ~~Opt-G xoá~~ ✅
-6. ~~Opt-Q1+Q2~~ ✅ (Phase 3 micro-opts, −13% avg)
-7. ~~Opt-R~~ ✅ (Restore best_back_vf, **−38% ms/tree, +60% speedup vs CPU**)
-8. ~~Reseed~~ ✅ (Reseed bad slots từ threshold pool, 0 regressions / +14.5% time N≈200)
-9. ~~Dead code removal~~ ✅ (K1: 155→96 regs, GpuTopology −12.8 KB, API simplification)
-10. ~~K' < K (Opt-LessK1)~~ ✅ (**−60% K1 time; +17–28% total speedup; GPU wins +13–25%**)
-11. ~~Pool restart simplify~~ ✅ (K2 regs 151→128, simpler lane-0 selection-sort)
-12. ~~Opt-S: Per-slot pool locks~~ ✅ (thundering herd fix, pool_size=20 → ~50 blocks/lock)
-13. **Opt-N** (thread coarsening UNROLL=2 cho STATES=4): estimate +10-20% cho DNA datasets
-14. **gpuRandomNNIs parallelize** (31 lanes idle → all 32 active): estimate 10–20× NNI phase
-13. ~~Opt-O~~ — hủy: applyMove chiếm <0.1% thời gian, không đáng optimize
-14. ~~Opt-E~~ — hủy: không khả thi, redesign quá lớn
-
----
-
-## Phase 3 Algorithm Experiments (2026-05-14 → 2026-05-15)
-
-### Current Defaults (2026-05-17, updated post-LessK1)
-- `gpu_stop = 6` — **sweet spot** (benchmark 115 datasets: 4.55× total speedup K'=K, 5.35× với K'=0.2K)
-- `gpu_top_pct = 0.1`
-- `gpu_pool_size = 30`, `numpars = 1000`, `sprdist = 6` — recommended production config
-- `gpu_k1_ratio = 0.2` — **production default** (K'=max(30, 200)=200 với K=999); 1.0 = backward compat
-- `-gpu_hc_iter` đã bị xóa (2026-05-17); `gpu_stop` là stopping criterion duy nhất
-
-### Output Formatting (2026-05-15)
-- Kernel times now in **seconds** (%.3f s) instead of ms
-- Individual timing for buildTreesKernel + hillClimbingKernel
-- Aligned columns, `═══` borders
-- `setbuf(stdout, NULL)` for immediate flush in GPU section
-
-### ✅ Hybrid CPU-GPU — DONE (2026-05-15 → 2026-05-16)
-
-- **hybrid_cb1**: CPU build cây (`_pllMakeParsimonyTreeFast` + `computeParsimony()`) trong khi GPU Kernel 1 chạy async. Push vào `candidateTrees` khi score đủ tốt.
-- **hybrid_cb2**: CPU alternates NNI (even) / Ratchet (odd) perturbation trong khi GPU `hillClimbingKernel` chạy. Dùng `PhyloTree::computeParsimony()` — không PLL.
-- **[7] redesign**: Xóa `pllInstanceClone`/`pllPartitionsClone` — reuse `tr`/`pr` trực tiếp. `candidateTrees.update()` chạy trong [7] loop, post-loop trong `phyloanalysis.cpp` đã bị xóa.
-- **Print format**: `best CPU tree: X  best GPU tree: Y` thay `built = K / K trees`.
-
-**Bug fixes trong quá trình implement**:
-- Bug #10: ODR violation `sizeof(SearchInfo)` khác nhau giữa CXX TU (clang++) và CUDA TU (gcc) → fix bằng `#if __cplusplus >= 201103L` trong `tools.h`
-- Bug #11: `hybrid_cb2` 5 crash độc lập do PLL state conflict + unsafe function calls → fix bằng loại bỏ toàn bộ PLL parsimony, dùng `PhyloTree::computeParsimony()` only

@@ -827,8 +827,8 @@ void parseArg(int argc, char *argv[], Params &params) {
 
 	params.use_gpu = false;
 	params.gpu_nni_strength = 0.5;
-	params.gpu_pool_size = 20;
-	params.gpu_worker = 200;
+	params.gpu_pool_size = 10;
+	params.gpu_worker = 100;
 	params.gpu_worker_stop = 1;
 	params.gpu_device = 0;
 

@@ -6,13 +6,14 @@
 |------|--------|--------|
 | Pattern set + encoding fix | ✅ DONE (gpu_init_trees.cu) | GPU reaches 6662 = CPU ✅ |
 | Ratchet for Sankoff | ✅ DONE (2026-05-20) | K=200 đạt 6662 = CPU (was 6664) ✅ |
-| Opt 1: Memory layout [ptn][state] → [state][ptn] | TODO | ~2–4× speedup |
-| Opt 3: Remove weighted newview in Sankoff | TODO | Minor cleanup |
+| Opt 1: Memory layout [ptn][state] → [state][ptn] | ✅ DONE (2026-05-20) | Sankoff 2.1×, Fitch 2.5× ✅ |
+| Opt 3: Remove weighted newview in Sankoff | ✅ DONE (2026-05-20, combined w/ Opt 1) | Cleaned up dead code ✅ |
 | ~~Identity matrix O(S)~~ | DROPPED | Not used in practice |
 
 Baseline (K=200, -cost e, -sprdist 6, gpu_worker=200): ~168 ms/tree (pre-ratchet)
-Post-ratchet (K=200, solo): **346 ms/tree**, BEST SCORE **6662** = CPU ✅
-Fitch reference (K=200): ~16 ms/tree
+Post-ratchet (K=200): **346 ms/tree** (pre-Opt1)
+Post-Opt1 (K=200): **167 ms/tree**, BEST SCORE **6662** = CPU ✅
+Fitch post-Opt1 (K=400): ~6.4 ms/tree (was ~16 ms/tree)
 
 ---
 
@@ -241,9 +242,25 @@ for (int s = 0; s < states; ++s)
     // else stays kSankoffInf (already initialized)
 ```
 
+### Verification (2026-05-20)
+
+```bash
+# Fitch K=400 (shows stable 6662 at more trees):
+./mpboot-avx -s ../data_debug/tree1.phy -use_gpu -seed 1 \
+    -numpars 400 -sprdist 6 -gpu_device 2 -gpu_worker 400 \
+    -gpu_pool_size 20 -gpu_worker_stop 3 2>&1 | grep "BEST SCORE\|ms/tree"
+# → ~6.4 ms/tree, BEST SCORE 6662 ✅  (was ~16 ms/tree pre-Opt1, speedup ~2.5×)
+
+# Sankoff K=200:
+./mpboot-avx -s ../data_debug/tree1.phy -use_gpu -seed 1 \
+    -numpars 200 -sprdist 6 -gpu_device 2 -gpu_worker 200 \
+    -gpu_pool_size 20 -gpu_worker_stop 3 -cost e 2>&1 | grep "BEST SCORE\|ms/tree"
+# → 167 ms/tree, BEST SCORE 6662 ✅  (was 346 ms/tree pre-Opt1, speedup ~2.1×)
+```
+
 ### Expected speedup
 - Theoretical: 4× (perfectly coalesced vs 4× waste)
-- Realistic: 2–4× depending on L2 cache hit rate
+- Achieved: Fitch ~2.5×, Sankoff ~2.1× (limited by other ops, L2 cache)
 - Applies to both Fitch and Sankoff kernels
 
 ---
@@ -282,9 +299,15 @@ for (int ii = 0; ii < STATES; ++ii) {
 // score_tree[p_num] left at 0 (never read in Sankoff evaluate)
 ```
 
-### Expected effect
-- Remove 2 instructions per pattern per newview call (1 min-reduce + 1 multiply-add)
-- Minor performance gain, mainly eliminates dead computation
+### Implementation note (2026-05-20)
+
+Opt 3 was implemented **combined with Opt 1** — the Sankoff newview branch was rewritten
+in place in `pars_tree.cuh` to use new `[state][block]` indexing AND removed `min_site`/`score +=`
+in the same edit.
+
+### Effect
+- Eliminates dead computation (1 min-reduce + 1 multiply-add per pattern per newview)
+- Absorbed into Opt 1 rewrite — no separate measurable delta
 
 ---
 
@@ -307,13 +330,12 @@ cd build && make -j8 2>&1 | tail -5
 
 Sankoff correctness check:
 ```bash
-# Quick check (K=200, ~70 s) — confirmed 2026-05-20 post-ratchet:
+# Quick check (K=200) — confirmed 2026-05-20 post-Opt1:
 ./mpboot-avx -s ../data_debug/tree1.phy -use_gpu -seed 1 \
     -numpars 200 -sprdist 6 -gpu_device 2 -gpu_worker 200 \
     -gpu_pool_size 20 -gpu_worker_stop 3 -cost e 2>&1 | grep "BEST SCORE\|ms/tree"
-# BEST SCORE FOUND : 6662  ✅ (= CPU, ngay K=200 nhờ ratchet!)
-# 346.40 ms/tree (post-ratchet, pre-Opt1)
-# Post-Opt1 expected: BEST SCORE 6662, ms/tree ~2–4× faster
+# BEST SCORE FOUND : 6662  ✅ (= CPU)
+# 167 ms/tree (post-Opt1, vs 346 ms/tree post-ratchet-pre-Opt1 = 2.1× speedup)
 ```
 
 CPU reference (confirmed 2026-05-20):

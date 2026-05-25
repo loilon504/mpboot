@@ -120,6 +120,10 @@ __device__ void testInsert(
             sh.bestRemoveVf = p;
             sh.bestInsertVf = q;
         }
+    }
+    __syncwarp();
+    if (lane == 0)
+    {
         gpuHookup(topo->back_vf, q, sh.bcast[0]);
         topo->back_vf[vfNextFace(p, N)] = -1;
         topo->back_vf[vfNnxtFace(p, N)] = -1;
@@ -287,7 +291,12 @@ __device__ void gpuSPRHillClimb(
     int N,
     int sprDist,
     int width,
-    int lane
+    int lane,
+    unsigned int* treels_scores  = nullptr,
+    int*          treels_back_vf = nullptr,
+    int*          treels_filled  = nullptr,
+    unsigned int* treels_cutoff  = nullptr,
+    int           max_treels     = 0
 )
 {
     int* const back_vf = topo->back_vf;
@@ -487,6 +496,59 @@ __device__ void gpuSPRHillClimb(
                 }
                 __syncwarp();
             }
+
+            // ── Treels: save best candidate per-node-i (regardless of improvement) ──
+            // If improvement: back_vf already reflects candidate (applyMove done above).
+            // If no improvement: temporarily apply → copy → undo via second applyMove.
+            if (lane == 0)
+            {
+                sh.bcast[6] = -1;
+                if (sh.bestRemoveVf >= 0 && sh.bestInsertVf >= 0 &&
+                    treels_scores != nullptr &&
+                    *((volatile int*)treels_filled) < max_treels)
+                {
+                    unsigned int cutoff = *((volatile unsigned int*)treels_cutoff);
+                    if (sh.bestParsimony <= cutoff)
+                    {
+                        int slot = atomicAdd(treels_filled, 1);
+                        if (slot < max_treels)
+                        {
+                            treels_scores[slot] = sh.bestParsimony;
+                            sh.bcast[6] = slot;
+                            if (sh.bcast[9] < 0)
+                                sh.bcast[3] = topo->back_vf[vfNextFace(sh.bestRemoveVf, N)];
+                        }
+                    }
+                }
+            }
+            __syncwarp();
+            if (sh.bcast[6] >= 0)
+            {
+                if (sh.bcast[9] < 0)
+                {
+                    // Temporarily apply: back_vf does not yet reflect candidate
+                    applyMove<STATES>(
+                        pars_tree, score_tree, topo, sh,
+                        sh.bestRemoveVf, sh.bestInsertVf, N, width, lane
+                    );
+                    __syncwarp();
+                }
+                int* dst = treels_back_vf + (size_t)sh.bcast[6] * kMaxVFaces;
+                for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
+                    dst[vf] = topo->back_vf[vf];
+                __syncwarp();
+                if (sh.bcast[9] < 0)
+                {
+                    // Undo: re-apply rm to original p1 (saved in bcast[3])
+                    // After temp apply, rm's old siblings (p1, p2) are hooked together,
+                    // so applyMove(rm, p1) correctly re-inserts rm between p1 and p2.
+                    applyMove<STATES>(
+                        pars_tree, score_tree, topo, sh,
+                        sh.bestRemoveVf, sh.bcast[3], N, width, lane
+                    );
+                    __syncwarp();
+                }
+            }
         }  // end for i
 
     } while (sh.randomMP < startMP);
@@ -670,7 +732,8 @@ __device__ void runPhase3(
         }
         __syncwarp();
 
-        gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
+        gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane,
+            treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels);
     }
     else
     {
@@ -704,7 +767,8 @@ __device__ void runPhase3(
         }
         __syncwarp();
 
-        gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
+        gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane,
+            treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels);
 
         if (lane == 0)
             sh.site_weights = sh.use_sankoff ? sw_k : nullptr;  // restore original weights
@@ -720,7 +784,8 @@ __device__ void runPhase3(
         }
         __syncwarp();
 
-        gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane);
+        gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane,
+            treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels);
     }
 
     // ── Step 3: Stagnation tracking + pool insert with hash dedup ────────────
@@ -1157,7 +1222,7 @@ void gpuStepwiseBuildTrees(
 
     // Dispatch kernels by compile-time STATES × NTAXA (Opt-P Layer 3)
     // STATES: 2=binary, 4=DNA, 20=protein, 32=fallback
-    // NTAXA buckets: ≤128, ≤256, ≤384, ≤512, ≤800 (=kMaxTaxa)
+    // NTAXA buckets: ≤128, ≤256, ≤384, ≤512, ≤800 (=kMaxTaxa)  [GPU_NTAXA_TEMPLATE]
     auto launch = [&](auto states_tag, auto ntaxa_tag)
     {
         constexpr int S = decltype(states_tag)::value;
@@ -1246,7 +1311,7 @@ void gpuStepwiseBuildTrees(
     };
 
     // Dispatch on NTAXA bucket (Opt-P L3) then STATES.
-    // GPU_NTAXA_TEMPLATE=ON  → 4 buckets (128/256/512/800), slow build, full speedup.
+    // GPU_NTAXA_TEMPLATE=ON  → 5 buckets (128/256/384/512/800), slow build, full speedup.
     // GPU_NTAXA_TEMPLATE=OFF → 800 only, fast build, no NTAXA speedup.
     auto dispatch_ntaxa = [&](auto states_tag)
     {
@@ -1255,6 +1320,8 @@ void gpuStepwiseBuildTrees(
             launch(states_tag, std::integral_constant<int, 128>{});
         else if (mxtips <= 256)
             launch(states_tag, std::integral_constant<int, 256>{});
+        else if (mxtips <= 384)
+            launch(states_tag, std::integral_constant<int, 384>{});
         else if (mxtips <= 512)
             launch(states_tag, std::integral_constant<int, 512>{});
         else

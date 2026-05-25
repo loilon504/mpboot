@@ -56,7 +56,10 @@ static void uploadSankoffTipParsVect(
     const size_t parsVT = mem->parsVectPerTree;
     const int lower = (int)pr->partitionData[0]->lower;
     const int upper = (int)pr->partitionData[0]->upper;
-    const unsigned int undetermined = (1u << states) - 1u;  // all-states bitmask = gap/N
+    // PLL undetermined code: DNA=15 (4-bit bitmask), AA=22 (index-based, not bitmask).
+    // Do NOT use (1<<states)-1 — that gives 1048575 for states=20, which overflows seen[256].
+    // Use maxTipStates-1 which PLL sets to getUndetermined(dataType) for each partition.
+    const unsigned int undetermined = (unsigned int)(pr->partitionData[0]->maxTipStates - 1);
 
     std::vector<parsimonyNumber> h_buf(parsVT, (parsimonyNumber)kSankoffInf);
 
@@ -76,15 +79,13 @@ static void uploadSankoffTipParsVect(
             if (counter <= 1) continue;  // uninformative: skip
         }
 
-        parsimonyNumber* row = &h_buf[(size_t)ptn_gpu * states];
         for (int tipNum = 1; tipNum <= N; ++tipNum) {
             unsigned char nuc = tr->yVector[tipNum][i];
             unsigned int bitmask = (unsigned int)nuc;
-            parsimonyNumber* out = &h_buf[(size_t)tipNum * P * states + (size_t)ptn_gpu * states];
             for (int s = 0; s < states; ++s)
-                out[s] = ((bitmask >> s) & 1u) ? 0u : (parsimonyNumber)kSankoffInf;
+                h_buf[(size_t)tipNum * P * states + (size_t)s * P + ptn_gpu] =
+                    ((bitmask >> s) & 1u) ? 0u : (parsimonyNumber)kSankoffInf;
         }
-        (void)row;
         ptn_gpu++;
     }
 
@@ -182,15 +183,16 @@ int mpbootGpu(
 
     // ── [2] Allocate GPU memory ───────────────────────────────────────────────
     t0 = std::chrono::high_resolution_clock::now();
-    // Treels buffer: bootstrap K2 writes all good trees each round for REPS eval.
-    // Size = K * 10 (up to ~10 outer iters per K2 round × K workers).
-    const int max_treels_boot = K * 10;  // always allocate; gpuHillClimbing needs it
+    // Treels buffer: only needed for bootstrap (-bb). Non-bootstrap uses pool directly.
+    const bool need_treels = (params.gbo_replicates > 0);
+    const int max_treels_boot = need_treels ? K_alloc * 1000 : 0;
     GpuParsimonyMem* mem = gpuParsimonyMemAlloc(
         K_alloc, mxtips, width, states, params.gpu_pool_size, max_treels_boot,
         use_sankoff ? iqtree.cost_matrix : nullptr,
         use_sankoff ? iqtree.cost_nstates : 0
     );
-    GPU_LOG("[GPU]   [2]      %-28s: %8.3f s\n", "GPU memory alloc", msSince(t0) / 1e3);
+    GPU_LOG("[GPU]   [2]      %-28s: %8.3f s  (%.2f GB)\n", "GPU memory alloc",
+            msSince(t0) / 1e3, mem->total_gpu_bytes / 1073741824.0);
 
     // ── [3] Upload tip parsVect ───────────────────────────────────────────────
     cudaStream_t stream = 0;
@@ -202,65 +204,6 @@ int mpbootGpu(
         uploadSankoffSiteWeights(mem, pr, stream);
     }
     GPU_LOG("[GPU]   [3]      %-28s: %8.3f s\n", "Upload tip parsVect (H->D)", msSince(t0) / 1e3);
-
-    // ── [3b] Sankoff debug info ───────────────────────────────────────────────
-    if (use_sankoff) {
-        // Cost matrix
-        GPU_LOG("[GPU]\n[GPU] --- Sankoff debug ---\n");
-        GPU_LOG("[GPU] Cost matrix (%dx%d):\n", states, states);
-        for (int i = 0; i < states; i++) {
-            GPU_LOG("[GPU]   row[%d]: ", i);
-            for (int j = 0; j < states; j++)
-                GPU_LOG("%6u", iqtree.cost_matrix[i * states + j]);
-            GPU_LOG("\n");
-        }
-
-        // Pattern weight stats
-        unsigned int sw_min = UINT_MAX, sw_max = 0, sw_sum = 0;
-        int sw_trivial = 0;
-        for (int p = 0; p < width; p++) {
-            unsigned int w = (unsigned int)iqtree.aln->at(p).frequency;
-            if (w < sw_min) sw_min = w;
-            if (w > sw_max) sw_max = w;
-            sw_sum += w;
-            if (w == 1) sw_trivial++;
-        }
-        GPU_LOG("[GPU] Patterns: %d  weights: min=%u max=%u sum=%u (trivial w=1: %d)\n",
-                width, sw_min, sw_max, sw_sum, sw_trivial);
-
-        // Memory bandwidth estimate per node update
-        // Layout [ptn][state]: stride=STATES between lanes → 4x non-coalesced
-        const double bytes_node_rw = 3.0 * width * states * sizeof(unsigned int);  // 2 reads + 1 write per node
-        const int inner_nodes = 2 * mxtips - 2;
-        const double bytes_per_tree_mb = bytes_node_rw * inner_nodes / 1e6;
-        GPU_LOG("[GPU] Mem/node update: %.1f KB  inner_nodes=%d  mem/tree: %.1f MB\n",
-                bytes_node_rw / 1024.0, inner_nodes, bytes_per_tree_mb);
-        GPU_LOG("[GPU] WARNING: layout [ptn*S+s] → stride=%d between lanes (non-coalesced, ~4x waste)\n", states);
-        GPU_LOG("[GPU] Ops/node: P*S^2=%d*%d=%d min-ops  vs Fitch: width*S=%d*%d=%d\n",
-                width, states * states, width * states * states,
-                width / 32, states, (width / 32) * states);
-
-        // Sample tip vectors: first 3 tips, first 4 patterns
-        GPU_LOG("[GPU] Sample tip cost vectors (tip 1..3, ptn 0..3), fmt: state=[cost,...]:\n");
-        const int show_tips = std::min(3, mxtips);
-        const int show_ptns = std::min(4, width);
-        for (int tip = 1; tip <= show_tips; tip++) {
-            GPU_LOG("[GPU]   tip%d:", tip);
-            for (int ptn = 0; ptn < show_ptns; ptn++) {
-                int s_state = (int)(unsigned char)iqtree.aln->at(ptn)[tip - 1];
-                GPU_LOG(" ptn%d=[", ptn);
-                for (int s = 0; s < states; s++) {
-                    unsigned int cost;
-                    if (s_state < states) cost = (s == s_state) ? 0u : (unsigned int)kSankoffInf;
-                    else cost = 0u;
-                    GPU_LOG("%s%u", s ? "," : "", cost == kSankoffInf ? 9u : cost);  // print 9 for INF
-                }
-                GPU_LOG("](st=%d)", s_state);
-            }
-            GPU_LOG("\n");
-        }
-        GPU_LOG("[GPU] --- end Sankoff debug ---\n[GPU]\n");
-    }
 
     // ── [4] Upload initial topologies ─────────────────────────────────────────
     t0 = std::chrono::high_resolution_clock::now();
@@ -603,7 +546,11 @@ void gpuHillClimbing(
     double best_logl_seen  = -1e30;
     int total_replicates   = 0;
     int last_impr_at       = 0;   // total_replicates at last improvement
-    const int unsuccess_thresh = params.unsuccess_iteration + k2_workers * params.gpu_worker_stop;
+    const int unsuccess_thresh = (is_bootstrap ? params.unsuccess_iteration : 0)
+                                 + k2_workers * params.gpu_worker_stop;
+    // Non-bootstrap: host buffer to track best pool score each round (cheap: pool_size ints)
+    std::vector<unsigned int> h_pool_scores_round(!is_bootstrap ? pool_size : 0, 0xFFFFFFFFu);
+    unsigned int best_pool_round = 0xFFFFFFFFu;
 
     if (is_bootstrap)
         GPU_LOG("%s K2-treels: B=%d K=%d pool=%d unsuccess=%d\n", tag, B, k2_workers, pool_size, unsuccess_thresh);
@@ -632,7 +579,8 @@ void gpuHillClimbing(
 
         // ── Download treels → REPS eval ───────────────────────────────────────
         int h_filled = 0;
-        CUDA_CHECK(cudaMemcpy(&h_filled, mem->d_treelsFilled, sizeof(int), cudaMemcpyDeviceToHost));
+        if (mem->d_treelsFilled)
+            CUDA_CHECK(cudaMemcpy(&h_filled, mem->d_treelsFilled, sizeof(int), cudaMemcpyDeviceToHost));
         const int n_treels = std::min(h_filled, max_treels);
 
         if (n_treels > 0 && max_treels > 0)
@@ -701,16 +649,22 @@ void gpuHillClimbing(
                 if (cur_best > best_logl_seen + 1e-6)
                 {
                     best_logl_seen = cur_best;
-                    last_impr_at   = total_replicates;
+                    last_impr_at   = total_done;
                 }
             }
         }
         else
         {
-            if (iqtree.bestScore > best_logl_seen + 1e-6)
+            CUDA_CHECK(cudaMemcpy(
+                h_pool_scores_round.data(), mem->d_poolScores,
+                (size_t)pool_size * sizeof(unsigned int), cudaMemcpyDeviceToHost
+            ));
+            best_pool_round = *std::min_element(h_pool_scores_round.begin(), h_pool_scores_round.end());
+            double cur_best_logl = -(double)best_pool_round;
+            if (cur_best_logl > best_logl_seen + 1e-6)
             {
-                best_logl_seen = iqtree.bestScore;
-                last_impr_at   = total_replicates;
+                best_logl_seen = cur_best_logl;
+                last_impr_at   = total_done;
             }
         }
 
@@ -758,16 +712,18 @@ void gpuHillClimbing(
         else
         {
             GPU_LOG(
-                "%s Round %-3d  done=%-5d  filled=%-5d  reps=%-5d  "
-                "last_impr=%-5d  best=%.0f  t=%.2fs\n",
-                tag, round, total_done, h_filled, total_replicates,
-                last_impr_at, iqtree.bestScore, round_sec
+                "%s Round %-3d  done=%-5d  last_impr=%-5d  best=%-8u  t=%.2fs\n",
+                tag, round, total_done, last_impr_at, best_pool_round, round_sec
             );
         }
         fflush(stdout);
 
-        if (total_replicates - last_impr_at > unsuccess_thresh
-            || (is_bootstrap && total_replicates > B))
+        // Mirror CPU SC_BOOTSTRAP_CORRELATION: require correlation convergence AND no improvement
+        // for unsuccess_thresh workers; or hard cap at B total workers done.
+        // Use total_done (worker count) not total_replicates (tree count) so intermediate
+        // SPR writes don't inflate the counter and cause premature exit.
+        if ((total_done - last_impr_at > unsuccess_thresh
+                && (!is_bootstrap || cur_correlation >= params.min_correlation)))
         {
             break;
         }
@@ -776,7 +732,7 @@ void gpuHillClimbing(
     if (is_bootstrap)
         GPU_LOG("%s Done: %d rounds, %d replicates, cor=%.4f\n", tag, round, total_done, cur_correlation);
     else
-        GPU_LOG("%s Done: %d rounds, %d replicates, best=%.0f\n", tag, round, total_done, iqtree.bestScore);
+        GPU_LOG("%s Done: %d rounds\n", tag, round);
 
     // ── Add GPU pool topologies to candidateTrees ────────────────────────────
     // Pool holds near-optimal topologies after K2 rounds. Register them so the

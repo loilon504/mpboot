@@ -116,17 +116,15 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     const size_t topoBytes          = (size_t)K * sizeof(GpuTopology);
     const size_t siteWeightsBytes   = (size_t)K * mem->siteWeightsPerTree * sizeof(unsigned int);
 
-    printf("[GPU] Allocating parsimony memory for %d trees (%s):\n", K, use_sankoff ? "Sankoff" : "Fitch");
-    printf("  parsVect  : %.2f MB\n", parsVectBytes / 1048576.0);
-    printf("  parsScore : %.2f MB\n", parsScoreBytes / 1048576.0);
-    printf("  topologies: %.2f MB\n", topoBytes / 1048576.0);
+    size_t total_bytes = 0;
 
-    CUDA_CHECK(cudaMalloc(&mem->d_parsVect,    parsVectBytes));
-    CUDA_CHECK(cudaMalloc(&mem->d_parsScore,   parsScoreBytes));
-    CUDA_CHECK(cudaMalloc(&mem->d_topos,       topoBytes));
+    CUDA_CHECK(cudaMalloc(&mem->d_parsVect,    parsVectBytes));   total_bytes += parsVectBytes;
+    CUDA_CHECK(cudaMalloc(&mem->d_parsScore,   parsScoreBytes));  total_bytes += parsScoreBytes;
+    CUDA_CHECK(cudaMalloc(&mem->d_topos,       topoBytes));       total_bytes += topoBytes;
     if (siteWeightsBytes > 0)
     {
         CUDA_CHECK(cudaMalloc(&mem->d_siteWeights, siteWeightsBytes));
+        total_bytes += siteWeightsBytes;
     }
     else
     {
@@ -134,34 +132,42 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     }
     mem->d_ratchetScratch = nullptr;
     if (use_sankoff && siteWeightsBytes > 0)
+    {
         CUDA_CHECK(cudaMalloc(&mem->d_ratchetScratch, siteWeightsBytes));
+        total_bytes += siteWeightsBytes;
+    }
 
     // Upload cost matrix for Sankoff mode
     if (use_sankoff)
     {
-        CUDA_CHECK(cudaMalloc(&mem->d_cost_matrix, (size_t)nstates * nstates * sizeof(unsigned int)));
-        CUDA_CHECK(cudaMemcpy(mem->d_cost_matrix, cost_matrix,
-                              (size_t)nstates * nstates * sizeof(unsigned int),
-                              cudaMemcpyHostToDevice));
+        const size_t costBytes = (size_t)nstates * nstates * sizeof(unsigned int);
+        CUDA_CHECK(cudaMalloc(&mem->d_cost_matrix, costBytes));
+        CUDA_CHECK(cudaMemcpy(mem->d_cost_matrix, cost_matrix, costBytes, cudaMemcpyHostToDevice));
+        total_bytes += costBytes;
     }
-    CUDA_CHECK(cudaMalloc(&mem->d_postSprScores, (size_t)K * sizeof(unsigned int)));
+    const size_t postSprBytes = (size_t)K * sizeof(unsigned int);
+    CUDA_CHECK(cudaMalloc(&mem->d_postSprScores, postSprBytes));  total_bytes += postSprBytes;
 
     // Pool for population-based hill-climbing restarts
-    CUDA_CHECK(cudaMalloc(&mem->d_poolScores, (size_t)pool_size * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMalloc(&mem->d_poolBackVf, (size_t)pool_size * kMaxVFaces * sizeof(int)));
+    const size_t poolScoreBytes = (size_t)pool_size * sizeof(unsigned int);
+    const size_t poolBackVfBytes = (size_t)pool_size * kMaxVFaces * sizeof(int);
+    CUDA_CHECK(cudaMalloc(&mem->d_poolScores, poolScoreBytes));   total_bytes += poolScoreBytes;
+    CUDA_CHECK(cudaMalloc(&mem->d_poolBackVf, poolBackVfBytes));  total_bytes += poolBackVfBytes;
     // Init pool scores to UINT_MAX (empty)
-    CUDA_CHECK(cudaMemset(mem->d_poolScores, 0xFF, (size_t)pool_size * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(mem->d_poolScores, 0xFF, poolScoreBytes));
 
     // Fill counter + per-slot spinlocks
-    CUDA_CHECK(cudaMalloc(&mem->d_poolFilled,    sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&mem->d_poolSlotLocks, (size_t)pool_size * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&mem->d_poolHashes,    (size_t)pool_size * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMalloc(&mem->d_globalBest,    sizeof(unsigned int)));
+    const size_t poolLocksBytes = (size_t)pool_size * sizeof(int);
+    const size_t poolHashBytes  = (size_t)pool_size * sizeof(unsigned int);
+    CUDA_CHECK(cudaMalloc(&mem->d_poolFilled,    sizeof(int)));          total_bytes += sizeof(int);
+    CUDA_CHECK(cudaMalloc(&mem->d_poolSlotLocks, poolLocksBytes));       total_bytes += poolLocksBytes;
+    CUDA_CHECK(cudaMalloc(&mem->d_poolHashes,    poolHashBytes));        total_bytes += poolHashBytes;
+    CUDA_CHECK(cudaMalloc(&mem->d_globalBest,    sizeof(unsigned int))); total_bytes += sizeof(unsigned int);
     int h_zero = 0;
     unsigned int h_inf = 0xFFFFFFFFu;
     CUDA_CHECK(cudaMemcpy(mem->d_poolFilled,  &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(mem->d_poolSlotLocks, 0, (size_t)pool_size * sizeof(int)));
-    CUDA_CHECK(cudaMemset(mem->d_poolHashes, 0xFF, (size_t)pool_size * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(mem->d_poolSlotLocks, 0, poolLocksBytes));
+    CUDA_CHECK(cudaMemset(mem->d_poolHashes, 0xFF, poolHashBytes));
     CUDA_CHECK(cudaMemcpy(mem->d_globalBest,  &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
 
     // Treels buffer (optional, for bootstrap round output)
@@ -171,17 +177,18 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     mem->d_treelsFilled   = nullptr;
     mem->d_treelsCutoff   = nullptr;
     if (max_treels > 0) {
-        CUDA_CHECK(cudaMalloc(&mem->d_treelsScores,
-            (size_t)max_treels * sizeof(unsigned int)));
-        CUDA_CHECK(cudaMalloc(&mem->d_treelsBackVf,
-            (size_t)max_treels * kMaxVFaces * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&mem->d_treelsFilled, sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&mem->d_treelsCutoff, sizeof(unsigned int)));
-        CUDA_CHECK(cudaMemset(mem->d_treelsScores, 0xFF,
-            (size_t)max_treels * sizeof(unsigned int)));
+        const size_t treelsScoreBytes = (size_t)max_treels * sizeof(unsigned int);
+        const size_t treelsBackVfBytes = (size_t)max_treels * kMaxVFaces * sizeof(int);
+        CUDA_CHECK(cudaMalloc(&mem->d_treelsScores,  treelsScoreBytes));  total_bytes += treelsScoreBytes;
+        CUDA_CHECK(cudaMalloc(&mem->d_treelsBackVf,  treelsBackVfBytes)); total_bytes += treelsBackVfBytes;
+        CUDA_CHECK(cudaMalloc(&mem->d_treelsFilled,  sizeof(int)));       total_bytes += sizeof(int);
+        CUDA_CHECK(cudaMalloc(&mem->d_treelsCutoff,  sizeof(unsigned int))); total_bytes += sizeof(unsigned int);
+        CUDA_CHECK(cudaMemset(mem->d_treelsScores, 0xFF, treelsScoreBytes));
         CUDA_CHECK(cudaMemcpy(mem->d_treelsFilled, &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(mem->d_treelsCutoff, &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
     }
+
+    mem->total_gpu_bytes = total_bytes;
 
     CUDA_CHECK(cudaMemset(mem->d_parsVect,    0, parsVectBytes));
     CUDA_CHECK(cudaMemset(mem->d_parsScore,   0, parsScoreBytes));
@@ -259,13 +266,9 @@ void resetTreelsRound(GpuParsimonyMem* mem, unsigned int cutoff_pars)
 }
 
 // ─── uploadTipParsVect ────────────────────────────────────────────────────────
-// Fitch mode:
-//   CPU layout per node: [state][block]  stride = parsimonyLength (= width)
-//   GPU layout per node: [block][state]  stride = states
-// Sankoff mode:
-//   CPU layout: Fitch bitmask (parsimonyLength blocks × states × uint32)
-//   GPU layout: [pattern][state] where pattern = b*32+bit, cost = 0 if bit set else kSankoffInf
-//   width in Sankoff mode = parsimonyLength * 32 (= numPatterns, set by caller)
+// Fitch mode only (Sankoff handled by uploadSankoffTipParsVect in gpu_init_trees.cu).
+// CPU layout per node: [state][block]  stride = parsimonyLength (= width)
+// GPU layout per node: [state][block]  — same → direct memcpy, no reorder needed
 void uploadTipParsVect(
     GpuParsimonyMem* mem, const pllInstance* tr, const partitionList* pr, cudaStream_t stream
 )
@@ -274,62 +277,22 @@ void uploadTipParsVect(
     const int width = mem->width;
     const int states = mem->states;
     const size_t parsVT = mem->parsVectPerTree;  // elements per tree
-    const bool use_sankoff = (mem->d_cost_matrix != nullptr);
 
-    // Build one reordered host buffer for a single tree, then broadcast to all K.
+    // Build one host buffer for a single tree, then broadcast to all K.
     std::vector<parsimonyNumber> h_buf(parsVT, 0);
 
     // Only partition 0 for now (single-partition case).
     const parsimonyNumber* cpu_pars = pr->partitionData[0]->parsVect;
 
-    if (!use_sankoff)
+    // Fitch: CPU and GPU both use [node][state][block] → direct memcpy
+    const int parsimonyLength = width;
+    for (int tipNum = 1; tipNum <= N; ++tipNum)
     {
-        // Fitch: reorder [node][state][block] → [node][block][state]
-        // cpu_pars indexed with parsimonyLength (= width) as stride
-        const int parsimonyLength = width;
-        for (int tipNum = 1; tipNum <= N; ++tipNum)
-        {
-            for (int b = 0; b < parsimonyLength; ++b)
-            {
-                for (int s = 0; s < states; ++s)
-                {
-                    parsimonyNumber v = cpu_pars[
-                        (size_t)parsimonyLength * states * tipNum +
-                        (size_t)parsimonyLength * s + b];
-                    h_buf[(size_t)tipNum * parsimonyLength * states + (size_t)b * states + s] = v;
-                }
-            }
-        }
-    }
-    else
-    {
-        // Sankoff: unpack Fitch bitmask into per-pattern cost vectors.
-        // width = numPatterns = parsimonyLength * 32.
-        // parsimonyLength = width / 32 (number of uint32 blocks in CPU Fitch layout).
-        const int parsimonyLength = width / 32;
-        const parsimonyNumber sankoff_inf = (parsimonyNumber)kSankoffInf;
-
-        for (int tipNum = 1; tipNum <= N; ++tipNum)
-        {
-            for (int b = 0; b < parsimonyLength; ++b)
-            {
-                for (int s = 0; s < states; ++s)
-                {
-                    // Fitch bitmask for this tip, state s, block b:
-                    // bit j set => state s is possible at pattern b*32+j
-                    parsimonyNumber mask = cpu_pars[
-                        (size_t)parsimonyLength * states * tipNum +
-                        (size_t)parsimonyLength * s + b];
-
-                    for (int j = 0; j < 32; ++j)
-                    {
-                        int pat = b * 32 + j;
-                        parsimonyNumber cost = ((mask >> j) & 1u) ? 0u : sankoff_inf;
-                        h_buf[(size_t)tipNum * width * states + (size_t)pat * states + s] = cost;
-                    }
-                }
-            }
-        }
+        memcpy(
+            &h_buf[(size_t)tipNum * parsimonyLength * states],
+            cpu_pars + (size_t)tipNum * parsimonyLength * states,
+            (size_t)parsimonyLength * states * sizeof(parsimonyNumber)
+        );
     }
 
     // Upload the same tip data into every tree slot.

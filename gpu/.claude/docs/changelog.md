@@ -241,129 +241,6 @@ Block Limit Reg: 12 → 16 blocks/SM. Nhưng Theor. Occ vẫn 20.31% vì shared 
 
 ---
 
-## Refactor #1 — Joined kernel: SPR vào buildParsimonyTreesKernel, chung BuildShared
-
-**Ngày**: 2026-05-07
-**Task**: Tối ưu hóa kiến trúc — join SPR vào sau build để tận dụng shared memory chung
-**File liên quan**: `gpu/src/pars_build.cu`, `gpu/include/pars_tree.cuh`, `gpu/src/gpu_spr.cu`
-
-### Thay đổi
-
-Trước: hai kernel riêng biệt — `buildParsimonyTreesKernel` và `gpuSprKernel`, mỗi cái có
-struct shared memory riêng (`BuildShared` và `SprShared`). Giữa hai kernel phải đồng bộ CPU.
-
-Sau: một kernel duy nhất `buildParsimonyTreesKernel(sprDist)` gồm 4 phase:
-- Phase 0: init (Fisher-Yates shuffle, 3-tip tree)
-- Phase 1: stepwise addition (tips 4..N)
-- Phase 2: set `start_vface`
-- Phase 3: SPR hill-climbing (if `sprDist > 0`)
-
-### Thiết kế BuildShared mới (≈24.8 KB trên A100)
-
-`SprShared` được xóa bỏ, các field của nó được merge vào `BuildShared`:
-- `stack[]` (2×kMaxTaxa) — build DFS stack, tái dụng làm SPR `stackVf`
-- `stackMint[]`, `stackMaxt[]` (kMaxTaxa mỗi) — SPR addTraverse / recompute child_index
-- `seed` (long) — từ biến local thành shared, kế thừa từ build phase sang SPR
-- `randomMP`, `randomMPHits`, `bestRemoveVf`, `bestInsertVf`, `tip_p_num`, `bcast[16]` — SPR fields
-- `bestPars` đổi tên thành `bestParsimony` — dùng cho cả hai phase
-
-### Init `sh.randomMP` không cần `recomputeAllNodes`
-
-Sau Phase 1, `sh.bestParsimony` là điểm parsimony hợp lệ của cây (từ lần evaluate cuối
-trong stepwise addition), và xPars flags đã nhất quán với parsVect. Do đó:
-```cuda
-sh.randomMP = sh.bestParsimony;  // valid: xPars consistent after build
-```
-
-Đây là insight quan trọng: `recomputeAllNodes` (O(N) work) KHÔNG cần thiết nếu xPars system
-đã nhất quán từ phase trước. Tiết kiệm N−1 newview calls per tree.
-
-### Kết quả
-
-| Metric | Trước (2 kernel) | Sau (joined) |
-|--------|-----------------|--------------|
-| Shared memory | BuildShared + SprShared | BuildShared duy nhất (24.8 KB) |
-| CPU sync giữa build-SPR | 1 lần | Không cần |
-| Post-SPR best (N=295, K=99) | 16369 (sai) | **6676** (≈CPU 6682) |
-| ms/tree | 79 ms/tree (build) + fail | 79.3 ms/tree (build+SPR) |
-
-### Bài học / Ghi chú cho khóa luận
-
-**Ưu điểm join kernel**:
-1. Loại bỏ CPU synchronization overhead giữa hai kernel (cudaStreamSynchronize)
-2. Shared memory được tái dụng — không cần tải lại parsVect/score_tree
-3. xPars state được kế thừa — không cần recomputeAllNodes
-4. Đơn giản hóa API: một hàm `gpuStepwiseBuildTrees(mem, seeds, sprDist, stream)`
-
-**Lưu ý cho khóa luận**: Việc join kernel không chỉ là optimization mà còn là architectural
-change — nó khai thác tính sequential của build→SPR để chia sẻ state (xPars, seed, parsVect)
-mà không cần round-trip qua global memory. Đây là pattern quan trọng trong GPU kernel design.
-
----
-
-## Kết quả thực nghiệm — Scaling theo số cây K (2026-05-07)
-
-**Ngày**: 2026-05-07
-**Dataset**: `data_debug/tree1.phy` — N=295 taxa, 1836 columns, 1400 patterns (DNA)
-**Hardware**: NVIDIA A100-SXM4-80GB
-**Tham số**: sprDist=6, seed=1
-**CPU reference** (`_pllSprOnCurrentTree`, 1 cây): best parsimony ≈ **6668**
-
-### Bảng kết quả
-
-| K (số cây GPU) | Post-SPR best | ms/tree | Tổng thời gian |
-|----------------|--------------|---------|----------------|
-| 99             | 6676         | 79.3 ms | ~7.9 s         |
-| 199            | 6671         | 44.9 ms | ~9.0 s         |
-| 499            | 6671         | 25.0 ms | 12.5 s         |
-| 999            | 6670         | 21.2 ms | 21.2 s         |
-| **9999**       | **6664**     | **16.3 ms** | **163 s**   |
-| CPU ref (1 cây) | ~6668       | —       | —              |
-
-### Kết quả quan trọng
-
-**Với K=9999: GPU đạt best=6664 — vượt CPU reference 6668.**
-Đây là lần đầu tiên GPU tìm được cây tốt hơn CPU sau khi tăng số lượng cây.
-
-### Phân tích scaling
-
-**ms/tree giảm theo K:**
-- 99→999 cây: 79→21 ms/tree (giảm 3.7×) — tốt hơn tuyến tính
-- 999→9999 cây: 21→16 ms/tree (giảm 1.3×) — gần bão hòa
-
-GPU A100 có 108 SM × nhiều warps/SM. Khi K nhỏ (99 blocks), nhiều SM idle.
-Khi K lớn (9999 blocks), tất cả SM đều bận → throughput tối đa đạt ~16 ms/tree.
-
-**Post-SPR best cải thiện theo K:**
-Càng nhiều cây khởi đầu từ random seeds khác nhau → tìm kiếm bao phủ landscape
-parsimony rộng hơn → tìm được optimum tốt hơn. Đây là lợi thế cốt lõi của GPU
-parallelism so với CPU serial: GPU có thể chạy 9999 independent SPR hill-climbs
-trong ~163 giây.
-
-**So sánh tổng thời gian:**
-- CPU chạy 9999 cây serial: 9999 × (thời gian 1 cây CPU) ≈ 9999 × ~0.2s ≈ **33 phút**
-- GPU chạy 9999 cây parallel: **163 giây (2.7 phút)** — speedup ~12×
-
-### Bài học / Ghi chú cho khóa luận
-
-**Ý nghĩa chính của kết quả này:**
-
-1. **Correctness**: GPU SPR đúng thuật toán và cho kết quả không tệ hơn CPU (với đủ cây,
-   GPU tìm được cây TỐT HƠN CPU vì khám phá nhiều starting points hơn).
-
-2. **Scalability**: ms/tree giảm từ 79 ms (K=99) xuống 16 ms (K=9999), gần tuyến tính
-   theo số SM. GPU amortizes overhead (upload, alloc) tốt hơn khi K lớn.
-
-3. **Practical impact**: Thay vì chạy serial 9999 cây (33 phút), GPU chạy 9999 cây trong
-   2.7 phút — **speedup 12×**. Với mục tiêu MPBoot (tìm cây parsimony tốt nhất nhanh nhất),
-   đây là kết quả có giá trị thực tiễn cao.
-
-4. **Limitation**: Tổng thời gian tăng tuyến tính theo K (kernel time), nên không thể tăng K
-   vô hạn. Điểm "sweet spot" phụ thuộc vào yêu cầu chất lượng vs. thời gian: K=999 cho
-   kết quả gần CPU (6670) trong 21 giây là cân bằng tốt.
-
----
-
 ## Refactor #2 — Thêm `nodep[kMaxNodes]` vào `GpuTopology`; rewrite `gpuNodeRectifierPars`
 
 **Ngày**: 2026-05-11
@@ -446,79 +323,6 @@ khác nhau một đơn vị và dễ nhầm. Quy tắc:
 - Nếu biến là **node number**: dùng `> N` cho inner
 
 Luôn kiểm tra: biến đang so sánh là vface hay node number?
-
----
-
-## Kết quả thực nghiệm — Scaling sau Refactor #2 + Bug #6-8 fixes (2026-05-11)
-
-**Ngày**: 2026-05-11
-**Dataset**: `data_debug/tree1.phy` — N=295 taxa, 1836 columns, 1400 patterns (DNA)
-**Hardware**: NVIDIA A100-SXM4-80GB
-**Tham số**: sprDist=6, seed=1, iters=100, NNI=29, sprDist4=3, maxDW=5
-**CPU reference** (`_pllSprOnCurrentTree`, 1 cây): best parsimony ≈ **6668**
-
-### Bảng kết quả
-
-| K (số cây GPU) | Thực chạy | Post-SPR best | Pre-SPR best | ms/tree | Tổng thời gian |
-|----------------|-----------|--------------|-------------|---------|----------------|
-| 100            | 99        | **6665**     | 6734        | 83.21 ms | 8.24 s        |
-| 200            | 199       | **6665**     | 6723        | 39.55 ms | 7.87 s        |
-| 500            | 499       | **6665**     | 6713        | 24.15 ms | 12.05 s       |
-| 1000           | 999       | **6665**     | 6713        | 23.09 ms | 23.07 s       |
-| **10000**      | **9999**  | **6662**     | 6713        | **20.76 ms** | **207.6 s** |
-| CPU ref (1 cây) | —        | ~6668        | —           | —        | —              |
-
-### Kết quả quan trọng
-
-**K=10000: GPU best=6662 — vượt CPU reference 6668.**
-Post-SPR best ổn định ở 6665 với K=100..1000, cải thiện thêm khi K=10000 (6662).
-
-### So sánh với kết quả trước (2026-05-07, trước Refactor #2)
-
-| K | Post-SPR best cũ | ms/tree cũ | Post-SPR best mới | ms/tree mới | Nhận xét |
-|---|-----------------|-----------|------------------|------------|---------|
-| ~100 | 6676 | 79.3 ms | 6665 | 83.21 ms | Best cải thiện; ms/tree tăng nhẹ |
-| ~1000 | 6670 | 21.2 ms | 6665 | 23.09 ms | Best cải thiện; overhead nhỏ |
-| ~10000 | 6664 | 16.3 ms | 6662 | 20.76 ms | Best cải thiện; ms/tree cao hơn |
-
-ms/tree tăng nhẹ (~4 ms) so với trước refactor — chi phí từ `gpuNodeRectifierPars` mới
-(DFS gán `nodep[]` sau mỗi do-while iteration) và mảng `nodep[kMaxNodes]` bổ sung vào
-`GpuTopology` (tăng shared memory bandwidth).
-
-### Phân tích scaling
-
-**ms/tree giảm theo K:**
-- 100→500 cây: 83→24 ms/tree (giảm 3.5×) — GPU SM occupancy tăng rõ rệt
-- 500→1000 cây: 24→23 ms/tree (gần bão hòa ở ~108 SM × warps/SM)
-- 1000→10000 cây: 23→21 ms/tree (bão hòa — SM overhead amortized)
-
-**Pre-SPR best hội tụ từ K=500**: Pre-SPR best ổn định ở 6713 khi K ≥ 500 —
-stepwise addition bão hòa về chất lượng; cải thiện thêm đến từ SPR.
-
-**Post-SPR best cải thiện chậm hơn**: Từ 6665 (K=100) xuống 6662 (K=10000) —
-landscape parsimony có nhiều local optima tốt ở 6665; cần rất nhiều starting points
-để lọt qua vào optima tốt hơn. Đây là tính chất NP-hard của bài toán.
-
-**So sánh với CPU serial:**
-- CPU 10000 cây serial: ~10000 × 0.2s ≈ **33 phút**
-- GPU 10000 cây: **207 giây (3.5 phút)** — speedup ~**9.6×**
-
-### Bài học / Ghi chú cho khóa luận
-
-1. **Correctness**: Sau Refactor #2 và Bug #6-8, GPU SPR cho kết quả đúng thuật toán
-   và tìm được cây tốt hơn CPU với đủ starting points (6662 < 6668).
-
-2. **Overhead của nodep[]**: Thêm mảng `nodep[]` và DFS của `gpuNodeRectifierPars` tăng
-   ms/tree ~4 ms (~20% overhead với K=10000). Đây là trade-off chấp nhận được để đảm bảo
-   correctness (ring arithmetic đúng với mọi face).
-
-3. **Scaling behavior**: ms/tree bão hòa ở ~20-21 ms sau K≈500. Điểm "sweet spot":
-   - K=500: 24 ms/tree, best=6665, tổng 12s — nhanh, chất lượng tốt
-   - K=1000: 23 ms/tree, best=6665, tổng 23s — balanced
-   - K=10000: 21 ms/tree, best=6662, tổng 207s — best quality, tốn thời gian
-
-4. **GPU speedup ~9.6×** so với CPU serial (thực tế có thể cao hơn vì CPU reference
-   chỉ chạy 1 cây với search parameters đầy đủ — 10000 cây CPU sẽ còn chậm hơn).
 
 ---
 
@@ -646,86 +450,6 @@ GPU speedup tăng mạnh theo taxa (N). Dataset N<100 bị overhead-bound; N≥4
 
 ---
 
-## Kết quả thực nghiệm — CPU serial baseline (branch mpboot gốc, 2026-05-11)
-
-**Ngày**: 2026-05-11
-**Dataset**: `data_debug/tree1.phy` — N=295 taxa, 1836 columns, 1400 patterns (DNA)
-**Hardware**: CPU serial (1 core), không dùng GPU
-**Tham số**: sprDist=6, seed=1 (`_pllComputeRandomizedStepwiseAdditionParsimonyTree`)
-**Code**: branch mpboot gốc — `initCandidateTreeSet` single-loop gốc
-
-### Bảng kết quả
-
-| K (numpars) | Thực chạy | ms/tree | Tổng thời gian |
-|-------------|-----------|---------|----------------|
-| 100         | 99        | 44.2 ms | 4.38 s         |
-| 200         | 199       | 45.0 ms | 8.95 s         |
-| 500         | 499       | 43.7 ms | 21.80 s        |
-| 1000        | 999       | 43.8 ms | 43.73 s        |
-| **10000**   | **9999**  | **45.3 ms** | **453.41 s** |
-
-### Kết quả quan trọng
-
-**ms/tree bằng phẳng ~44ms ở mọi K** — CPU serial là thuần tuyến tính O(K).
-Post-initCandidateSet best parsimony = **6668** (nhất quán mọi K với seed=1).
-Không có lợi thế scaling: chạy 10000 cây = chạy 10 lần × 1000 cây.
-
-### So sánh với GPU (A100-SXM4-80GB, 2026-05-11)
-
-| K | CPU serial (ms/tree) | GPU (ms/tree) | GPU total | CPU total | Speedup tổng |
-|---|---------------------|---------------|-----------|-----------|-------------|
-| 100 | 44.2 ms | 83.2 ms | 8.24 s | 4.38 s | 0.53× |
-| 200 | 45.0 ms | 39.6 ms | 7.87 s | 8.95 s | 1.14× |
-| 500 | 43.7 ms | 24.2 ms | 12.05 s | 21.80 s | 1.81× |
-| 1000 | 43.8 ms | 23.1 ms | 23.07 s | 43.73 s | **1.90×** |
-| **10000** | **45.3 ms** | **20.8 ms** | **207.6 s** | **453.4 s** | **2.18×** |
-
-**GPU breakeven điểm ~K=150**: dưới đó GPU chậm hơn CPU do overhead khởi tạo (upload parsVect, alloc, kernel launch). Trên K≈500 GPU vượt CPU rõ rệt.
-
-**K=10000: GPU tổng thời gian 207s vs CPU 453s → GPU speedup tổng 2.18×.**
-
-### Phân tích
-
-**Tại sao GPU speedup chỉ ~2× thay vì 10×+?**
-- CPU single-loop `_pllComputeRandomizedStepwiseAdditionParsimonyTree` chạy fast (~44ms/tree)
-  nhờ: xPars lazy eval bỏ qua newview cho subtrees đã fresh; CPU cache locality tốt.
-- GPU ~21ms/tree là bottleneck tính toán thực sự (A100 SM saturation với K≥500).
-- Overhead GPU: upload 295 tips × parsVect + alloc + kernel launch ≈ vài giây cố định.
-- Lợi thế GPU không phải tốc độ per-tree mà là **chất lượng**: K=10000 GPU best=6662
-  (sau SPR) vs CPU K=10000 best=6668 (chỉ stepwise+SPR, chưa NNI).
-
-**Tại sao hai-phase code (branch GPU cũ trước fix) chậm ~900ms/tree?**
-
-Branch GPU trung gian dùng cấu trúc hai phase:
-- Phase 1: build tất cả K cây, lưu Newick strings vào `vector<string>`
-- Phase 2: với mỗi cây, gọi `readTreeString(candidateTrees[i])`
-
-Khi Phase 2 xử lý cây i, `pllInst` đang giữ topology của **cây N** (cây cuối build).
-`readTreeString` phải:
-1. `freeNode()` — giải phóng topology hiện tại
-2. `readTree()` — parse Newick và rebuild topology từ đầu
-3. `pllTreeInitTopologyNewick()` — sync PLL topology (O(N))
-
-Ngược lại trong code gốc single-loop, `readTreeString` được gọi ngay sau build — `pllInst`
-đang giữ đúng topology → bước rebuild rất nhẹ, chỉ sync metadata pointer mapping.
-
-Fix: khôi phục single-loop inline registration (branch GPU branch hiện tại đã fix).
-
-### Bài học / Ghi chú cho khóa luận
-
-1. **CPU baseline thực sự ~44ms/tree** — con số "~0.2s/tree" từ trước đó ước tính quá cao.
-   Speedup GPU so với CPU là ~2.2× về tổng thời gian (K=10000), không phải 12×.
-
-2. **Ưu thế GPU chủ yếu là quality, không phải speed**: GPU với K=10000 tìm best=6662
-   (sau SPR) — bằng CPU+NNI-refined. CPU K=10000 serial chỉ cho best=6668.
-   GPU khám phá nhiều starting points hơn trong cùng thời gian → landscape coverage tốt hơn.
-
-3. **readTreeString cost phụ thuộc ngữ cảnh**: Gọi khi pllInst khớp topology → O(N) nhẹ.
-   Gọi khi pllInst có topology khác → O(N) nặng + PLL rebuild. Không thể nhìn code và
-   biết cost mà không biết state của pllInst tại thời điểm gọi.
-
----
-
 ## Bug #8 — `node_num >= N` trong stepwise addition: cùng lỗi vf vs. num
 
 **Ngày**: 2026-05-11
@@ -806,52 +530,6 @@ Output in ra từ kernel (block 0, lane 0):
 ### Bài học / Ghi chú cho khóa luận
 
 `doAddTraverse` (candidate edge search) chiếm gần 90% thời gian SPR. Đây là phần cần tối ưu trước tiên nếu muốn tăng tốc SPR. Phần `applyMove` (chỉ 0.05%) gần như free — bottleneck không phải là số lần apply move mà là số lần evaluate candidate.
-
----
-
-## Experiment Log — Phase 3 Hill-Climbing Benchmark (2026-05-11)
-
-**Dataset**: `data_debug/tree1.phy` (N=295 taxa, 1140 sites)
-**Settings**: `-seed 1 -numpars 100` (K=99 trees), Phase 2 `sprDist=6`
-**GPU**: A100-SXM4-80GB
-
-### Baseline
-
-| Config | best | worst | ms/tree | Total |
-|--------|------|-------|---------|-------|
-| Phase 2 only (sprDist=6, no Phase 3) | 6665 | — | 79 ms | 7.9s |
-
-### Phase 3 experiments (`-gpu_hc_iter` × `-gpu_hc_spr_dist`)
-
-| gpu_hc_iter | gpu_hc_spr_dist | best | worst | ms/tree | Total | moves |
-|-------------|-----------------|------|-------|---------|-------|-------|
-| 10 | 4 | 6662 | 6684 | 881 ms | 90s | 384 |
-| 10 | 6 | 6662 | 6685 | 1426 ms | 145s | 356 |
-| 20 | 4 | 6662 | 6684 | 1385 ms | 140s | 704 |
-| 20 | 6 | 6662 | 6683 | 2144 ms | 215s | 687 |
-| 50 | 4 | 6662 | 6680 | 2370 ms | 238s | 1590 |
-| **50** | **6** | **6662** | **6666** | **3282 ms** | **330s** | **1654** |
-| 100 | 3 | 6662 | 6681 | 1254 ms | 124s | 2827 |
-
-CPU reference (1 tree, serial): best ≈ 6668
-
-### Quan sát
-
-1. **`best` hội tụ sớm**: mọi cấu hình đều cho `best=6662`, từ 10 đến 100 iterations.
-   Phase 3 cải thiện 3 điểm so với Phase 2 (6665→6662), nhưng tăng thêm iter không cải thiện `best`.
-
-2. **`worst` giảm dần theo iter và sprDist**: tăng iter từ 10→50 và sprDist từ 4→6
-   cải thiện worst-case đáng kể (6685 → 6666). Với `iter=50, spr=6`, worst=6666 gần bằng best=6662
-   → phân phối chất lượng cây rất đồng đều.
-
-3. **Trade-off thời gian**: sprDist=6 tốn ~50-60% thêm thời gian so với sprDist=4 cùng iter.
-   Iter tỉ lệ tuyến tính với thời gian.
-
-4. **Khuyến nghị**: `iter=10, spr=4` (880 ms/tree) nếu ưu tiên tốc độ;
-   `iter=50, spr=6` (3282 ms/tree) nếu muốn worst-case tốt nhất.
-   `best` không thay đổi theo cấu hình nào trong số này.
-
-5. **So với CPU**: GPU K=99 trees best=6662 tốt hơn CPU single-tree best≈6668 (seed=1).
 
 ---
 
@@ -965,146 +643,6 @@ else     { mp = createTiAndEvaluateParsimony(...); }
 
 ---
 
-## Bug #9 — `bestParsimony` báo score tốt hơn `Current best score` do topology drift
-
-**Ngày**: 2026-05-12
-**Task**: Benchmark 115 dataset → so sánh CPU/GPU → phát hiện discrepancy
-**File liên quan**: `gpu/src/pars_build.cu`, `gpu/src/gpu_init_trees.cu`, `gpu/include/pars_tree.cuh`
-
-### Triệu chứng
-
-Trong 14/115 dataset benchmark, log GPU in ra:
-```
-[GPU]   [6b] Post-Hillclimbing parsimony: best=2938  worst=3007
-Current best score: 2941 / CPU time: 5
-```
-`Post-Hillclimbing best` (2938) nhỏ hơn (tốt hơn) `Current best score` (2941). Delta: −1 đến −46 units.
-Hướng lệch luôn nhất quán: post-HC luôn tốt hơn hoặc bằng final score, không bao giờ ngược lại.
-
-### Root cause — Topology Drift
-
-Hai luồng dữ liệu hoàn toàn tách biệt:
-
-**1. `topo->bestParsimony` — historical minimum** (`pars_build.cu:899-901`):
-```cpp
-// Cuối mỗi Phase 3 iteration:
-if (lane == 0 && sh.randomMP < topo->bestParsimony)
-    topo->bestParsimony = sh.randomMP;  // lưu score tốt nhất từ trước đến nay
-```
-
-**2. `downloadTopology` — tải end-state** (`gpu_init_trees.cu:161`):
-```cpp
-downloadTopology(mem, i, &h_topo, stream);  // tải back_vf[] cuối iteration cuối cùng
-```
-
-**3. Bước `[6b]`** đọc `h_topo_tmp.bestParsimony` cho tất cả K trees → in "Post-Hillclimbing best=2938"
-(đây là minimum thực sự tìm được trong toàn bộ Phase 3).
-
-**4. CPU re-score end-state topology từ đầu** (`phyloanalysis.cpp:1295-1297`):
-```cpp
-iqtree.initializeAllPartialPars();
-iqtree.clearAllPartialLH();
-iqtree.curScore = -iqtree.computeParsimony();  // → 2941 (topology end-state)
-```
-
-**Tại sao topology bị drift?** Phase 3 loop có cấu trúc chẵn/lẻ:
-- **Iter chẵn**: NNI perturbation ngẫu nhiên → SPR hill-climb. NNI phá vỡ topology hiện tại trước.
-- **Iter lẻ**: Ratchet (trọng số SPR) → SPR thông thường.
-
-Topology đạt `bestParsimony` ở iteration k bị ghi đè khi iteration k+1 bắt đầu (NNI perturbation
-hoặc ratchet moves không lưu lại topology cũ). Sau nhiều iterations, cây cuối cùng (end-state)
-có thể khác — và tệ hơn — topology đã đạt `bestParsimony`.
-
-Đây là **quality loss thực sự**: GPU tìm được cây tốt nhưng không lưu lại, cuối cùng trả về
-cây kém hơn cho CPU.
-
-### Phân tích để tìm bug: dùng Agent debugger
-
-Bug được phát hiện qua pipeline:
-1. Chạy benchmark 115 dataset → so sánh `post_hc_best` vs `final_score` trong Python
-2. Phát hiện 14/115 dataset có discrepancy (luôn theo chiều post-HC tốt hơn)
-3. Spawn Agent debugger tìm code path: trace từ `bestParsimony` print → download → CPU re-score
-4. Agent xác định 3 write site của `bestParsimony` và vị trí download topology
-
-### Fix: Lưu `best_back_vf[]` mỗi khi `bestParsimony` cập nhật
-
-**Nguyên tắc**: khi tìm được score tốt hơn, lưu snapshot của `back_vf[]` (topology tại thời điểm đó).
-Khi download, dùng snapshot này thay vì end-state.
-
-**4 thay đổi trong 4 file:**
-
-**1. `pars_tree.cuh`** — thêm field vào `GpuTopology`:
-```cpp
-int back_vf[kMaxVFaces];       // topology hiện tại (end-state sau mỗi iteration)
-int best_back_vf[kMaxVFaces];  // snapshot back_vf[] khi bestParsimony được cập nhật
-```
-Memory overhead: +12.8 KB/tree. Với K=199: +2.5 MB GPU memory.
-
-**2. `pars_tree.cu`** — `cpuToGpuTopology`: khởi tạo `best_back_vf = back_vf`.
-
-**3. `pars_build.cu`** — copy `back_vf → best_back_vf` tại 3 điểm update `bestParsimony`:
-```cpp
-// End of Phase 1 (build):
-topo->bestParsimony = sh.bestParsimony;
-for (int vf = 0; vf < topo->num_vfaces; vf++)
-    topo->best_back_vf[vf] = topo->back_vf[vf];
-
-// End of Phase 2 (initial SPR):
-topo->bestParsimony = sh.randomMP;
-for (int vf = 0; vf < topo->num_vfaces; vf++)
-    topo->best_back_vf[vf] = topo->back_vf[vf];
-
-// Phase 3 per-iteration:
-if (lane == 0 && sh.randomMP < topo->bestParsimony) {
-    topo->bestParsimony = sh.randomMP;
-    for (int vf = 0; vf < topo->num_vfaces; vf++)
-        topo->best_back_vf[vf] = topo->back_vf[vf];
-}
-```
-
-**4. `gpu_init_trees.cu`** — bước [7] sau download, trước `gpuTopoToCpu`:
-```cpp
-// Restore best-seen topology (not end-state after last iteration)
-for (int vf = 0; vf < h_topo.num_vfaces; vf++)
-    h_topo.back_vf[vf] = h_topo.best_back_vf[vf];
-```
-Không cần thay đổi `gpuTopoToCpu` — chỉ swap `back_vf` ← `best_back_vf` trên CPU trước khi convert.
-
-### Kết quả
-
-**Test nhanh 5 dataset có discrepancy lớn nhất:**
-
-| Dataset | Post-HC best | Final (trước fix) | Final (sau fix) |
-|---------|-------------|-----------------|----------------|
-| dna_M8692_395_3583 | 2938 | 2941 (+3) | **2938** ✓ |
-| dna_M11113_344_9778 | 113713 | 113718 (+5) | **113713** ✓ |
-| dna_M3198_216_2578 | 35866 | 35870 (+4) | **35866** ✓ |
-| dna_M10933_229_2696 | 21854 | 21857 (+3) | **21854** ✓ |
-| dna_M7024_767_5814 | 95109 | 95155 (+46) | **95109** ✓ |
-
-Post-HC best = Final score ở tất cả 5 dataset. Full benchmark 115 dataset đang chạy.
-
-### Bài học / Ghi chú cho khóa luận
-
-1. **Score ≠ Topology**: Lưu score tốt nhất là không đủ — phải lưu kèm topology tương ứng.
-   Đây là lỗi kiến trúc: thiết kế ban đầu coi `bestParsimony` là điểm thống kê, không phải
-   pointer tới trạng thái tốt nhất. Khi thêm Phase 3 với NNI perturbation (có thể làm cây tệ
-   tạm thời), sự tách biệt này trở thành bug.
-
-2. **Phát hiện qua benchmark cross-validation**: Bug không xuất hiện ở test nhỏ (1 dataset),
-   chỉ lộ ra khi chạy 115 dataset và so sánh hai metric `post_hc_best` vs `final_score` bằng
-   script Python. Bài học: tổng hợp kết quả nhiều dataset giúp phát hiện bugs systematic.
-
-3. **Trade-off của Option A vs B vs C**: Fix đúng nhất (A) là lưu topology — tốn thêm bộ nhớ
-   nhưng không tốn thêm thời gian đáng kể (copy `num_vfaces` ints ≈ 4.7 KB, rất nhanh).
-   Option C (sửa log) chỉ ẩn bug không fix. Option B (thêm 1 pass HC cuối) tốn thêm 1 iteration
-   thời gian (~10% overhead) và không đảm bảo recover đúng topology tốt nhất.
-
-4. **Subtlety của copy loop**: Copy chỉ cần `num_vfaces` (= 4N-3) elements, không phải `kMaxVFaces`
-   (= 4×800 = 3200). Với N=295: num_vfaces=1177 ints = 4.7 KB — rất nhỏ, overhead không đáng kể.
-
----
-
 ## Optimization #2 — Opt-M: Template specialization `newviewParsimony<STATES>` (2026-05-13)
 
 **Ngày**: 2026-05-13  
@@ -1212,103 +750,6 @@ Template hóa BuildShared theo NTAXA bucket (128/256/512/800) để array sizes 
 
 ---
 
-## Experiment Log — Phase 3 Effectiveness Analysis (2026-05-13)
-
-**Ngày**: 2026-05-13  
-**Dataset**: 10 datasets N=100–767  
-**Settings**: `-numpars 200 -sprdist 3 -gpu_stop 4 -seed 1`
-
-### Kết quả
-
-| Dataset | N | NNI+SPR (even) | Ratchet (odd) | Winner |
-|---------|---|---------------|--------------|--------|
-| prot N=100 | 100 | 24.7% | 13.6% | NNI+SPR |
-| prot N=137 | 137 | 30.6% | 23.0% | NNI+SPR |
-| prot N=169 | 169 | 0.0% | 0.0% | tie (converged) |
-| dna N=295 | 295 | 20.5% | 35.8% | Ratchet |
-| dna N=330 | 330 | 2.6% | 14.3% | Ratchet |
-| dna N=350 | 350 | 39.1% | 32.6% | NNI+SPR |
-| dna N=405 | 405 | 6.7% | 9.1% | Ratchet |
-| dna N=544 | 544 | 4.2% | 9.9% | Ratchet |
-| dna N=699 | 699 | 27.9% | 51.5% | Ratchet |
-| dna N=767 | 767 | 35.5% | 55.6% | Ratchet |
-| **Average** | | **19.2%** | **24.5%** | **Ratchet 6/10** |
-
-### Quan sát
-
-1. **Ratchet hiệu quả hơn tổng thể** (avg 24.5% vs 19.2%): Ratchet tạo "escape" khỏi local optima
-   tốt hơn NNI perturbation vì thay đổi objective function (weighted parsimony), không chỉ swap edges.
-
-2. **NNI+SPR hiệu quả hơn với protein nhỏ** (N≤137): Protein datasets có state space phức tạp hơn
-   (states=20), NNI perturbation phù hợp hơn vì ít phá vỡ cấu trúc tốt.
-
-3. **N=169: cả hai 0%** — cây hội tụ hoàn toàn sau Phase 2 (initial SPR); Phase 3 không tìm thêm
-   cải thiện. Đây là trường hợp `gpu_stop` hoạt động hiệu quả — dừng sớm không lãng phí.
-
-4. **Dataset lớn N≥699: Ratchet vượt trội rõ** (51–56% vs 28–36%): Landscape parsimony lớn có nhiều
-   local optima, Ratchet tạo perturbation mạnh hơn (thay đổi trọng số sites) giúp thoát sâu hơn.
-
-### Bài học / Ghi chú cho khóa luận
-
-**Ratchet trong GPU context**: Ratchet gốc (Nixon, 1999) dùng cho maximum parsimony: tăng gấp đôi
-trọng số một subset ngẫu nhiên các sites, chạy SPR, rồi trở về trọng số đều. GPU implementation
-thực hiện cả 2 SPR calls (weighted + unweighted) trong 1 odd iteration. Kết quả: Ratchet tạo
-perturbation 2-phase mạnh hơn NNI 1-phase, đặc biệt hiệu quả với dataset lớn.
-
-**Implication cho thiết kế**: Nếu tài nguyên hạn chế, ưu tiên Ratchet (odd iters) hơn NNI+SPR
-(even iters) — đặc biệt với dataset DNA lớn. Với protein nhỏ, NNI+SPR cần thiết hơn.
-
----
-
-## Kết quả thực nghiệm — GPU vs CPU Full Benchmark (2026-05-13)
-
-**Ngày**: 2026-05-13  
-**Dataset**: 115 datasets, N=50–767 (50 protein, 65 DNA)  
-**Config GPU**: numpars=400, sprdist=3, gpu_stop=4, seed=1  
-**Config CPU**: numpars=100 (serial, gốc)  
-**GPU**: A100-SXM4-80GB; **CPU**: Intel Xeon (single core, serial)
-
-### Kết quả tổng hợp
-
-| Metric | Value |
-|--------|-------|
-| Average speedup | **2.28×** |
-| N ≤ 60 | 0.68–1.3× (overhead > compute) |
-| N = 200–400 | 1.4–3.7× |
-| N ≥ 400 | **3.5–6.7×** |
-| GPU chất lượng tốt hơn | 33/115 (29%) |
-| Chất lượng bằng nhau | 57/115 (50%) |
-| CPU tốt hơn | 25/115 (22%) |
-| Avg Δparsimony (GPU−CPU) | **−0.13** |
-
-Full results: [benchmark/gpu_vs_cpu_np400_115datasets.md](../benchmark/gpu_vs_cpu_np400_115datasets.md)
-
-### Phân tích
-
-**Tại sao N nhỏ (≤60) GPU chậm hơn?**  
-Overhead cố định (cudaMalloc, upload parsVect, kernel launch) chiếm tỉ lệ lớn khi kernel time ngắn.
-Với N=55, kernel chạy chỉ 1–2 giây — overhead ~1-2 giây → tổng thời gian gần gấp đôi kernel.
-
-**Tại sao GPU tốt hơn chất lượng (29% cases)?**  
-GPU chạy 399 trees độc lập với seeds khác nhau → khám phá nhiều vùng của landscape parsimony.
-CPU serial chỉ chạy 99 trees → ít diverse starting points hơn.
-
-**Avg Δ = −0.13**: GPU nhỉnh hơn CPU về parsimony score trung bình, xác nhận GPU tìm được cây
-tốt hơn hoặc tương đương trong 79% trường hợp.
-
-### Bài học / Ghi chú cho khóa luận
-
-1. **GPU phù hợp nhất với N≥200**: Breakeven point khoảng N=80–100 tùy dataset.
-   Với N<80, CPU serial vẫn cạnh tranh hoặc nhanh hơn.
-
-2. **Chất lượng GPU không kém hơn CPU**: Dù GPU dùng khác thuật toán (NNI+Ratchet thay vì pure SPR),
-   kết quả parsimony tương đương hoặc tốt hơn trong đa số trường hợp.
-
-3. **Speedup lớn nhất ở dataset "nặng" về width**: prot_M10273 (N=169, 11009 sites) đạt 6.69× —
-   vì parsVect lớn làm CPU memory-bound hơn, trong khi GPU parallel Fitch computation mạnh hơn.
-
----
-
 ## Optimization #4 — Phase 3 Micro-optimizations (2026-05-14)
 
 **Ngày**: 2026-05-14  
@@ -1386,86 +827,6 @@ cách này chậm hơn 11.9%. Skip-first approach: chỉ tiết kiệm 1 call/it
 2. **Redundant computation pattern**: `gpuNodeRectifierPars` là O(N) DFS — chi phí đáng kể. Khi một function được gọi với invariant "caller đã maintain property này", skip có thể tiết kiệm đáng kể.
 
 3. **Trade-off giữa "rectify after each move" vs "skip first iteration"**: Cả hai đều đúng về logic, nhưng performance khác nhau. After-each-move tốt khi ít moves/iteration; skip-first tốt khi nhiều moves/iteration (amortizes better). Cần benchmark để chọn.
-
----
-
-## Optimization #5 — Restore best_back_vf trước mỗi Phase 3 perturbation (2026-05-14)
-
-**Ngày**: 2026-05-14  
-**Task**: Cải tiến Phase 3 hill-climbing — loại bỏ "topology drift"  
-**File liên quan**: `gpu/src/pars_build.cu` — `runPhase3`
-
-### Phát hiện vấn đề
-
-Phân tích `runPhase3` cho thấy mỗi iteration bắt đầu từ **end-state** của iteration trước, không phải từ `best_back_vf` (cây tốt nhất đã tìm được):
-
-```
-topo->back_vf[]      = working topology (bị modify mỗi iter)
-topo->best_back_vf[] = snapshot khi bestParsimony được update
-```
-
-Flow cũ:
-```
-Iter 0 (even): NNI(T_init) → SPR → T0;  if T0<best: best=T0
-Iter 1 (odd):  Ratchet(T0)  → SPR → T1;  if T1<best: best=T1
-Iter 2 (even): NNI(T1)      → SPR → T2   ← T1 có thể tệ hơn T0!
-```
-
-Hậu quả: GPU "drift" xa vùng parsimony tốt sau nhiều iterations, làm SPR phải tốn thêm do-while để leo đồi trở lại từ điểm tệ.
-
-### Fix: Restore warp-parallel trước mỗi iteration
-
-Thêm warp-parallel copy `best_back_vf → back_vf` đầu mỗi even (NNI) VÀ odd (Ratchet) iteration:
-
-```cpp
-// Warp-parallel restore (32 lanes, tất cả tham gia):
-for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
-    topo->back_vf[vf] = topo->best_back_vf[vf];
-__syncwarp();
-// Sau đó: NNI / Ratchet weights
-// createTiAndEvaluateParsimony(full=true) đã có sẵn → sync lại parsVect tự động
-```
-
-**Tại sao parsVect không cần reset thêm**: `createTiAndEvaluateParsimony(full=true)` được gọi ngay sau mỗi perturbation (đã có sẵn trong code), `full=true` bỏ qua xpars flags và recompute toàn bộ cây.
-
-### Thực nghiệm 3 options
-
-| Option | Restore khi nào | Avg Δms/tree (10 datasets) |
-|--------|----------------|--------------------------|
-| Baseline | Không restore | 0% |
-| A | Chỉ trước even (NNI) | **−24.5%** |
-| B+C | Trước cả even + odd | **−38.0%** |
-
-Option C (restore cả hai) thắng rõ ràng — improvement rate Ratchet tăng từ 35% → 52% (N=295) và 52% → 70% (N=699).
-
-### Giải thích speedup
-
-1. **SPR do-while ít iterations hơn**: Restore về best → SPR bắt đầu từ điểm gần-optimal → hội tụ nhanh hơn.
-2. **Ratchet improvement rate cao hơn**: Ratchet từ best tree tìm được cải thiện thực sự thay vì từ end-state tệ của NNI.
-
-### Kết quả benchmark đầy đủ (115 datasets, numpars=400, sprdist=3, gpu_stop=4)
-
-So sánh gpu_final_800 (Option C) vs gpu_np400 (baseline):
-
-| Metric | gpu_np400 | gpu_final_800 | Cải thiện |
-|--------|-----------|---------------|-----------|
-| Avg speedup vs CPU | 2.28× | **3.66×** | +60% |
-| Max speedup | 6.69× | **12.88×** | |
-| GPU better quality | 33/115 (29%) | **40/115 (35%)** | |
-| GPU worse quality | 25/115 (22%) | **20/115 (17%)** | |
-| Avg Δparsimony (GPU−CPU) | −0.13 | **−0.22** | |
-
-Full results: `output/gpu_final_800/`
-
-### Bài học / Ghi chú cho khóa luận
-
-1. **State machine analysis quan trọng**: Phân tích luồng state `back_vf` (working) vs `best_back_vf` (saved) cho thấy "drift" problem — không phải bug về correctness mà là sub-optimal exploration strategy.
-
-2. **Restore từ best = independent exploration**: Mỗi iteration trở thành một independent perturbation + hill-climb từ best known, thay vì sequential chain. Tương tự concept "iterated local search" trong combinatorial optimization.
-
-3. **Tại sao nhanh hơn CHỨ KHÔNG phải chậm hơn**: Restore thêm O(N) work mỗi iteration, nhưng tiết kiệm O(N×k) SPR do-while work (k = số do-while extra cần thiết để "leo đồi" từ tệ về tốt). Với k>>1, net speedup lớn.
-
-4. **Quality cải thiện cùng với speed**: Đây là dấu hiệu của exploitation-exploration balance tốt hơn. Khi mỗi perturbation bắt đầu từ best, exploration có ý nghĩa hơn → tìm được cây tốt hơn trong ít thời gian hơn.
 
 ---
 
@@ -1823,67 +1184,6 @@ Caller post-loop trong `phyloanalysis.cpp` bị xóa hoàn toàn.
 
 ---
 
-## Experiment — Reseed bad GPU slots from threshold pool (2026-05-17)
-
-**Ngày**: 2026-05-17  
-**Task**: Cải thiện chất lượng K2 bằng cách tái sử dụng topology tốt cho các bad GPU slots  
-**File**: `gpu/src/gpu_init_trees.cu` — `hybrid_cb` lambda (Step 3.5)
-
-### Vấn đề
-
-Trong `hybrid_cb` (sau K1), Step 3 upload CPU threshold trees vào các bad GPU slots (score > threshold). Thường số CPU trees < số bad slots → nhiều bad slots không được điền, tiếp tục vào K2 với topology kém từ K1 SPR — lãng phí compute budget.
-
-### Giải pháp — Step 3.5
-
-Sau Step 3, với các bad slots còn lại chưa được điền:
-1. **Thu thập good GPU topos**: Download các slots có `gpu_scores[k] <= threshold`, restore `best_back_vf → back_vf` (topology tốt nhất của K1 Phase 3).
-2. **Build pool**: Kết hợp good GPU topos + good CPU trees (score ≤ threshold) vào một pool.
-3. **Reseed**: Mỗi remaining bad slot nhận một topology ngẫu nhiên từ pool, với `savedSeed` khác nhau (`params.ran_seed + slot * 99991L`) để diversity, và `needs_recompute=1` để K2 recompute parsVect từ actual topology.
-
-```cpp
-GpuTopology fill_topo = *pool[random_int((int)pool.size())];
-fill_topo.savedSeed = params.ran_seed + (long)slot * 99991L;
-fill_topo.needs_recompute = 1;
-uploadTopology(cb_mem, slot, &fill_topo, cb_stream);
-```
-
-### Cơ chế K2 compatibility
-
-- `buildPhase3Kernel` filter: `if (topo->postSprParsimony > phase3Threshold) return;`
-  → Donor's `postSprParsimony ≤ threshold` → reseeded slots được vào K2.
-- `needs_recompute=1` trigger (lines 1107–1133): Recompute parsVect từ actual topology (`back_vf`), override `sh.randomMP`, `topo->bestParsimony`, `topo->postSprParsimony` → Phase 3 bắt đầu từ trạng thái đúng với seed mới.
-
-### Kết quả benchmark
-
-**N≈200 (37 datasets, numpars=200, sprdist=4, gpu_stop=6):**
-
-| Metric | Value |
-|--------|-------|
-| Better (↑) | 14/37 |
-| Same (=) | 23/37 |
-| Worse (↓) | **0/37** |
-| Avg Δscore | −1.2 (reseed tốt hơn trung bình) |
-| Avg time | 8.2s → 9.4s (+14.5%) |
-
-**N=767 (dna_M7024, numpars=400):**
-- Score cải thiện: 95079 vs baseline 95088 (−9)
-- K2 time tăng ~2× (143s vs 66.5s) — tất cả 400 slots start từ good topology → chạy nhiều Phase 3 iterations hơn
-
-### Trade-offs
-
-- ✅ Quality không bao giờ tệ hơn (0 regressions trên 37 datasets N≈200)
-- ✅ 38% datasets cải thiện score
-- ⚠️ Time overhead: +14.5% (N≈200), +100% (N=767) — do K2 có nhiều improving iterations hơn
-- ⚠️ Overhead tăng theo N: slots lớn hơn → K2 iterations dài hơn khi start từ good topology
-
-### Bài học / Ghi chú cho khóa luận
-
-1. **Slot diversity vs quality**: Mỗi slot nhận cùng donor topology nhưng seed khác nhau → trajectories diverge trong K2, tạo diversity mà không cần extra memory.
-2. **`needs_recompute` flag**: Cho phép upload topology shell (chỉ `back_vf`) mà không cần upload toàn bộ parsVect (2.44 MB/slot). GPU recompute trong kernel → tiết kiệm bandwidth đáng kể.
-3. **Overhead asymmetry**: Reseed có giá trị nhất khi K2 budget lớn tương đối so với K1. Với N nhỏ (≈200), +14.5% là chấp nhận được. Với N lớn (≥700), cần cân nhắc giới hạn `gpu_stop` để kiểm soát overhead.
-
----
-
 ## Experiment — K' < K: Build fewer trees in K1 (Opt-LessK1, 2026-05-17)
 
 **Ngày**: 2026-05-17  
@@ -2087,4 +1387,154 @@ Không có regression. `gpu_nni_strength=0.5` hoạt động đúng (trước: c
 3. **On-the-fly lookup vs lưu pair**: Trong thuật toán online (có update giữa chừng), lưu thêm 1 field và tra cứu dynamic thường an toàn hơn lưu cặp pre-computed. Trade-off: 1 global memory read thêm per iteration, nhưng correctness được đảm bảo.
 
 4. **CPU `doRandomNNIs` pattern**: CPU reset `usedNodes` map khi conflict → apply anyway (iqtree.cpp:1091). GPU replicate đúng pattern này bằng bitset clear. Kết quả: đúng `numNNI` moves, không bị thiếu ở strength cao.
+
+---
+
+## Bug Fix — Sankoff GPU: Pattern Set Mismatch + PLL Encoding (2026-05-20)
+
+**Ngày**: 2026-05-20
+**Task**: Sửa Sankoff GPU để cho kết quả đúng (BEST SCORE = 6662 = CPU)
+**File liên quan**: `gpu/src/gpu_init_trees.cu` (`uploadSankoffTipParsVect`)
+
+### Triệu chứng
+
+GPU Sankoff (K=5000, sprdist=6): BEST SCORE **6662** = CPU ✅ nhưng cần K=5000 mới hội tụ.
+Trước đó với K=200: BEST SCORE 6664 — không hội tụ dù nhiều cây.
+
+### Root cause (2 lỗi)
+
+**Lỗi 1 — Width mismatch**: `uploadSankoffTipParsVect` dùng `width = iqtree.aln->size() = 1400`
+(tất cả unique patterns) nhưng CPU `compressSankoffDNA` chỉ xử lý `parsimonyLength = 1072`
+*informative* patterns qua `isInformative()`. Gây score sai vì GPU dùng nhiều pattern hơn CPU.
+
+**Lỗi 2 — Encoding**: Đọc từ `iqtree.aln->at(ptn)` dùng IQTree encoding, phải đọc từ
+`tr->yVector[tipNum][i]` dùng PLL bitmask encoding (A=bit0, C=bit1, G=bit2, T=bit3).
+
+**Lỗi phụ**: `extern Params *globalParam` khai báo bên trong `namespace mpbootgpu` → linker error.
+
+### Fix
+
+Rewrite `uploadSankoffTipParsVect` trong `gpu/src/gpu_init_trees.cu`:
+- `width = parsimonyLength` (không phải `iqtree.aln->size()`)
+- Đọc từ `tr->yVector[tipNum][i]`, dùng PLL bitmask
+- Replicate `isInformative()` logic của CPU: skip pattern nếu ≤ 1 distinct bitmask < undetermined
+- Di chuyển `extern Params *globalParam` lên trước `namespace mpbootgpu`
+
+### Kết quả
+
+K=5000, sprdist=6: BEST SCORE **6662 = CPU** ✅. Fitch không thay đổi ✅.
+
+### Bài học / Ghi chú cho khóa luận
+
+Sankoff CPU dùng `isInformative()` của PLL với bitmask encoding riêng — khác hoàn toàn với
+IQTree alignment API. GPU phải replicate logic PLL, không phải IQTree. Khi upload tip data cho
+GPU, luôn đọc từ cùng nguồn mà CPU parsimony code đọc (`tr->yVector`, `parsimonyLength`).
+
+---
+
+## Optimization — Ratchet cho GPU Sankoff (2026-05-20)
+
+**Ngày**: 2026-05-20
+**Task**: Enable ratchet perturbation cho Sankoff mode (trước đây tất cả Sankoff workers chạy NNI, không có ratchet)
+**File liên quan**: `gpu/include/pars_tree.cuh`, `gpu/src/pars_tree.cu`, `gpu/src/pars_build.cu`, `gpu/src/gpu_init_trees.cu`
+
+### Vấn đề
+
+`iter_is_nni = sh.use_sankoff || (blockIdx.x % 2 == 0)` — tất cả Sankoff workers làm NNI.
+Root cause: ratchet Fitch ghi `sw_k[b] = {1,2}` trực tiếp vào `d_siteWeights` rồi restore về `nullptr`.
+Với Sankoff: `d_siteWeights` lưu **pattern frequencies gốc** (non-uniform) → overwrite = xóa frequencies;
+restore về `nullptr` = uniform weight = sai hoàn toàn.
+
+### Fix: thêm `d_ratchetScratch[K][width]`
+
+- `d_ratchetScratch`: buffer scratch riêng cho Sankoff ratchet, không đụng `d_siteWeights`
+- Khi ratchet: `ratchet_k[b] = sw_k[b] * {1 hoặc 2}` — frequencies gốc không bị đụng
+- Sau ratchet: `sh.site_weights = sw_k` (restore về frequencies gốc)
+- Bỏ `sh.use_sankoff ||` trong `iter_is_nni` → Sankoff workers giờ chạy ratchet như Fitch
+
+4 file thay đổi: `pars_tree.cuh` (+1 field), `pars_tree.cu` (alloc/free), `pars_build.cu`
+(kernel sig, runPhase3 sig, iter_is_nni, ratchet branch), `gpu_init_trees.cu` (K2 launch param).
+
+### Kết quả
+
+- **K=200 đạt 6662 = CPU** ✅ (trước cần K=5000)
+- ms/tree tăng ~2× (168→346 ms/tree) — expected: ratchet chạy thêm 1 re-evaluate + 1 SPR pass
+
+### Bài học / Ghi chú cho khóa luận
+
+Ratchet là perturbation quan trọng: nó chọn ngẫu nhiên 50% patterns và tăng trọng số gấp đôi,
+sau đó SPR từ đó. CPU làm tương tự (`informativePtnWgt` rebuild từ perturbed alignment).
+GPU phải tách storage gốc (frequencies) khỏi scratch ratchet — dùng buffer riêng thay vì ghi đè.
+
+---
+
+## Optimization — Opt 1: Đổi parsVect layout từ `[ptn][state]` sang `[state][ptn]` (2026-05-20)
+
+**Ngày**: 2026-05-20
+**Task**: Cải thiện memory coalescing trong Fitch và Sankoff kernels
+**File liên quan**: `gpu/include/pars_tree.cuh`, `gpu/src/pars_tree.cu`, `gpu/src/gpu_init_trees.cu`
+
+### Vấn đề
+
+Layout cũ `parsVect[node][ptn][state]` (access: `base[b * STATES + s]`):
+- Lane 0: `base + 0*STATES + s`, Lane 1: `base + 1*STATES + s` → stride = STATES words giữa lanes
+- DNA (STATES=4): 32 lanes span 128 words = **4 cache lines** → 4× bandwidth waste
+
+### Fix: Layout mới `parsVect[node][state][ptn]` (access: `base[s * width + b]`)
+
+- Lane 0: `base + s*width + 0`, Lane 1: `base + s*width + 1` → stride = 1 word
+- 32 lanes fit vào **1 cache line** → perfectly coalesced
+
+3 file thay đổi:
+- `pars_tree.cuh`: 5 access sites (Fitch newview/eval + Sankoff newview/eval) đổi indexing
+- `pars_tree.cu`: `uploadTipParsVect` Fitch branch → memcpy (CPU và GPU layout giờ giống nhau `[node][state][ptn]`); xóa dead Sankoff else block
+- `gpu_init_trees.cu`: `uploadSankoffTipParsVect` h_buf indexing từ `[ptn][state]` → `[state][ptn]`
+
+### Kết quả
+
+| Mode | ms/tree trước | ms/tree sau | Speedup | Score |
+|------|--------------|-------------|---------|-------|
+| Fitch (K=400) | ~16 ms | ~6.4 ms | **2.5×** | 6662 ✅ |
+| Sankoff (K=200) | 346 ms | **167 ms** | **2.07×** | 6662 ✅ |
+
+### Bài học / Ghi chú cho khóa luận
+
+**Memory coalescing** là một trong những tối ưu quan trọng nhất trong CUDA:
+- Warp (32 lanes) đọc cùng lúc → nếu địa chỉ liên tiếp thì 1 cache line đủ, ngược lại cần nhiều cache line
+- Layout `[state][ptn]` (SoA — Structure of Arrays) coalesced với warp iterating over patterns
+- Layout `[ptn][state]` (AoS — Array of Structures) KHÔNG coalesced với warp iterating over patterns
+- Quy tắc chung: dimension được warp iterate over phải là dimension innermost trong layout
+
+Sau opt này, Fitch đạt ~6.4 ms/tree (speedup 2.5× so với 16 ms/tree). Đây là mức gần tối ưu
+cho DNA width=1072 trên A100 — bottleneck chuyển sang shared memory limit (13 blocks/SM).
+
+---
+
+## Optimization — Opt 3: Xóa dead `min_site` + score accumulation trong Sankoff newview (2026-05-20)
+
+**Ngày**: 2026-05-20
+**Task**: Loại bỏ tính toán không cần thiết trong Sankoff newview
+**File liên quan**: `gpu/include/pars_tree.cuh` (`newviewParsimony` Sankoff branch)
+
+### Vấn đề
+
+Trong Sankoff newview:
+```cuda
+unsigned int min_site = kSankoffInf;
+for (ii): min_site = min(min_site, cost_ii);   // dead
+score += (sw ? sw[b] : 1u) * min_site;         // dead — score_tree[p_num] never read in Sankoff eval
+```
+
+`score_tree[p_num]` được set nhưng Sankoff evaluate KHÔNG dùng nó — Sankoff evaluate tính
+trực tiếp từ parsVect values (`min_ij(q[i] + cost[i][j] + r[j])`).
+
+### Fix
+
+Xóa `min_site` tracking và `score +=` khỏi Sankoff newview branch.
+Thực hiện cùng Opt 1 rewrite (không cần commit riêng).
+
+### Kết quả
+
+Giải phóng 2 instructions/pattern/newview. Khó đo riêng (hấp thụ vào Opt 1), nhưng giúp
+code rõ ràng hơn và không có dead computation.
 

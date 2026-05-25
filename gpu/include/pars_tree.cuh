@@ -67,12 +67,11 @@ struct GpuTopology
 // ─── Parsimony memory for K trees ─────────────────────────────────────────────
 // parsVect GPU layout: [treeId * nodesPerTree * width * states
 //                       + nodeNumber * width * states
-//                       + block * states
-//                       + state]
-// i.e. [tree][node][block][state]  — AoS at block level, coalesced per-thread
+//                       + state * width
+//                       + block]
+// i.e. [tree][node][state][block]  — SoA at state level, perfectly coalesced
 //
-// CPU layout:  [node][state][block]
-// → reorder on upload (reorderParsVectForGpu)
+// CPU layout (Fitch): [node][state][block]  — same → direct memcpy on upload
 struct GpuParsimonyMem
 {
     parsimonyNumber* d_parsVect;  // [K][2N+1][width][states]
@@ -110,6 +109,8 @@ struct GpuParsimonyMem
     size_t parsVectPerTree;     // = nodesPerTree * width * states  (elements)
     size_t parsScorePerTree;    // = nodesPerTree                    (elements)
     size_t siteWeightsPerTree;  // = width (elements). Fitch: ratchet weights; Sankoff: pattern frequencies
+
+    size_t total_gpu_bytes;     // total GPU memory allocated (sum of all cudaMalloc calls)
 };
 
 // ─── Shared memory per block ──────────────────────────────────────────────────
@@ -354,8 +355,8 @@ __device__ __forceinline__ unsigned int newviewParsimony(
                 #pragma unroll
                 for (int s = 0; s < STATES; ++s)
                 {
-                    parsimonyNumber lv = q_base[b * STATES + s];
-                    parsimonyNumber rv = r_base[b * STATES + s];
+                    parsimonyNumber lv = q_base[(size_t)s * width + b];
+                    parsimonyNumber rv = r_base[(size_t)s * width + b];
                     t_A[s] = lv & rv;
                     o_A[s] = lv | rv;
                     t_N |= t_A[s];
@@ -364,15 +365,14 @@ __device__ __forceinline__ unsigned int newviewParsimony(
 
                 #pragma unroll
                 for (int s = 0; s < STATES; ++s)
-                    p_base[b * STATES + s] = t_A[s] | (t_N & o_A[s]);
+                    p_base[(size_t)s * width + b] = t_A[s] | (t_N & o_A[s]);
 
                 score += sw ? sw[b] * __popc(t_N) : __popc(t_N);
             }
             else
             {
                 // Sankoff: each b = one pattern; elements are costs (not bitmasks)
-                // partial_p[b][i] = min_j(q[b][j] + cost[i][j]) + min_j(r[b][j] + cost[i][j])
-                unsigned int min_site = kSankoffInf;
+                // partial_p[s][b] = min_j(q[j][b] + cost[s][j]) + min_j(r[j][b] + cost[s][j])
                 #pragma unroll
                 for (int ii = 0; ii < STATES; ++ii)
                 {
@@ -381,16 +381,13 @@ __device__ __forceinline__ unsigned int newviewParsimony(
                     for (int jj = 0; jj < STATES; ++jj)
                     {
                         unsigned int c = cm[ii * STATES + jj];
-                        unsigned int lv = (unsigned int)q_base[b * STATES + jj];
-                        unsigned int rv = (unsigned int)r_base[b * STATES + jj];
+                        unsigned int lv = (unsigned int)q_base[(size_t)jj * width + b];
+                        unsigned int rv = (unsigned int)r_base[(size_t)jj * width + b];
                         best_left  = min(best_left,  lv + c);
                         best_right = min(best_right, rv + c);
                     }
-                    unsigned int cost_ii = best_left + best_right;
-                    p_base[b * STATES + ii] = (parsimonyNumber)cost_ii;
-                    min_site = min(min_site, cost_ii);
+                    p_base[(size_t)ii * width + b] = (parsimonyNumber)(best_left + best_right);
                 }
-                score += (sw ? sw[b] : 1u) * min_site;
             }
         }
         score = warpReduceU32(score);
@@ -427,8 +424,8 @@ __device__ __forceinline__ unsigned int newviewParsimony(
             #pragma unroll
             for (int s = 0; s < STATES; ++s)
             {
-                parsimonyNumber lv = q_base[b * STATES + s];
-                parsimonyNumber rv = r_base[b * STATES + s];
+                parsimonyNumber lv = q_base[(size_t)s * width + b];
+                parsimonyNumber rv = r_base[(size_t)s * width + b];
                 t_A[s] = lv & rv;
                 o_A[s] = lv | rv;
                 t_N |= t_A[s];
@@ -445,12 +442,12 @@ __device__ __forceinline__ unsigned int newviewParsimony(
             #pragma unroll
             for (int ii = 0; ii < STATES; ++ii)
             {
-                unsigned int qi = (unsigned int)q_base[b * STATES + ii];
+                unsigned int qi = (unsigned int)q_base[(size_t)ii * width + b];
                 #pragma unroll
                 for (int jj = 0; jj < STATES; ++jj)
                 {
                     unsigned int c = cm[ii * STATES + jj];
-                    unsigned int rj = (unsigned int)r_base[b * STATES + jj];
+                    unsigned int rj = (unsigned int)r_base[(size_t)jj * width + b];
                     min_edge = min(min_edge, qi + c + rj);
                 }
             }

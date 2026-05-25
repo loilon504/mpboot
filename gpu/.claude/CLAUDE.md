@@ -44,32 +44,24 @@ python3 ../output/summarize.py             # → output/results.xlsx
 |------|---------|---------|
 | `-use_gpu` | off | Bật GPU mode — gọi `gpuInitCandidateTrees()` thay vì CPU stepwise |
 | `-gpu_device N` | **0** | CUDA device ID sử dụng. `cudaSetDevice(N)` được gọi tại đầu `gpuInitCandidateTrees` |
-| `-numpars K` | 100 | Số cây parsimony ban đầu. GPU dùng **K−1 blocks** (tree index 1..K-1) |
+| `-numpars K` | 100 | Số cây parsimony ban đầu. GPU dùng **K blocks** (tree index 1..K) |
 | `-sprdist N` | 6¹ | SPR radius dùng cho Phase 2 (initial SPR) và Phase 3 (NNI+SPR) |
-| `-gpu_stop N` | **6** | Stopping criterion duy nhất: dừng Phase 3 sau N iterations liên tiếp không cải thiện. **0 = infinite loop (tránh dùng).** |
-| `-gpu_nni_strength X` | **0.05** | Strength NNI perturbation trong Phase 3: `numNNI = X×(N−3)`, min=1. Even iterations của Phase 3 |
-| `-gpu_top_pct X` | **0.1** | Opt-G2 two-kernel: chỉ top X% cây (postSprParsimony thấp nhất) mới chạy Phase 3. ≤0 = tắt (single-kernel) |
+| `-gpu_nni_strength X` | **0.5** | Strength NNI perturbation trong Phase 3: `numNNI = X×(N−3)`, min=1. Even iterations của Phase 3 |
 | `-gpu_pool_size N` | **20** | Số pool slots cho topology restart trong K2 |
 | `-gpu_worker N` | **400** | Số K2 blocks (workers); -1 = same as k1_count. Tăng → nhiều trees song song hơn |
 | `-gpu_worker_stop N` | **1** | Stop threshold multiplier cho `gpuHillClimbing`: `unsuccess_thresh = unsuccess_iteration + K×N`. Tăng → khoan dung hơn khi K lớn |
-| `-gpu_k1_ratio X` | **1.0** | K'=max(pool_size, K×X) trees built in K1. 0 hoặc ≥1 = build tất cả K. Production: **0.2** |
 | `-seed N` | random | RNG seed cho tất cả K trees |
-
-¹ Default thực tế phụ thuộc vào context; benchmark GPU thường dùng `-sprdist 3`.
 
 #### Derived / internal (không phải CLI)
 | Parameter | Source | Ý nghĩa |
 |-----------|--------|---------|
 | `numNNI` | `max(1, gpu_nni_strength×(N−3))` | Số NNI perturbation mỗi even iteration của Phase 3. `gpu_init_trees.cu` |
-| `K` | `numpars − 1` | Số CUDA blocks = số trees thực sự build. `gpu_init_trees.cu:34` |
 
 #### Recommended benchmark command
 ```bash
 ./mpboot-avx -s <dataset> -use_gpu -seed 1 \
     -numpars 1000 -sprdist 6 -gpu_stop 6 -gpu_pool_size 30 -gpu_k1_ratio 0.2
-# Defaults: gpu_device=0, gpu_stop=6, gpu_nni_strength=0.05, gpu_worker=400, gpu_worker_stop=1, gpu_top_pct=0.1
-# Sweet spot confirmed (115 datasets × 5 configs): k1_ratio=0.2 → 5.35× total speedup (vs 4.55× baseline)
-# -gpu_k1_ratio 1.0 (default) = K'=K (backward compat, same as not passing the flag)
+# Defaults: gpu_device=0, gpu_nni_strength=0.5, gpu_worker=400, gpu_worker_stop=1
 ```
 
 #### Thông tin kernel (in lúc chạy) — format mới 2026-05-15
@@ -324,19 +316,6 @@ createTiAndEvaluateParsimony(pars_tree, score_tree, topo, sh, p, N, /*full=*/tru
 **Joined kernel `buildParsimonyTreesKernel`** (`pars_build.cu`) — stepwise-addition + SPR in
 one `__global__` function sharing `BuildShared` shared memory (≈24.8 KB on A100).
 
-**Verified results** for N=295, sprDist=6, seed=1 (A100-SXM4-80GB):
-
-| K (trees) | Post-SPR best | ms/tree | Total kernel |
-|-----------|--------------|---------|--------------|
-| 100       | 6665         | ~79 ms  | ~7.9 s       |
-| 199       | 6671         | 44.9 ms | ~9.0 s       |
-| 999       | 6670         | 21.2 ms | 21.2 s       |
-| **9999**  | **6664**     | **16.3 ms** | **163 s** |
-| CPU ref (1 tree) | ~6668 | — | — |
-
-**K=9999: GPU best=6664 beats CPU reference 6668.** ✅
-ms/tree saturates at ~16 ms (A100 SM occupancy ceiling). Serial CPU equivalent: ~33 min → GPU speedup ~12×.
-
 ### ✅ testInsert optimization (2026-05-12)
 
 **Optimization**: `testInsert` pre-refresh — eliminate redundant Fitch step for remove node `p`.
@@ -428,18 +407,6 @@ best_back_vf[0]  offset=32.0 KB  COLD
 **Benchmark** (10 datasets, seed=1, numpars=200, gpu_hc_iter=10, sprdist=3):
 average **−8.7% ms/tree** across N=55..395. Range: −4% to −14%.
 Parsimony quality unchanged (2/10 differ by ±2 = stochasticity).
-
-### ✅ Early stopping Phase 3 — Opt-H (2026-05-12)
-
-**Insight**: Most trees converge well before `numSearchIter` (e.g. 10) iterations. Running extra iterations wastes compute when no improvement is found.
-
-**Fix**: Add `no_improve_count` counter in Phase 3 for-loop. At end of each iteration, if `sh.randomMP >= best_before` (no improvement vs start of this iteration) → increment; else reset. When `no_improve_count >= gpu_stop`: lane 0 sets `sh.bcast[0] = 1`, `__syncwarp()`, all lanes `break`.
-
-**Benchmark** (10 datasets, seed=1, numpars=200, gpu_hc_iter=10, sprdist=3):
-average **−32.4% ms/tree** across N=55..395. Range: −17% to −57%.
-Actual iterations used: 2–8 (vs 10 hardcoded). Quality: 9/10 same or better.
-
-**File**: `gpu/src/pars_build.cu` — Phase 3 for-loop (~10 lines added).
 
 ### ✅ Dead code removal — Refactor #3 (2026-05-17)
 
