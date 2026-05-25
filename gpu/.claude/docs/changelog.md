@@ -1538,3 +1538,251 @@ Thực hiện cùng Opt 1 rewrite (không cần commit riêng).
 Giải phóng 2 instructions/pattern/newview. Khó đo riêng (hấp thụ vào Opt 1), nhưng giúp
 code rõ ràng hơn và không có dead computation.
 
+---
+
+## Bug #12 — CUDA hardware call stack overflow với STATES=20 (protein Sankoff)
+
+**Ngày**: 2026-05-25
+**Dataset**: `prot_M2593_56_386.phy` (N=56 taxa, protein, STATES=20)
+**File liên quan**: `gpu/src/pars_build.cu` (lines 1253–1284, 1301–1342)
+
+### Triệu chứng
+
+Dataset `prot_M2593_56_386` crash với `CUDA error: an illegal memory access was encountered`
+tại `pars_build.cu:1310` (`cudaStreamSynchronize` sau `buildPhase3Kernel`).
+
+Điều kiện tái hiện: `pool_size=2`, `gpu_worker≥8`, `seed=1`.
+Không crash với: `pool_size=4`, hoặc khi thêm bất kỳ `printf` nào vào kernel (**Heisenbug**).
+
+Các giả thuyết ban đầu đều bị loại:
+- `gpuHookup` out-of-bounds: thêm bounds check `[0..3199]` → không bao giờ trigger
+- `d_ratchetScratch` null: xác nhận được alloc cho Sankoff mode
+- `BuildSharedT.ti[]` overflow: `tiSize ≤ 168` với N=56 (giới hạn 2400)
+- Race condition pool spinlock: per-slot lock đã đúng
+
+### Root cause: Hardware call stack overflow
+
+ptxas (compile với `--generate-line-info`) báo:
+
+```
+buildPhase3Kernel<STATES=20, NTAXA=800>:
+    1264 bytes cumulative stack size, 255 registers
+
+buildParsimonyTreesKernel<STATES=20, NTAXA=800>:
+    1544 bytes cumulative stack size, 255 registers
+
+buildPhase3Kernel<STATES=4, NTAXA=800>:
+    0 bytes cumulative stack size, 96 registers
+```
+
+CUDA default per-thread hardware stack = **1024 bytes**.
+`1264 > 1024` và `1544 > 1024` → **stack overflow** → corrupt bộ nhớ của thread lân cận
+→ illegal memory access.
+
+---
+
+### Câu hỏi 1: Cumulative stack size là gì?
+
+CUDA mỗi thread có hai vùng bộ nhớ riêng biệt thường bị nhầm lẫn:
+
+| Tên | ptxas báo | Vị trí vật lý | Kích thước giới hạn |
+|-----|-----------|--------------|-------------------|
+| **Register spill** | "stack frame" (bytes), "spill stores/loads" | DRAM (L1/L2 cache) | Chỉ giới hạn bởi VRAM |
+| **Hardware call stack** | "cumulative stack size" | SRAM riêng per-SM | `cudaLimitStackSize` (default 1024 bytes) |
+
+**Register spill** (`spill stores/loads`): Khi kernel dùng nhiều biến hơn số register có
+(255 với A100), compiler "spill" phần biến thừa vào DRAM. Đây là chậm nhưng không crash.
+
+**Hardware call stack** (`cumulative stack size`): Mỗi khi có lệnh gọi hàm thực sự
+(không phải inlined), CPU/GPU cần lưu địa chỉ trả về và local variables của caller lên stack.
+`cumulative stack size = tổng kích thước tất cả stack frames trên call chain sâu nhất`.
+
+Ví dụ: Nếu `kernelA` gọi `funcB` (non-inlined), `funcB` gọi `funcC` (non-inlined):
+```
+cumulative = frame(kernelA) + frame(funcB) + frame(funcC)
+```
+
+Overflow hardware call stack → ghi đè vùng nhớ của thread khác → illegal memory access.
+Đây là **memory corruption không deterministic**: tùy thuộc vào layout thread trong SM,
+crash có thể xảy ra ở nhiều vị trí khác nhau, và chỉ khi nhiều threads active cùng lúc.
+
+---
+
+### Câu hỏi 2: Những hàm nào làm tăng cumulative stack nhiều nhất?
+
+Nguyên nhân: `newviewParsimony<SharedT, STATES=20>` được đánh dấu `__forceinline__` nhưng
+ở 255 registers (hardware max), compiler **từ chối inline** → sinh actual function call.
+
+Khi hàm này không được inline, mỗi call đẩy một stack frame gồm:
+- Local arrays: `t_A[STATES]` = 20 × 4 = **80 bytes**, `o_A[STATES]` = **80 bytes**
+  (dùng trong cả Fitch branch và Sankoff branch của hàm)
+- Biến loop và temporaries: ~40–100 bytes
+- Return address và saved registers: ~100–200 bytes
+
+Tổng frame ≈ 300–460 bytes cho mỗi lần gọi `newviewParsimony<20>`.
+
+Call chain sâu nhất trong `buildPhase3Kernel`:
+```
+buildPhase3Kernel
+  └─ runPhase3
+       └─ gpuSPRHillClimb
+            └─ doAddTraverse
+                 └─ testInsert
+                      └─ createTiAndEvaluateParsimony
+                           └─ newviewParsimony<20>   ← frame lớn nhất
+```
+
+Nếu bất kỳ hàm nào trong chain không được inline → frame của nó cộng vào cumulative stack.
+Ratchet path (odd blocks) đặc biệt nguy hiểm hơn vì gọi `createTiAndEvaluateParsimony` với
+`full=true` → deep traversal → nhiều nesting hơn even path.
+
+---
+
+### Câu hỏi 3: STATES=4 và STATES=20 khác nhau chỗ nào?
+
+| Đặc điểm | STATES=4 (DNA) | STATES=20 (protein) |
+|-----------|---------------|---------------------|
+| `t_A[STATES]` size | 16 bytes | 80 bytes |
+| `o_A[STATES]` size | 16 bytes | 80 bytes |
+| Sankoff inner loop | 4×4=16 ops/pattern | 20×20=400 ops/pattern |
+| Registers used (ptxas) | **96** | **255** (hardware max) |
+| `#pragma unroll` effect | 4 iters → 4 instructions | 20 iters → 20 instructions mỗi loop |
+| `__forceinline__` honored? | **Có** — 96 regs đủ chỗ | **Không** — 255 regs = max, không còn register để inline |
+| Cumulative stack | **0 bytes** | **1264–1544 bytes** |
+
+Với STATES=4: compiler thành công inline toàn bộ call chain → cumulative stack = 0.
+Mọi local variable (`t_A[4]`, `o_A[4]`) được giữ trong 96 registers → không cần stack frame.
+
+Với STATES=20: compiler đạt giới hạn 255 registers. Để inline `newviewParsimony<20>`,
+cần thêm registers cho `t_A[20]` và `o_A[20]` — nhưng đã full. Compiler buộc phải sinh
+actual `CALL` instruction. `t_A[20]` và `o_A[20]` khi đó đi lên **hardware call stack**
+thay vì registers.
+
+---
+
+### Câu hỏi 4: Nếu bỏ `#pragma unroll` thì vẫn còn gặp lỗi không?
+
+**Có thể không gặp nữa** — nhưng không phải giải pháp đúng.
+
+Cơ chế: `#pragma unroll` khiến compiler mở rộng loop 20 lần (`STATES=20`), tạo ra
+20 instances của biến trung gian đồng thời live → register pressure tăng vọt.
+Không unroll → compiler quản lý loop counter và dùng lại 1 set biến → ít registers hơn
+→ có thể inline lại → stack = 0.
+
+Tuy nhiên đây là **cách sửa không an toàn** vì:
+1. Phụ thuộc vào quyết định nội bộ của nvcc — thay đổi theo compiler version
+2. Mất ILP (Instruction-Level Parallelism) — STATES=20 loop không unrolled chậm hơn đáng kể
+3. Không giải quyết nguyên nhân gốc: threshold register lúc nào cũng có thể bị chạm lại
+   khi code thêm local variables hoặc compiler thay đổi allocation
+
+Heisenbug (bỏ `printf` là crash, thêm `printf` là hết crash) chính xác là biểu hiện của
+cơ chế này: `printf` thay đổi register allocation của compiler → `newviewParsimony<20>`
+được inline hay không được inline → crash hay không crash. Đây là lý do tại sao bug này
+không thể debug bằng printf truyền thống.
+
+---
+
+### Fix
+
+Trước mỗi kernel launch có STATES=20, tăng per-thread hardware stack lên 4096 bytes;
+sau khi sync xong, restore về giá trị cũ:
+
+```cpp
+// pars_build.cu, trước K1 launch (~line 1253)
+size_t k1_prev_stack = 0;
+CUDA_CHECK(cudaDeviceGetLimit(&k1_prev_stack, cudaLimitStackSize));
+if (k1_prev_stack < 4096)
+    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 4096));
+
+buildParsimonyTreesKernel<S, NT><<<...>>>(...)
+
+CUDA_CHECK(cudaStreamSynchronize(stream));
+if (k1_prev_stack < 4096)
+    CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, k1_prev_stack));
+```
+
+Tương tự cho K2 launch (~line 1304). Giá trị 4096 = 3× default, đủ để cover cả
+1544 bytes (K1) và 1264 bytes (K2) với buffer an toàn.
+
+**Kết quả**: prot_M2593_56_386 chạy thành công, 5 rounds, best=1462, không crash.
+
+---
+
+### Câu hỏi 5: Tăng stack lên 4096 ảnh hưởng gì? GPU yếu hơn có bị không?
+
+**Cơ chế tính toán bộ nhớ**:
+
+`cudaDeviceSetLimit(cudaLimitStackSize, 4096)` yêu cầu CUDA runtime cấp phát
+`4096 bytes × max_concurrent_threads` cho hardware stack trên device.
+
+| Thông số | A100 SXM4 | RTX 2080 Ti | GTX 1060 |
+|----------|-----------|-------------|---------|
+| Max threads/SM | 2048 | 1024 | 1024 |
+| Số SM | 108 | 68 | 10 |
+| Max concurrent threads | ~221,184 | ~69,632 | ~10,240 |
+| Stack tăng thêm (4096−1024)×threads | **~665 MB** | **~210 MB** | **~31 MB** |
+
+**Lưu ý**: Con số 665 MB trên A100 là trường hợp tất cả threads active đồng thời — thực
+tế với K2=800 workers × 32 lanes = 25,600 threads, extra stack chỉ **~79 MB**.
+
+**Giải thích tại sao an toàn trên GPU yếu hơn**:
+
+1. **Chỉ ảnh hưởng khi STATES=20**: Hầu hết datasets là DNA (STATES=4) → không bao giờ
+   gọi đoạn code này. Protein datasets thường ít taxa (M2593 chỉ N=56) → K nhỏ →
+   ít threads → extra memory nhỏ.
+
+2. **Restore sau sync**: `cudaDeviceSetLimit` được restore ngay sau `cudaStreamSynchronize`.
+   Chỉ ảnh hưởng trong thời gian kernel STATES=20 chạy, không ảnh hưởng các kernel khác.
+
+3. **guard `if (prev_stack < 4096)`**: Nếu caller đã set stack lớn hơn (ví dụ 8192),
+   code không downgrade về 4096, cũng không tăng thêm không cần thiết.
+
+4. **Ngưỡng thực tế**: Protein dataset với STATES=20 thường nhỏ (N<200). Với K=800, N=56:
+   - Threads: 800 × 32 = 25,600
+   - Extra memory: 3072 bytes × 25,600 = **~79 MB** — hoàn toàn chấp nhận được
+   - Ngay cả GTX 1060 có 6 GB VRAM cũng không bị ảnh hưởng
+
+**Rủi ro thực sự**: nếu chạy STATES=20 với K cực lớn (K=10,000+) trên GPU cũ 2 GB VRAM,
+có thể OOM. Nhưng K=10,000 với STATES=20 đã cần `parsVect` lớn hơn VRAM trước khi stack
+là vấn đề → constraint này không bao giờ binding.
+
+---
+
+### Bài học / Ghi chú cho khóa luận
+
+**1. Hardware call stack vs register spill: hai khái niệm khác nhau trong CUDA**
+
+ptxas in ra cả hai nhưng chúng không liên quan đến nhau:
+- "spill stores/loads" lớn (34524 bytes spill stores) = dùng DRAM làm register overflow.
+  Chậm nhưng không crash.
+- "cumulative stack size" lớn (1544 bytes) = actual function calls dùng hardware stack.
+  Overflow 1024 byte limit → crash không deterministic.
+
+Nhiều developer nhầm hai khái niệm này, dẫn đến chẩn đoán sai khi thấy "spill" lớn mà
+nghĩ đó là nguyên nhân crash.
+
+**2. Heisenbug trong GPU là dấu hiệu của stack overflow hoặc memory corruption**
+
+Khi thêm `printf` làm crash biến mất, nguyên nhân gần như chắc chắn là:
+- Hardware call stack overflow (như bug này), hoặc
+- Shared memory race condition (thêm code thay đổi timing)
+
+`printf` thay đổi cách compiler allocate registers → quyết định inline/not-inline thay đổi →
+cumulative stack thay đổi. Đây là lý do tại sao tool debug thông thường không hiệu quả:
+bản thân hành động debug phá vỡ điều kiện gây bug.
+
+**3. `__forceinline__` là hint, không phải lệnh bắt buộc**
+
+Compiler CUDA có thể và sẽ vi phạm `__forceinline__` khi register pressure quá cao.
+Cách kiểm tra: xem ptxas output với `--ptxas-options=-v`. Nếu "cumulative stack size > 0",
+có ít nhất một hàm `__forceinline__` đã không được inline.
+
+Với template kernel sử dụng nhiều STATES: kiểm tra ptxas cho mỗi STATES instantiation
+riêng biệt — threshold register có thể chỉ bị chạm ở STATES=20 không phải STATES=4.
+
+**4. Fix đúng: tăng limit, không phải bỏ optimization**
+
+Bỏ `#pragma unroll` để giảm register pressure và cho phép inlining là cách sửa dựa vào
+side effect không ổn định. Fix đúng là: nhận biết hardware constraint và set limit phù hợp.
+`cudaDeviceSetLimit(cudaLimitStackSize, 4096)` là API chính xác cho vấn đề này.
+

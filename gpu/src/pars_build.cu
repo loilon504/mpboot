@@ -698,7 +698,9 @@ __device__ void runPhase3(
                 while (atomicCAS(&pool_slot_locks[phys_slot], 0, 1) != 0) {}
             }
             __syncwarp();
-            const int* src = pool_back_vf + (size_t)phys_slot * kMaxVFaces;
+            // Volatile reads bypass L1 cache: pool_back_vf may have been written by a
+            // different SM in the previous round — L1 on this SM may be stale.
+            const volatile int* src = (const volatile int*)(pool_back_vf + (size_t)phys_slot * kMaxVFaces);
             for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
             {
                 topo->back_vf[vf] = src[vf];
@@ -711,7 +713,10 @@ __device__ void runPhase3(
             }
             __syncwarp();
 
-            if (lane == 0) { gpuNodeRectifierPars(topo, sh, N); }
+            if (lane == 0)
+            {
+                gpuNodeRectifierPars(topo, sh, N);
+            }
             __syncwarp();
         }
     }
@@ -887,11 +892,17 @@ __device__ void runPhase3(
         {
             dst[vf] = topo->back_vf[vf];
         }
+        // All 32 lanes fence their own stores: each lane wrote different vfaces
+        // (0,32,64,... / 1,33,65,... / etc.), so each lane must flush its own
+        // writes to L2.  A fence by lane 0 alone only guarantees lane 0's vfaces
+        // are visible — lanes 1..31 stores may still be in write-back L1, causing
+        // readers on other SMs to see garbage from cudaMalloc in the next round.
+        __threadfence();
         __syncwarp();
     }
     __syncwarp();
 
-    // Release per-slot spinlock after topology copy is complete
+    // Release per-slot spinlock after all stores are globally visible.
     if (sh.bcast[4] >= 0 && lane == 0)
     {
         atomicExch(&pool_slot_locks[sh.bcast[4]], 0);
@@ -1176,6 +1187,7 @@ __global__ void buildPhase3Kernel(
         sh.cost_matrix = d_cost_matrix;
         sh.site_weights = sh.use_sankoff ? sw_k : nullptr;
         sh.bestParsimony = topo->bestParsimony;
+        (void)k;
     }
     __syncwarp();
 
@@ -1238,6 +1250,14 @@ void gpuStepwiseBuildTrees(
                 sharedBytes / 1024.0
             );
 
+            // Same stack limit needed for K1 (buildParsimonyTreesKernel<20> also > 1024 bytes).
+            size_t k1_prev_stack = 0;
+            CUDA_CHECK(cudaDeviceGetLimit(&k1_prev_stack, cudaLimitStackSize));
+            if (k1_prev_stack < 4096)
+            {
+                CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 4096));
+            }
+
             cudaEvent_t k1_start, k1_end;
             cudaEventCreate(&k1_start);
             cudaEventCreate(&k1_end);
@@ -1259,6 +1279,11 @@ void gpuStepwiseBuildTrees(
                 CUDA_CHECK(cudaStreamSynchronize(stream));
             }
 
+            if (k1_prev_stack < 4096)
+            {
+                CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, k1_prev_stack));
+            }
+
             float k1ms = 0.f;
             cudaEventElapsedTime(&k1ms, k1_start, k1_end);
             cudaEventDestroy(k1_start);
@@ -1271,6 +1296,16 @@ void gpuStepwiseBuildTrees(
         if (!skip_k1) {
             printf("\n[GPU] --------------------------------------------\n");
             printf("[GPU]   hillClimbingKernel<STATES=%d,NTAXA=%d>\n", S, NT);
+        }
+
+        // STATES=20 kernel has 1264 bytes cumulative stack (register spills force non-inlined
+        // calls); default CUDA per-thread stack is 1024 bytes → overflow → illegal access.
+        // Set 4096 bytes to cover the gap.  Restore after sync to avoid wasting memory.
+        size_t prev_stack = 0;
+        CUDA_CHECK(cudaDeviceGetLimit(&prev_stack, cudaLimitStackSize));
+        if (prev_stack < 4096)
+        {
+            CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 4096));
         }
 
         // Launch K2 async — AfterK2Callback (if any) runs CPU work while K2 executes
@@ -1300,6 +1335,11 @@ void gpuStepwiseBuildTrees(
         else
         {
             CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+
+        if (prev_stack < 4096)
+        {
+            CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, prev_stack));
         }
 
         float k2ms = 0.f;

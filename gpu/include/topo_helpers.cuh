@@ -83,6 +83,11 @@ __device__ __forceinline__ void gpuHookup(
     int* back_vf, int a, int b
 )
 {
+    if (a < 0 || a >= 3200 || b < 0 || b >= 3200)
+    {
+        printf("[CRASH] gpuHookup OOB: a=%d b=%d blk=%d\n", a, b, (int)blockIdx.x);
+        __trap();
+    }
     back_vf[a] = b;
     back_vf[b] = a;
 }
