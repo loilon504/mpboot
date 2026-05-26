@@ -16,11 +16,13 @@ std::vector<std::vector<NodeTriple>> computeTraversalInfoBFS(
     nodeptr root, int maxTips, pllBoolean full, size_t& nNodes
 );
 
-void parsimonyGpuInit(pllInstance* tr, partitionList* pr);
+void newviewGpuInit(pllInstance* tr, partitionList* pr);
 
-void newviewParsimonyGpu(
-    pllInstance* tr, partitionList* pr, std::vector<std::vector<NodeTriple>>& levels, size_t nNodes
+parsimonyNumber newviewParsimonyGpu(
+    pllInstance* tr, partitionList* pr
 );
+
+void resetParsVect();
 
 }  // namespace mpbootgpu
 

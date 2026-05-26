@@ -32,6 +32,7 @@
 #include "vectorclass/vectormath_common.h"
 #include "parstree.h"
 #include "gpu/include/profiler.hpp"
+#include "gpu/include/pars_bootstrap.cuh"
 
 Params *globalParam;
 Alignment *globalAlignment;
@@ -80,6 +81,7 @@ void IQTree::init() {
     reps_segments = -1;
     segment_upper = NULL;
     original_sample = NULL;
+    gpu_boot_mem_ = nullptr;
 }
 
 IQTree::IQTree(Alignment *aln) : PhyloTree(aln) {
@@ -359,7 +361,6 @@ void myPartitionsDestroy(partitionList *pl) {
 // This is done independent of Tung's initializePLL function
 // to support reordering aln pattern by parsimony score
 void IQTree::initTopologyByPLLRandomAdition(Params &params){
-    cout << "--Reach 361 iqtree.cpp, initTopologyByPLLRandomAdition\n";
 	pllInstance * tmpInst = NULL;
 	pllInstanceAttr tmpAttr;
 	pllAlignmentData * tmpAlignmentData;
@@ -478,6 +479,11 @@ IQTree::~IQTree() {
     if(original_sample){
     	aligned_free(original_sample);
     	original_sample = NULL;
+    }
+
+    if (gpu_boot_mem_) {
+        mpbootgpu::gpuBootstrapMemFree(gpu_boot_mem_);
+        gpu_boot_mem_ = nullptr;
     }
 
 #if (defined(__SSE3) || defined(__AVX))
@@ -1087,6 +1093,7 @@ void IQTree::doRandomNNIs(int numNNI) {
     NodeVector nodeList1, nodeList2;
     getInternalBranches(nodeList1, nodeList2);
     int numInBran = nodeList1.size();
+    if (numInBran != aln->getNSeq() - 3)
     assert(numInBran == aln->getNSeq() - 3);
     for (int i = 0; i < numNNI; i++) {
         int index = random_int(numInBran);
@@ -1620,7 +1627,6 @@ double IQTree::doTreeSearch() {
     printTree(bestTreeStream, WT_TAXON_ID + WT_BR_LEN);
     printTree(bestTopoStream, WT_TAXON_ID + WT_SORT_TAXA);
     string best_tree_topo = bestTopoStream.str();
-
     stop_rule.addImprovedIteration(1);
     searchinfo.curPerStrength = params->initPerStrength;
 
@@ -1695,7 +1701,6 @@ double IQTree::doTreeSearch() {
 //		long tmp_num_ratchet_bootcands = treels.size();
         if(params->ratchet_iter >= 0){
         	if(params->ratchet_iter == ratchet_iter_count){
-                PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/PerturbAlignment");
                 // cout << "Iteration " << curIt << ", perturb alignment\n";
 //				string candidateTree = candidateTrees.getRandCandVecTree(); // Diep: to pick from vector-stored candidates
 				string candidateTree = candidateTrees.getRandCandTree();
@@ -1726,7 +1731,6 @@ double IQTree::doTreeSearch() {
     	 *---------------------------------------*/
 		double perturbScore;
 		if(!on_ratchet_hclimb1){
-            PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/PerturbTree");
             // cout << "Iteration " << curIt << ", perturb tree\n";
             // cout << "REACH " << 1725 << " iqtree.cpp: what is this\n";
 			if (iqp_assess_quartet == IQP_BOOTSTRAP) {
@@ -1792,7 +1796,6 @@ double IQTree::doTreeSearch() {
 					curScore = pllInst->likelihood;
 					perturbScore = curScore;
 				} else {
-                    // cout << "   optimizeAllBranches\n";
 					initializeAllPartialLh();
 					clearAllPartialLH();
 					if (isSuperTree()) {
@@ -1809,10 +1812,7 @@ double IQTree::doTreeSearch() {
         int nni_count = 0;
         int nni_steps = 0;
 
-        {
-            PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/doNNISearch");
-		    imd_tree = doNNISearch(nni_count, nni_steps);
-        }
+        imd_tree = doNNISearch(nni_count, nni_steps);
 
         if (iqp_assess_quartet == IQP_BOOTSTRAP) {
             // restore alignment
@@ -1830,7 +1830,6 @@ double IQTree::doTreeSearch() {
          * PARSIMONY RATCHET-LIKE IDEA
          * -------------------------------------------------------------------------*/
         if(on_ratchet_hclimb1){
-            PROFILE_SCOPE("runTreeReconstruction/doTreeSearch/on_ratchet_hclimb1");
             // cout << "Iteration " << curIt << ", on_ratchet_hclimb1 = true\n";
 			ratchet_iter_count = 0;
 
@@ -2119,7 +2118,6 @@ string IQTree::doNNISearch(int& nniCount, int& nniSteps) {
 
 //		if(false){
 		if(on_ratchet_hclimb1 && params->hclimb1_nni){
-            cout << "--REACH 2108, on_ratchet_hclimb1 && params->hclimb1_nni\n";
 			curScore = optimizeNNI(nniCount, nniSteps);
 			treeString = getTreeString();
 		}else{
@@ -2134,8 +2132,10 @@ string IQTree::doNNISearch(int& nniCount, int& nniSteps) {
 				 /* Make the replacement. */
 				 treeString1.replace(index, 4, ":0");
 
-				 /* Advance index forward so the next iteration doesn't pick it up as well. */
-				 index += 4;
+				 /* Bug fix: advance by 2 (length of ":0"), not 4 (length of ":nan").
+				    Advancing by 4 skipped over the next character after ":0", causing
+				    adjacent ":nan" tokens to be missed. */
+				 index += 2;
 			}
 
 			int max_spr_rad = params->spr_maxtrav;
@@ -3425,11 +3425,20 @@ void IQTree::saveCurrentTree(double cur_logl) {
         int updated = 0;
         int nsamples = (params->maximum_parsimony) ? boot_samples_pars.size() : boot_samples.size();
 
+        // GPU REPS path: evaluate all B replicates in parallel before the sample loop
+        if (gpu_boot_mem_ != nullptr && params->maximum_parsimony && _pattern_pars != nullptr) {
+            mpbootgpu::gpuREPSEval(gpu_boot_mem_, _pattern_pars);
+        }
+
         for (int sample = 0; sample < nsamples; sample++) {
             double rell = 0.0;
             bool skipped = false;
 
 			if (params->maximum_parsimony) {
+				// --- GPU REPS: use pre-computed h_rell ---
+				if (gpu_boot_mem_ != nullptr && _pattern_pars != nullptr) {
+					rell = -(double)gpu_boot_mem_->h_rell[sample];
+				} else {
 				BootValTypePars *boot_sample = boot_samples_pars[sample];
 
 				if(params->auto_vectorize){
@@ -3464,6 +3473,7 @@ void IQTree::saveCurrentTree(double cur_logl) {
 
 					rell = -(double)res;
 				}
+				} // end CPU REPS else-branch
 			} else {
 				// TODO: The following parallel is not very efficient, should wrap the above loop
 	//#ifdef _OPENMP

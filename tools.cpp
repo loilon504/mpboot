@@ -826,6 +826,11 @@ void parseArg(int argc, char *argv[], Params &params) {
     params.write_local_optimal_trees = false;
 
 	params.use_gpu = false;
+	params.gpu_nni_strength = 0.5;
+	params.gpu_pool_size = 10;
+	params.gpu_worker = 100;
+	params.gpu_worker_stop = 1;
+	params.gpu_device = 0;
 
 	if (params.nni5) {
 	    params.nni_type = NNI5;
@@ -2700,6 +2705,26 @@ void parseArg(int argc, char *argv[], Params &params) {
 			}
 			if (strcmp(argv[cnt], "-use_gpu") == 0) {
 				params.use_gpu = true;
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_nni_strength") == 0) {
+				params.gpu_nni_strength = (float)atof(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_pool_size") == 0) {
+				params.gpu_pool_size = convert_int(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_worker") == 0) {
+				params.gpu_worker = convert_int(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_worker_stop") == 0) {
+				params.gpu_worker_stop = convert_int(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_device") == 0) {
+				params.gpu_device = atoi(argv[++cnt]);
 				continue;
 			}
 			if (argv[cnt][0] == '-') {

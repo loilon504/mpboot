@@ -1922,7 +1922,6 @@ void pllMakeParsimonyTreeFast(pllInstance *tr, partitionList *pr, int sprDist)
   
   randomMP = tr->bestParsimony;        
   
-  printf("--REACH 1925 fastDNAparsimony.c, SPR init tree\n");
   do
     {
       startMP = randomMP;

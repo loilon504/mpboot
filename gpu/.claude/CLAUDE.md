@@ -1,0 +1,593 @@
+# GPU Parsimony – Developer Context
+
+## 0. Quick Reference — Common Commands
+
+Working directory: `mpboot-gpu/build/`  (created by `mkdir build && cd build`)
+
+### Build
+```bash
+# Configure (run once from build/)
+cmake ../mpboot -DIQTREE_FLAGS=avx -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_CXX_STANDARD=14 -DUSE_GPU=ON
+
+# Build
+make -j4
+```
+
+### Run CPU
+```bash
+make -j4 && /usr/bin/time -v ./mpboot-avx \
+    -s ../data_debug/tree1.phy -seed 1 \
+    > tree2.txt 2>&1
+```
+
+### Run GPU
+```bash
+make -j4 && /usr/bin/time -v ./mpboot-avx \
+    -s ../data_debug/tree1.phy -use_gpu -seed 1 \
+    -numpars 200 -sprdist 3 \
+    > tree2.txt 2>&1
+```
+
+### Benchmark scripts (run from `build/`)
+```bash
+bash bench_cpu.sh                          # all datasets → output/cpu/*.log
+bash bench_gpu.sh                          # all datasets → output/gpu/*.log
+bash bench_cpu.sh path/to/file.phy         # single file
+python3 ../output/summarize.py             # → output/results.xlsx
+```
+
+### Key CLI flags
+
+#### User-facing (CLI)
+| Flag | Default | Ý nghĩa |
+|------|---------|---------|
+| `-use_gpu` | off | Bật GPU mode — gọi `gpuInitCandidateTrees()` thay vì CPU stepwise |
+| `-gpu_device N` | **0** | CUDA device ID sử dụng. `cudaSetDevice(N)` được gọi tại đầu `gpuInitCandidateTrees` |
+| `-numpars K` | 100 | Số cây parsimony ban đầu. GPU dùng **K blocks** (tree index 1..K) |
+| `-sprdist N` | 6¹ | SPR radius dùng cho Phase 2 (initial SPR) và Phase 3 (NNI+SPR) |
+| `-gpu_nni_strength X` | **0.5** | Strength NNI perturbation trong Phase 3: `numNNI = X×(N−3)`, min=1. Even iterations của Phase 3 |
+| `-gpu_pool_size N` | **20** | Số pool slots cho topology restart trong K2 |
+| `-gpu_worker N` | **400** | Số K2 blocks (workers); -1 = same as k1_count. Tăng → nhiều trees song song hơn |
+| `-gpu_worker_stop N` | **1** | Stop threshold multiplier cho `gpuHillClimbing`: `unsuccess_thresh = unsuccess_iteration + K×N`. Tăng → khoan dung hơn khi K lớn |
+| `-seed N` | random | RNG seed cho tất cả K trees |
+
+#### Derived / internal (không phải CLI)
+| Parameter | Source | Ý nghĩa |
+|-----------|--------|---------|
+| `numNNI` | `max(1, gpu_nni_strength×(N−3))` | Số NNI perturbation mỗi even iteration của Phase 3. `gpu_init_trees.cu` |
+
+#### Recommended benchmark command
+```bash
+./mpboot-avx -s <dataset> -use_gpu -seed 1 \
+    -numpars 1000 -sprdist 6 -gpu_stop 6 -gpu_pool_size 30 -gpu_k1_ratio 0.2
+# Defaults: gpu_device=0, gpu_nni_strength=0.5, gpu_worker=400, gpu_worker_stop=1
+```
+
+#### Thông tin kernel (in lúc chạy) — format mới 2026-05-15
+```
+[GPU] ═══════════════════════════════════════════════════════
+[GPU]   K=399  N=295  device=1
+[GPU]
+[GPU]   [1]      CPU parsimony alloc         :    0.006 s  (width=40 states=4)
+[GPU]   [2]      GPU memory alloc            :    0.001 s
+[GPU]   [3]      Upload tip parsVect (H->D)  :    0.009 s
+[GPU]   [4]      Upload topologies (H->D)    :    0.001 s  (399 trees)
+[GPU]
+[GPU]   buildTreesKernel<STATES=4,NTAXA=800>
+[GPU]         K=399  sprDist=3  top_pct=10%  shared=11.4 KB
+[GPU]         time: 1.234 s
+[GPU]   hillClimbingKernel<STATES=4,NTAXA=800>
+[GPU]         top_k=40/399  threshold=6685  actual=43 (10.8%)  score_range=[6676,6751]
+[GPU]         time: 4.567 s
+[GPU]   [5+6+7]  Kernel (build+SPR+search)   :    5.801 s  (399 trees, 14.54 ms/tree)
+[GPU]            sprDist=3  iters=100  NNI=29(0.10)  stop=6  top_pct=10%
+[GPU]
+[GPU]   [6b]     Pre-SPR  parsimony    :  best=6723     worst=6816
+[GPU]   [6b]     Post-SPR parsimony    :  best=6676     worst=6751
+[GPU]   [6b]     Post-HC  parsimony    :  best=6664     worst=6751
+[GPU]   [6b]     NNI+SPR (even)        :  112/422 iters improved (26.5%)
+[GPU]   [6b]     Ratchet (odd)         :  198/408 iters improved (48.5%)
+[GPU]
+[GPU]   [7a]     Download topologies (D->H)  :    0.006 s
+[GPU]   [7b]     gpuTopoToCpu               :    0.003 s
+[GPU]   [7c]     Newick conversion           :    0.050 s
+[GPU]   best CPU tree: 6664     best GPU tree: 6664
+[GPU] ═══════════════════════════════════════════════════════
+```
+
+---
+
+## 1. Pipeline Overview: Porting MPBoot to GPU
+
+MPBoot's candidate-tree generation (`makeParsimonyTreeFast` in `sprparsimony.cpp`) builds
+`numInitTrees` trees from scratch using stepwise-addition + SPR hill-climbing.
+The CPU runs them **serially**; the GPU runs **K trees in parallel** (one CUDA block per tree,
+one warp of 32 lanes per block).
+
+### Entry point
+`gpuInitCandidateTrees()` in `gpu/src/gpu_init_trees.cu`.
+Called from `IQTree::initCandidateTreesParsimony()` when `--use_gpu` is passed.
+
+### Pipeline steps (numbered as printed at runtime)
+
+| Step | Code | What happens |
+|------|------|-------------|
+| [1] | `_allocateParsimonyDataStructures` | CPU allocs `parsVect` buffers and compresses alignment into Fitch bit-vectors per partition |
+| [2] | `gpuParsimonyMemAlloc` | GPU allocs `d_parsVect[K][2N+1][width][states]`, `d_parsScore[K][2N+1]`, `d_topos[K]` |
+| [3] | `uploadTipParsVect` | Reorders tip parsVect from CPU layout `[node][state][block]` → GPU layout `[node][block][state]` and uploads (tips are **read-only**, shared across all K trees) |
+| [4] | `cpuToGpuTopology` + `uploadTopology` | Converts PLL pointer-ring to flat integer arrays (`GpuTopology`), uploads **one initial topology** to all K trees |
+| [5] | `buildParsimonyTreesKernel` (`pars_build.cu`) | Each block builds one tree via **stepwise addition** on GPU |
+| [6] | `gpuSprKernel` (`gpu_spr.cu`) | Each block runs **SPR hill-climbing** on its tree |
+| [7] | `downloadTopology` + `gpuTopoToCpu` + `pllTreeToNewick` + `candidateTrees.update` | Download K topologies, convert to PLL (reuse `tr` directly — no clone), CPU-rescore each via `computeParsimony()`, register into `iqtree.candidateTrees` |
+
+### Data layout
+
+**GpuTopology** (`pars_tree.cuh`): flat integer arrays mirroring PLL's pointer ring.
+- Tips 1..N: one vface each, `vf = num - 1`.
+- Inner nodes N+1..2N-1: three vfaces each, `vf = N + 3*(num-N-1) + face_idx`.
+- `face_idx`: GPU face[0], face[1], face[2]. Ring direction: **face[2]→face[1]→face[0]→face[2]**.
+- `nodepVf(num, N)` = the fixed formula for face[2] of node num (used as default canonical).
+- `topo->nodep[num]` = DFS-canonical vface for node num, set by `gpuNodeRectifierPars`.
+  - Tips: `nodep[num] = num - 1` (fixed).
+  - Inner: DFS-encountered face; analogous to CPU `tr->nodep[num]`.
+- `back_vf[vf]` = the back-neighbor's vface (analogous to PLL's `p->back`).
+- **Note**: `best_back_vf` đã bị xóa (2026-05-17). Topology tốt nhất nay lưu trong pool (`d_poolBackVf` trong `GpuParsimonyMem`).
+
+**Inner node boundary rules** (easy to confuse):
+- By **vface**: inner if `vf >= N` (tips have `vf = 0..N-1`).
+- By **node number**: inner if `num > N` (tips have `num = 1..N`).
+- Never use `vf > N` (misses face[0] of first inner node) or `num >= N` (includes tip N).
+
+**PLL vs GPU face mapping**:
+| PLL pointer | GPU vface |
+|-------------|-----------|
+| `p` = `tr->nodep[i]` = face[0] | `topo->nodep[i]` (DFS-canonical, any face) |
+| `p->next` = face[1] | `vfNextFace(nodep[i], N)` |
+| `p->next->next` = face[2] | `vfNnxtFace(nodep[i], N)` |
+| `p->back` | `back_vf[nodep[i]]` |
+
+PLL ring direction: face[0]→face[1]→face[2]→face[0].
+GPU ring direction: face[2]→face[1]→face[0]→face[2].
+Ring arithmetic works for any face p: `vfNextFace(vfNnxtFace(p)) = p`.
+
+**parsVect layout**: `pars_tree[node * width * states + block * states + state]`.
+`score_tree[node]` = accumulated Fitch parsimony for the entire subtree of `node` (from its
+DFS-children's side), equivalent to PLL's `parsimonyScore[node]`.
+
+---
+
+## 2. CPU PLL Parsimony Implementation
+
+### Fitch parsimony fundamentals
+
+Each inner node stores a **parsVect** (bit-vector per state per site-block).
+For a node with children L and R:
+```
+intersection[s] = L[s] & R[s]          // sites where L and R agree on state s
+union[s]        = L[s] | R[s]
+t_N             = ~(OR of all intersection[s])  // sites with NO common state
+node[s]         = intersection[s] | (t_N & union[s])  // Fitch rule
+partial_score   = popcount(t_N)          // substitutions at this node
+parsimonyScore[node] = partial_score + parsimonyScore[L] + parsimonyScore[R]
+```
+`parsimonyScore[n]` = total parsimony for **all branches in n's subtree** (not counting the
+edge to n's parent). For tips, `parsimonyScore[tip] = 0`.
+
+Full-tree parsimony at edge (p, q):
+```
+evaluateParsimony(p) = parsimonyScore[p->number] + parsimonyScore[q->number] + cross(p, q)
+```
+where `cross(p, q) = popcount(~(OR of (parsVect_p[s] & parsVect_q[s]))`.
+This equals GPU's `warpEvaluateScore(p_num, q_num)`.
+
+### The `ti[]` array and xPars lazy evaluation
+
+PLL avoids redundant recomputation via the **xPars flag** (per nodeptr, not per node number):
+- `p->xPars = 1` means `parsVect[p->number]` was computed from `p`'s perspective
+  (children = `p->next->back`, `p->next->next->back`).
+- `computeTraversalInfoParsimony(p, ti, ...)` traverses from `p` and fills `ti[]` with
+  `[p->number, q->number, r->number]` tuples for all stale descendants (xPars=0).
+- `newviewParsimonyIterativeFast(tr)` processes `ti[]` bottom-up, recomputes parsVect and
+  parsimonyScore for each listed node.
+- `getxnodeLocal(p)` moves the xPars flag from `p->next` or `p->next->next` to `p` itself.
+
+This means **parsimonyScore[n] is direction-dependent**: the value depends on which face
+last called newview on node n. In PLL's SPR, `evaluateParsimony(p, FALSE)` at the start of
+`rearrangeParsimony` (line 2291, marked "VERY IMPORTANT") lazily refreshes parsimonyScore
+for p and any stale ancestors before the search begins.
+
+### Stepwise addition (`makeParsimonyTreeFast`)
+
+1. Shuffle tip order (Fisher-Yates).
+2. Start 3-tip tree from tips `perm[1..3]`.
+3. For each new tip `perm[4..N]`:
+   - Allocate a new inner node q from `tr->nodep[N + ntips - 1]`.
+   - `buildNewTip(p, q)`: hookup PLL face[0] of q to tip p; face[1], face[2] = NULL.
+   - DFS over candidate edges; call `stepwiseAddition` → `testInsert`:
+     - `insertParsimony(q, q_cand)`: hookup face[1]↔q_cand, face[2]↔r=q_cand->back;
+       `newviewParsimony(q)` from face[0]'s children (face[1]→q_cand, face[2]→r).
+     - Evaluate: `evaluateParsimony(q->next->next, FALSE)` at edge (face[2] of q, r).
+       Internally: recomputes parsVect[q->number] from face[2]'s perspective
+       (children = face[0]→q_back, face[1]→q_cand), then sums.
+     - Undo: `hookupDefault(q_cand, r)`, set face[1]->back = face[2]->back = NULL.
+   - Insert at best edge.
+
+### SPR hill-climbing (`rearrangeParsimony` + main loop in `makeParsimonyTreeFast`)
+
+Outer do-while repeats until `randomMP` stops decreasing.
+Inner loop: for each node i = 1..2N-2:
+
+```
+evaluateParsimony(tr->nodep[i], FALSE)   // lazy refresh of parsimonyScore[i] — line 2291 CRITICAL
+```
+
+**P-branch** (p = `tr->nodep[i]`, must be inner):
+```
+p1 = p->next->back,  p2 = p->next->next->back
+if (p1 or p2 is inner):
+    removeNodeParsimony(p)    // hookup(p1,p2); p->next->back = p->next->next->back = NULL
+    tip_p = p->back           // unchanged (the "other side" of p)
+    addTraverseParsimony(p, p1->next->back, mintrav=1, maxtrav=sprDist)
+    addTraverseParsimony(p, p1->next->next->back, ...)
+    addTraverseParsimony(p, p2->next->back, ...)  (if p2 inner)
+    addTraverseParsimony(p, p2->next->next->back, ...)
+    hookupDefault(p->next, p1); hookupDefault(p->next->next, p2)  // restore
+    newviewParsimony(p)        // refresh parsimonyScore[i]
+```
+
+**Q-branch** (q = `p->back`, must be inner with at least one inner grandchild):
+```
+q1 = q->next->back,  q2 = q->next->next->back
+if (condition on grandchildren):
+    removeNodeParsimony(q)
+    tip_q = p  (q's back, unchanged = node i)
+    addTraverseParsimony(q, ..., mintrav=2, maxtrav=sprDist)
+    restore q; newviewParsimony(q)
+```
+
+**testInsertParsimony(p, q_cand)**:
+```
+r = q_cand->back
+insertParsimony(p, q_cand)        // face[1]↔q_cand, face[2]↔r; newviewParsimony(p) from face[0]
+mp = evaluateParsimony(p->next->next, FALSE)
+     // face[2] of p: recomputes parsVect[i] from face[2]'s perspective:
+     //   children = face[0]->back = tip_p, face[1]->back = q_cand
+     // parsimonyScore[i] = cross(tip_p, q_cand) + score[tip_p] + score[q_cand]
+     // result = parsimonyScore[i] + parsimonyScore[r] + cross(i, r)
+undo insertParsimony
+if mp < tr->bestParsimony: record (removeNode=p, insertNode=q_cand)
+```
+
+After the full for-loop, apply best move (if better than `randomMP`):
+```
+restoreTreeRearrangeParsimony:
+    removeNodeParsimony(tr->removeNode)
+    restoreTreeParsimony(tr->removeNode, tr->insertNode)
+       // face[1]↔q_cand, face[2]↔r; newviewParsimony from face[0]
+    randomMP = tr->bestParsimony
+```
+
+---
+
+## 3. New GPU Functions (pars_tree.cuh) — xPars-Aware Traversal
+
+The following device functions mirror the CPU's `computeTraversalInfoParsimony` /
+`newviewParsimonyIterativeFast` / `evaluateParsimonyIterativeFast` pipeline.
+All are template on `SharedT` (works for both `BuildShared` and `SprShared`).
+
+### `computeTraversalInfoParsimony(topo, sh, node, N, full)`
+Builds `sh.ti[]` from `node`'s perspective (iterative DFS via `sh.tiStack`).
+- Mirrors CPU's xPars flag transfer: if `!xpars[p]`, moves xpars from `pNext` or `pNnxt`.
+- `full=false`: only recurses into children with `xpars=0` (lazy mode).
+- `full=true`: recurses into all inner children unconditionally.
+- Appends `(p_num, q_num, r_num)` tuples to `sh.ti[]` (starting at `sh.tiSize`).
+- **Must be called from lane 0 only.**
+
+### `newviewParsimony(pars_tree, score_tree, sh, evaluate, width, states)`
+Processes `sh.ti[]` bottom-up (`i = tiSize-3 … 3`), updating `parsVect` and `score_tree`.
+- If `evaluate=false`: just updates, returns `score_tree[sh.ti[3]]` (top-of-ti node).
+- If `evaluate=true`: after newview, also evaluates at edge `(sh.ti[1], sh.ti[2])` and
+  returns `score_tree[ti[1]] + score_tree[ti[2]] + cross(parsVect[ti[1]], parsVect[ti[2]])`.
+- All 32 lanes participate in parsVect computation; lane 0 handles score accumulation.
+
+### `createTiAndNewviewParsimony(pars_tree, score_tree, topo, sh, p, N, width, states, lane)`
+Wrapper: sets `sh.tiSize = 3`, calls `computeTraversalInfoParsimony(p, lazy)`, then
+`newviewParsimony(evaluate=false)`. Updates `parsVect[vfToNum(p)]` and all stale descendants.
+
+### `createTiAndEvaluateParsimony(pars_tree, score_tree, topo, sh, p, N, full, width, states)`
+Wrapper: sets `sh.tiSize = 3`, sets `sh.ti[1]=vfToNum(p)`, `sh.ti[2]=vfToNum(back_vf[p])`,
+then calls `computeTraversalInfoParsimony` for both p and `back_vf[p]`.
+Returns full-tree parsimony at edge `(p_num, back_vf[p]_num)`.
+- `full=true`: equivalent to CPU's `evaluateParsimony(p, PLL_TRUE)` — unconditional refresh.
+- `full=false`: equivalent to CPU's `evaluateParsimony(p, PLL_FALSE)` — lazy refresh.
+
+**GPU equivalent of CPU line-2291 call:**
+```cpp
+createTiAndEvaluateParsimony(pars_tree, score_tree, topo, sh, p, N, /*full=*/true, width, states)
+```
+
+---
+
+## 4. Current GPU Implementation Status (2026-05-17)
+
+### ✅ Fully working
+
+**Joined kernel `buildParsimonyTreesKernel`** (`pars_build.cu`) — stepwise-addition + SPR in
+one `__global__` function sharing `BuildShared` shared memory (≈24.8 KB on A100).
+
+### ✅ testInsert optimization (2026-05-12)
+
+**Optimization**: `testInsert` pre-refresh — eliminate redundant Fitch step for remove node `p`.
+
+**Root cause**: Old `testInsert` called `createTiAndNewviewParsimony(p, face[2])` then
+`createTiAndEvaluateParsimony(face[0])`. Step 1 computed `parsVect[p_num]` from face[2], which
+was immediately overwritten by step 2's computation from face[0]. That 1 Fitch step was pure waste.
+
+**Fix**: Replace step 1 with a pre-refresh that:
+- Refreshes q, r_vf, and `tip_p = back_vf[p]` subtrees if stale (these are face[0]'s children)
+- Does NOT compute parsVect[p] from face[2] (skips the wasted Fitch step)
+- Explicitly sets `xpars[q]=1`, `xpars[r_vf]=1`, `xpars[tip_p]=1` after refresh
+- Sets `xpars[face[0]]=0` to force step 2 to recompute p from face[0]
+
+**Bug found during fix**: `tip_p = back_vf[p]` (face0's child) degrades to `xpars=0` across
+many testInsert calls if not refreshed. Without it: eval_size=1.72 (extra traversal). With it: eval_size=1.00.
+
+**Pitfall**: Using `if (log) { inline } else { createTiAndEvaluateParsimony }` for step 2 caused
+a 48% regression. The compiler generates both branches even though `log` is warp-uniform at runtime.
+Fix: always use inline for step 2; only guard timing accumulation with `if (log)`.
+
+**Results** (N=295, sprDist=3, K=99, gpu_hc_iter=10, 5 even iters):
+
+| Metric | Before (old step 1) | After (pre-refresh) | Δ |
+|--------|---------------------|---------------------|---|
+| newview nodes/call | 2.51 | 1.72 | −31% |
+| eval nodes/call | 1.00 | 1.00 | 0% |
+| t_search (Phase3 NNI+SPR) | 8.296B cyc | ~5.5B cyc | **−34%** |
+
+### Joined kernel structure (pars_build.cu)
+
+`buildParsimonyTreesKernel(... sprDist ...)`:
+1. **Phase 0** (lane 0): Fisher-Yates shuffle → `sh.seed`, build 3-tip tree.
+   Init `topo->nodep[]`: tips `nodep[num] = num-1`; inner `nodep[num] = nodepVf(num, N)`.
+2. **Phase 1**: Stepwise addition for tips 4..N. Uses `sh.ti[]` + `computeTraversalInfoParsimony`
+   + `newviewParsimony` (xPars-aware). After this, `sh.bestParsimony` = tree parsimony.
+3. **Phase 2**: `gpuNodeRectifierPars` — DFS from `nodep[1]->back`, assigns `nodep[N+1..2N-1]`
+   in DFS order (exact face encountered). Sets `topo->start_vface = nodep[1]`.
+4. **Phase 3** (if `sprDist > 0`): SPR hill-climbing.
+   - Init: `sh.randomMP = sh.bestParsimony` (from build phase — xPars already consistent).
+   - **No `recomputeAllNodes` needed**: xPars flags from build are valid.
+   - `do-while randomMP < startMP`:
+     - `gpuNodeRectifierPars` — refresh `nodep[]` for current topology
+     - For i = 1..2N-2: `p = nodep[i]`, `q = back_vf[p]`
+       - `createTiAndEvaluateParsimony(p, full=false)` (line-2291 lazy refresh)
+       - P-branch (if p is inner): removeNode(p) → doAddTraverse → restore → newview(p)
+       - Q-branch (if q is inner with inner grandchild): same with q
+       - Apply best move if improving
+
+### `gpuNodeRectifierPars` semantics
+
+GPU equivalent of CPU `nodeRectifierPars + reorderNodes` (sprparsimony.cpp:2089):
+- DFS from `back_vf[nodep[1]]` using `sh.tiStack`
+- For each inner node M encountered via vface `m_vf`:
+  - `topo->nodep[count + N + 1] = m_vf` (exact DFS-encountered face)
+- Does NOT touch `xpars[]` or `back_vf[]` — pure nodep[] assignment
+- After call: `nodep[i]` ≡ CPU `tr->nodep[i]` — `back_vf[nodep[i]]` = DFS-parent direction
+
+### Key design decisions
+
+- **`topo->nodep[]`** — stores DFS-canonical vface per node, mirrors CPU `tr->nodep[]`.
+  Before (old approach): `gpuNodeRectifierPars` permuted `back_vf[]` to force canonical = face[2].
+  After (new approach): stores whatever face DFS encountered, without touching `back_vf[]`.
+- **`SprShared` removed** — `BuildShared` now holds all fields for both phases.
+- **`sh.randomMP` init** — set from `sh.bestParsimony` (last build insertion score) instead of
+  calling `recomputeAllNodes`. Valid because xPars flags are already consistent after build.
+- **`gpuSprKernel` removed** — `gpu_spr.cu` now contains only a no-op `gpuSprBuildTrees` stub.
+- **Pipeline steps [5]+[6] merged** → single call `gpuStepwiseBuildTrees(mem, seeds, sprDist, stream)`.
+
+### ✅ GpuTopology struct shrink — Opt-D (2026-05-12)
+
+**Discovery**: `vfToNum`, `vfNextFace`, `vfNnxtFace` are pure arithmetic — kernel never reads
+`topo->number[]`, `topo->next_vf[]`, `topo->nnxt_vf[]`. Those arrays only served CPU-side
+`cpuToGpuTopology`/`gpuTopoToCpu`.
+
+**Fix**: Remove all three arrays from `GpuTopology`. In `gpuTopoToCpu`, replace
+`p->next = base + in->next_vf[vf]` with `p->next = base + vfNextFace(vf, in->mxtips)`.
+Added `__host__` to `vfNextFace`/`vfNnxtFace` in `topo_helpers.cuh`.
+
+**Struct size: 83,236 → 44,836 bytes (−37.5 KB)**. Layout after:
+```
+back_vf[0]       offset=0        HOT  12.8 KB
+xpars[0]         offset=12.8 KB  HOT  12.8 KB  (was 64 KB from back_vf!)
+scalars          offset=25.6 KB  36 bytes
+nodep[0]         offset=25.6 KB  MEDIUM 6.4 KB
+best_back_vf[0]  offset=32.0 KB  COLD
+```
+
+**Benchmark** (10 datasets, seed=1, numpars=200, gpu_hc_iter=10, sprdist=3):
+average **−8.7% ms/tree** across N=55..395. Range: −4% to −14%.
+Parsimony quality unchanged (2/10 differ by ±2 = stochasticity).
+
+### ✅ Dead code removal — Refactor #3 (2026-05-17)
+
+**Thay đổi**: Xóa toàn bộ code không dùng sau khi kiến trúc 2-kernel (K1/K2) ổn định:
+- `BuildSharedT`: xóa timing fields (`t_build`, `t_phase2`, `t_p3_nni_spr`, `t_p3_ratchet`, `n_p3_even`, `n_p3_odd`) + dead Opt-C/sym fields (`last_odd_hash`, `restore_on_next_odd`, `sym_do_ratchet`)
+- `GpuTopology`: xóa `best_back_vf[kMaxVFaces]` (−12.8 KB per struct)
+- `numSearchIter` bị xóa toàn bộ chuỗi từ CLI đến kernel. Phase 3 dùng `for(;;)` với `gpu_stop` là stopping criterion duy nhất
+- CLI flag `-gpu_hc_iter` bị xóa
+
+**Kết quả NCU** (K=200, dna_M10434 544 taxa, A100):
+| Kernel | Regs/thread | Block Limit Reg | Theor. Occupancy |
+|--------|------------|-----------------|-----------------|
+| K1 `buildParsimonyTreesKernel` | **96** (↓ từ 155) | 20 | **20.31%** |
+| K2 `buildPhase3Kernel` | **151** | 12 | 18.75% |
+
+K1 giảm mạnh 155→96 regs. K2 vẫn 151 regs sau dead code removal.
+
+### ✅ Pool restart simplification — (2026-05-18)
+
+**Thay đổi**: Thay warp-parallel k-th min scan bằng lane-0 O(pool_size²) selection-sort.
+
+**Rationale**: `pool_size ≤ 60` → bitmask `unsigned long long used` đủ để track đã chọn slot nào.
+Sequential selection-sort với 60² = 3600 ops tối đa, đơn giản hơn nhiều so với warp-parallel.
+
+```cpp
+// Lane-0 only: O(pool_size²) selection-sort để chọn rank order_idx
+uint32_t used = 0;
+int found_slot = -1;
+for (int rank = 0; rank <= order_idx; rank++) {
+    unsigned int best = 0xFFFFFFFFu; int best_slot = -1;
+    for (int i = 0; i < accessible; i++) {
+        if ((used >> i) & 1u) continue;
+        if (pool_scores[i] < best) { best = pool_scores[i]; best_slot = i; }
+    }
+    used |= (1u << best_slot); found_slot = best_slot;
+}
+```
+
+**File**: `gpu/src/pars_build.cu` — pool restart scan block.
+**Effect on registers**: K2 regs **151 → 128** (đo NCU sau thay đổi này).
+
+### ✅ Per-slot pool spinlocks — Opt-S (2026-05-18)
+
+**Vấn đề**: 1 `pool_lock` global int bị tranh chấp bởi K=1000 blocks → thundering herd.
+- Pool restart: 1000 blocks busywait cùng một lock để copy 12.8 KB `back_vf`
+- Pool insert: thêm contention khi một block insert vào pool
+
+**Fix**: Thay `pool_lock` (1 int) bằng `pool_slot_locks[pool_size]` (20 ints):
+- Pool restart: `atomicCAS(&pool_slot_locks[phys_slot], 0, 1)` — chỉ lock đúng slot đang đọc
+- Pool insert: `atomicCAS(&pool_slot_locks[worst_slot], 0, 1)` — chỉ lock đúng slot đang ghi
+- Contention giảm từ K=1000 blocks tranh 1 lock → max K/pool_size ≈ 50 blocks per lock
+
+**Files thay đổi**:
+| File | Thay đổi |
+|------|---------|
+| `gpu/include/pars_tree.cuh` | `d_poolLock` → `d_poolSlotLocks` (int* array) |
+| `gpu/src/pars_tree.cu` | alloc pool_size ints + cudaMemset; free d_poolSlotLocks |
+| `gpu/src/pars_build.cu` | runPhase3 + buildPhase3Kernel: pool_lock → pool_slot_locks[slot] |
+| `gpu/src/gpu_init_trees.cu` | hybrid_cb: cudaMemset toàn bộ array thay cudaMemcpy 1 int |
+
+**NCU profiling** (K=1000, N=295, A100):
+| Kernel | Regs | Theor. Occ | Achieved Occ | Waves/SM |
+|--------|------|-----------|-------------|---------|
+| K2 `buildPhase3Kernel` | **128** | 20.31% | 13.29% | 0.71 |
+
+Shared memory (12.9 KB/block) là bottleneck chiếm dụng (không phải registers). Bottleneck còn lại: `gpuRandomNNIs` 31 lanes idle.
+
+**NCU profiling chi tiết** (config w400p20d6s3, 6 hard datasets N=219–504, A100, 2026-05-18):
+```
+ncu --launch-count 2 --set default -o <out> ./mpboot-avx -s <ds> -use_gpu -seed 1
+    -numpars 200 -sprdist 6 -gpu_pool_size 20 -gpu_worker 400 -gpu_device <dev>
+    -gpu_nni_strength 0.05 -gpu_pool_stop 3
+```
+| Kernel | Grid | Regs | Occ limit regs | Occ limit smem | Waves/SM | Theor. Occ% |
+|--------|------|------|---------------|---------------|----------|-------------|
+| K1 `buildParsimonyTreesKernel<4,800>` | 200 | **96** | 20/SM | **13/SM** | 0.14 | **20.31%** |
+| K2 `buildPhase3Kernel<4,800>` | 400 | **128** | 16/SM | **13/SM** | 0.28 | **20.31%** |
+
+Kết quả nhất quán cho tất cả 6 datasets (kernel template `NTAXA=800` cố định bất kể N thực tế).
+
+**Phân tích bottleneck**:
+- `smem_static = 11.584 KB/block` → A100 cho tối đa **13 blocks/SM** → theor. occ 13/64 = **20.31%**
+- K2 regs=128 → reg limit = 16/SM, nhưng smem vẫn stricter (13 < 16)
+- **Bottleneck là shared memory, không phải registers** cho cả K1 lẫn K2
+- K2 waves/SM = 0.28: với 400 blocks trên 108 SMs × 13 blocks/SM = **chưa đến 1 wave** → GPU không saturated
+- Để đạt ≥1 wave cần ≥ 108 × 13 = **1,404 blocks** (gpu_worker ≈ 1400)
+- NTAXA=800 template → smem được cấp cho worst-case dù N thực nhỏ hơn nhiều
+- Để tăng từ 13 → 16 blocks/SM (25% occ): cần cắt smem từ 11.584 → ≤ 10.25 KB (~1.3 KB)
+
+### ✅ K' < K: Build fewer trees in K1 — Opt-LessK1 (2026-05-17)
+
+**Insight**: `hybrid_cb` (callback sau K1) đã reseed **toàn bộ K slots** từ pool (Step 5:
+`for (k=0; k<Kc_full; k++)` với `Kc_full = mem->K`). K2 dùng `needs_recompute=1` path —
+không đọc K1 topology trực tiếp. K1 trees chỉ được dùng để chọn vào pool (Step 3).
+
+**Fix**: Chỉ build K'=max(pool_size, K×ratio) trees trong K1:
+```cpp
+// gpu_init_trees.cu: compute k1_trees before hybrid_cb
+int k1_trees = (k1_ratio <= 0.0f || k1_ratio >= 1.0f)
+               ? K : std::max(pool_size, (int)(K * k1_ratio));
+
+// hybrid_cb Step 2/3: dùng Kc_scores = k1_trees (only valid K1 results)
+const int Kc_scores = k1_trees;
+const int Kc_full   = cb_mem->K;  // Step 5: reseed ALL K
+
+// pars_build.cu K1 launch: dim3(k1_trees) thay vì dim3(K)
+buildParsimonyTreesKernel<S, NT><<<dim3(k1_trees), dim3(kWarpSize), 0, stream>>>(...);
+// K2 launch unchanged: dim3(K)
+```
+
+**Win-win effect**: K1 ngắn hơn → CPU builds ~50% more trees trong callback window →
+pool quality tốt hơn → K2 vừa nhanh hơn vừa tìm được cây tốt hơn.
+
+**Benchmark** (K=1000, pool=30, k1_ratio=0.2, 115 datasets per config):
+
+| Config (sprdist, stop) | speedup K'=K | speedup K'=0.2K | Δtotal | K1 Δ | GPU wins |
+|------------------------|-------------|-----------------|--------|------|---------|
+| d3, s10 | 8.04× | **10.11×** | +25.8% | −59.7% | 57→64/115 |
+| d4, s6  | 6.70× | **8.21×**  | +22.5% | −59.6% | 53→64/115 |
+| d4, s20 | 5.82× | **7.41×**  | +27.4% | −59.8% | 52→65/115 |
+| d5, s6  | 5.46× | **6.61×**  | +21.1% | −59.4% | 48→58/115 |
+| d6, s6  | 4.55× | **5.35×**  | +17.6% | −58.8% | 45→61/115 |
+
+**Files**: `tools.h/cpp` (gpu_k1_ratio field+parse), `pars_build.cuh` (k1_trees param),
+`pars_build.cu` (K1 launch `dim3(k1_trees)`, seeds sized to k1_trees),
+`gpu_init_trees.cu` (k1_trees compute, Kc_scores/Kc_full split in hybrid_cb).
+
+---
+
+### Fixed bugs (cumulative)
+
+| Bug | Status |
+|-----|--------|
+| #A `testInsert`: `vfNnxtFace(q,N)` → `vfNnxtFace(p,N)` (crash) | ✅ Fixed |
+| #B `sh.randomMP` uninitialized (wrong SPR threshold) | ✅ Fixed (use bestParsimony) |
+| #C Missing `__syncwarp()` in `createTiAndEvaluateParsimony` | ✅ Fixed |
+| #6 `__syncwarp;` missing `()` in SPR loop (race on nodep[]) | ✅ Fixed 2026-05-11 |
+| #7 `q_num >= N` in `doAddTraverse` (should be `> N`) | ✅ Fixed 2026-05-11 |
+| #8 `node_num >= N` in stepwise DFS (should be `> N`) | ✅ Fixed 2026-05-11 |
+
+### ✅ `gpuBootstrapSearch` → `gpuHillClimbing`: hợp nhất bootstrap và non-bootstrap (2026-05-19)
+
+**Vấn đề**: GPU non-bootstrap không có outer loop tương đương `doTreeSearch` của CPU — K2 chỉ chạy 1 lần.
+
+**Fix**: Đổi tên `gpuBootstrapSearch` → `gpuHillClimbing`; hàm nay xử lý cả hai mode:
+
+| | Bootstrap (`-bb`) | Non-bootstrap |
+|---|---|---|
+| Treels → | `saveCurrentTree()` (REPS weighted) | `candidateTrees.update()` |
+| Improvement signal | max `treels_logl` | `iqtree.bestScore` |
+| logl_cutoff update | ✓ | ✗ |
+| Correlation convergence | ✓ | ✗ |
+| Max iteration bound B | `gbo_replicates` | không giới hạn |
+| Stopping | `reps - last_impr > thresh \|\| reps > B` | `reps - last_impr > thresh` |
+
+**Stopping threshold**: `unsuccess_thresh = params.unsuccess_iteration + K * params.gpu_worker_stop`
+- `K * gpu_worker_stop` bù đắp cho K workers trong 1 round sinh ra K cây tương quan (không độc lập như CPU)
+
+**`mpbootGpu`** thay đổi:
+- `max_treels = K * 10` luôn (không còn điều kiện bootstrap)
+- `k2_max_outer = 0` luôn (skip K2 hoàn toàn, để `gpuHillClimbing` quản lý)
+- Xóa step [7] non-bootstrap (pool → candidateTrees nay nằm cuối `gpuHillClimbing`)
+
+**Caller** (`phyloanalysis.cpp`): `need_boot_loop` → `need_hc_loop = params.maximum_parsimony` (cả bootstrap lẫn non-bootstrap đều gọi `gpuHillClimbing`)
+
+### Open issues
+
+- **Build DFS off-by-one**: last inner node (2N-1) may have `back_vf[face[0]] = -1` after build.
+  No observable impact because `gpuNodeRectifierPars` DFS stops at leaves (vf < N check).
+
+---
+
+## 5. Key File Map
+
+| File | Purpose |
+|------|---------|
+| `gpu/src/gpu_init_trees.cu` | Entry point — calls `gpuStepwiseBuildTrees(sprDist)`, shows [5+6] timing |
+| `gpu/src/pars_build.cu` | **Main kernel**: build phase + SPR phase; all SPR device functions |
+| `gpu/src/gpu_spr.cu` | No-op stub for `gpuSprBuildTrees` (SPR is now in pars_build.cu) |
+| `gpu/src/pars_tree.cu` | Memory alloc, topology conversion, upload/download |
+| `gpu/include/pars_tree.cuh` | `BuildShared`, `GpuTopology`, template traversal functions |
+| `gpu/include/pars_build.cuh` | `gpuStepwiseBuildTrees(mem, seeds, sprDist, stream)` declaration |
+| `gpu/include/topo_helpers.cuh` | `vfToNum`, `nodepVf`, `vfNextFace`, `vfNnxtFace`, `gpuRandum` |
+| `mpboot/sprparsimony.cpp` | CPU reference: `_pllSprOnCurrentTree`, `rearrangeParsimony`, `testInsertParsimony` |

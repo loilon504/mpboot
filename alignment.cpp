@@ -420,7 +420,6 @@ Alignment::Alignment(char *filename, char *sequence_type, InputType &intype) : v
             readFasta(filename, sequence_type);
         } else if (intype == IN_PHYLIP) {
             cout << "Phylip format detected" << endl;
-            PROFILE_SCOPE("readPhylip");
             readPhylip(filename, sequence_type);
         } else {
             outError("Unknown sequence format, please use PHYLIP, FASTA, or NEXUS format");

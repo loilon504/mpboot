@@ -18,8 +18,13 @@ void resetGlobalParamOnNewAln(); // Diep 2021-12-28: This serves analysis compos
  */
 void _pllComputeRandomizedStepwiseAdditionParsimonyTree(pllInstance * tr, partitionList * partitions, int sprDist, IQTree *_iqtree);
 
-void _allocateParsimonyDataStructures(pllInstance *tr, partitionList *pr);
+void _allocateParsimonyDataStructures(pllInstance *tr, partitionList *pr, int perSiteScores = 0);
 void _pllFreeParsimonyDataStructures(pllInstance *tr, partitionList *pr);
+
+pllInstance*   pllInstanceClone(pllInstance* src);
+void           pllInstanceCloneFree(pllInstance* tr);
+partitionList* pllPartitionsClone(partitionList* src);
+void           pllPartitionsCloneFree(partitionList* pr);
 
 /**
  * DTH: optimize whatever tree is stored in tr by parsimony SPR

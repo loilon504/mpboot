@@ -34,6 +34,9 @@
 #include "nnisearch.h"
 #include "candidateset.h"
 
+// Forward declaration — avoids pulling in CUDA headers into every .cpp that includes iqtree.h
+namespace mpbootgpu { struct GpuBootstrapMem; }
+
 #define BOOT_VAL_FLOAT
 #define BootValType float
 //#define BootValType double
@@ -766,6 +769,9 @@ public:
 	vector<int> boot_tree_orig_logl;
 
 	bool iter_best;
+
+    // GPU-accelerated REPS evaluation (nullptr = CPU path, set when -use_gpu -bb)
+    mpbootgpu::GpuBootstrapMem* gpu_boot_mem_;
 
     /** corresponding RELL log-likelihood */
     DoubleVector boot_logl;

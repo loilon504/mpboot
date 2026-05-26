@@ -1,0 +1,364 @@
+#include <cassert>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "gpu/include/pars_tree.cuh"
+#include "gpu/include/utils.cuh"
+
+namespace mpbootgpu
+{
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+static inline int vface_of(
+    const pllInstance* tr, const nodeptr p
+)
+{
+    if (!p)
+    {
+        return -1;
+    }
+    return (int)(p - tr->nodeBaseAddress);
+}
+
+// ─── cpuToGpuTopology ─────────────────────────────────────────────────────────
+void cpuToGpuTopology(
+    const pllInstance* tr, GpuTopology* out
+)
+{
+    const int N = tr->mxtips;
+    const int num_vf = N + 3 * (N - 1);  // = 4N-3
+
+    assert(num_vf <= kMaxVFaces);
+
+    out->mxtips = N;
+    out->ntips = tr->ntips;
+    out->nextnode = tr->nextnode;
+    out->bestParsimony = tr->bestParsimony;
+    out->start_vface = vface_of(tr, tr->start);
+    out->num_vfaces = num_vf;
+    out->n_improved_even  = out->n_improved_odd = 0;
+    out->n_total_even     = out->n_total_odd    = 0;
+
+    const nodeptr base = tr->nodeBaseAddress;
+    for (int vf = 0; vf < num_vf; ++vf)
+    {
+        const nodeptr p = base + vf;
+        out->back_vf[vf] = vface_of(tr, p->back);
+        out->xpars[vf] = p->xPars;
+        // next_vf, nnxt_vf, number not stored — computed from arithmetic on download
+    }
+
+    // Init nodep[] and canonical xpars so all K slots are ready before any kernel runs.
+    // Tips are fixed: nodep[num] = num-1. Inner nodes use face[2] as canonical face.
+    for (int num = 1; num <= N; num++)
+        out->nodep[num] = num - 1;
+    for (int num = N + 1; num <= 2 * N - 1; num++)
+    {
+        int face2 = nodepVf(num, N);
+        out->nodep[num]      = face2;
+        out->xpars[face2]     = 1;
+        out->xpars[face2 - 1] = 0;
+        out->xpars[face2 - 2] = 0;
+    }
+}
+
+// ─── gpuTopoToCpu ─────────────────────────────────────────────────────────────
+void gpuTopoToCpu(
+    const GpuTopology* in, pllInstance* tr
+)
+{
+    nodeptr base = tr->nodeBaseAddress;
+    const int num_vf = in->num_vfaces;
+
+    for (int vf = 0; vf < num_vf; ++vf)
+    {
+        nodeptr p = base + vf;
+        p->back  = (in->back_vf[vf] >= 0) ? (base + in->back_vf[vf]) : nullptr;
+        p->next  = base + vfNextFace(vf, in->mxtips);
+        p->xPars = (char)in->xpars[vf];
+        // p->number and p->next->next are stable after PLL init — not stored on GPU
+    }
+
+    tr->ntips = in->ntips;
+    tr->nextnode = in->nextnode;
+    tr->bestParsimony = in->bestParsimony;
+    tr->start = (in->start_vface >= 0) ? (base + in->start_vface) : nullptr;
+    tr->insertNode = nullptr;
+}
+
+// ─── gpuParsimonyMemAlloc ─────────────────────────────────────────────────────
+GpuParsimonyMem* gpuParsimonyMemAlloc(
+    int K, int mxtips, int width, int states, int pool_size, int max_treels,
+    const unsigned int* cost_matrix, int nstates
+)
+{
+    auto* mem = new GpuParsimonyMem();
+    mem->K = K;
+    mem->mxtips = mxtips;
+    mem->width = width;
+    mem->states = states;
+    mem->pool_size = pool_size;
+    mem->d_cost_matrix = nullptr;
+    mem->nodesPerTree        = (size_t)(2 * mxtips + 1);
+    mem->parsVectPerTree     = mem->nodesPerTree * (size_t)width * (size_t)states;
+    mem->parsScorePerTree    = mem->nodesPerTree;
+
+    const bool use_sankoff = (cost_matrix != nullptr && nstates > 0);
+
+    // Site weights: Fitch uses them for ratchet; Sankoff uses them for pattern weights.
+    // Both modes allocate the same size (width elements per tree).
+    mem->siteWeightsPerTree = (size_t)width;
+
+    const size_t parsVectBytes      = (size_t)K * mem->parsVectPerTree  * sizeof(parsimonyNumber);
+    const size_t parsScoreBytes     = (size_t)K * mem->parsScorePerTree  * sizeof(unsigned int);
+    const size_t topoBytes          = (size_t)K * sizeof(GpuTopology);
+    const size_t siteWeightsBytes   = (size_t)K * mem->siteWeightsPerTree * sizeof(unsigned int);
+
+    size_t total_bytes = 0;
+
+    CUDA_CHECK(cudaMalloc(&mem->d_parsVect,    parsVectBytes));   total_bytes += parsVectBytes;
+    CUDA_CHECK(cudaMalloc(&mem->d_parsScore,   parsScoreBytes));  total_bytes += parsScoreBytes;
+    CUDA_CHECK(cudaMalloc(&mem->d_topos,       topoBytes));       total_bytes += topoBytes;
+    if (siteWeightsBytes > 0)
+    {
+        CUDA_CHECK(cudaMalloc(&mem->d_siteWeights, siteWeightsBytes));
+        total_bytes += siteWeightsBytes;
+    }
+    else
+    {
+        mem->d_siteWeights = nullptr;
+    }
+    mem->d_ratchetScratch = nullptr;
+    if (use_sankoff && siteWeightsBytes > 0)
+    {
+        CUDA_CHECK(cudaMalloc(&mem->d_ratchetScratch, siteWeightsBytes));
+        total_bytes += siteWeightsBytes;
+    }
+
+    // Upload cost matrix for Sankoff mode
+    if (use_sankoff)
+    {
+        const size_t costBytes = (size_t)nstates * nstates * sizeof(unsigned int);
+        CUDA_CHECK(cudaMalloc(&mem->d_cost_matrix, costBytes));
+        CUDA_CHECK(cudaMemcpy(mem->d_cost_matrix, cost_matrix, costBytes, cudaMemcpyHostToDevice));
+        total_bytes += costBytes;
+    }
+    const size_t postSprBytes = (size_t)K * sizeof(unsigned int);
+    CUDA_CHECK(cudaMalloc(&mem->d_postSprScores, postSprBytes));  total_bytes += postSprBytes;
+
+    // Pool for population-based hill-climbing restarts
+    const size_t poolScoreBytes = (size_t)pool_size * sizeof(unsigned int);
+    const size_t poolBackVfBytes = (size_t)pool_size * kMaxVFaces * sizeof(int);
+    CUDA_CHECK(cudaMalloc(&mem->d_poolScores, poolScoreBytes));   total_bytes += poolScoreBytes;
+    CUDA_CHECK(cudaMalloc(&mem->d_poolBackVf, poolBackVfBytes));  total_bytes += poolBackVfBytes;
+    // Init pool scores to UINT_MAX (empty)
+    CUDA_CHECK(cudaMemset(mem->d_poolScores, 0xFF, poolScoreBytes));
+
+    // Fill counter + per-slot spinlocks
+    const size_t poolLocksBytes = (size_t)pool_size * sizeof(int);
+    const size_t poolHashBytes  = (size_t)pool_size * sizeof(unsigned int);
+    CUDA_CHECK(cudaMalloc(&mem->d_poolFilled,    sizeof(int)));          total_bytes += sizeof(int);
+    CUDA_CHECK(cudaMalloc(&mem->d_poolSlotLocks, poolLocksBytes));       total_bytes += poolLocksBytes;
+    CUDA_CHECK(cudaMalloc(&mem->d_poolHashes,    poolHashBytes));        total_bytes += poolHashBytes;
+    CUDA_CHECK(cudaMalloc(&mem->d_globalBest,    sizeof(unsigned int))); total_bytes += sizeof(unsigned int);
+    int h_zero = 0;
+    unsigned int h_inf = 0xFFFFFFFFu;
+    CUDA_CHECK(cudaMemcpy(mem->d_poolFilled,  &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(mem->d_poolSlotLocks, 0, poolLocksBytes));
+    CUDA_CHECK(cudaMemset(mem->d_poolHashes, 0xFF, poolHashBytes));
+    CUDA_CHECK(cudaMemcpy(mem->d_globalBest,  &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
+
+    // Treels buffer (optional, for bootstrap round output)
+    mem->max_treels       = max_treels;
+    mem->d_treelsScores   = nullptr;
+    mem->d_treelsBackVf   = nullptr;
+    mem->d_treelsFilled   = nullptr;
+    mem->d_treelsCutoff   = nullptr;
+    if (max_treels > 0) {
+        const size_t treelsScoreBytes = (size_t)max_treels * sizeof(unsigned int);
+        const size_t treelsBackVfBytes = (size_t)max_treels * kMaxVFaces * sizeof(int);
+        CUDA_CHECK(cudaMalloc(&mem->d_treelsScores,  treelsScoreBytes));  total_bytes += treelsScoreBytes;
+        CUDA_CHECK(cudaMalloc(&mem->d_treelsBackVf,  treelsBackVfBytes)); total_bytes += treelsBackVfBytes;
+        CUDA_CHECK(cudaMalloc(&mem->d_treelsFilled,  sizeof(int)));       total_bytes += sizeof(int);
+        CUDA_CHECK(cudaMalloc(&mem->d_treelsCutoff,  sizeof(unsigned int))); total_bytes += sizeof(unsigned int);
+        CUDA_CHECK(cudaMemset(mem->d_treelsScores, 0xFF, treelsScoreBytes));
+        CUDA_CHECK(cudaMemcpy(mem->d_treelsFilled, &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(mem->d_treelsCutoff, &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
+    }
+
+    mem->total_gpu_bytes = total_bytes;
+
+    CUDA_CHECK(cudaMemset(mem->d_parsVect,    0, parsVectBytes));
+    CUDA_CHECK(cudaMemset(mem->d_parsScore,   0, parsScoreBytes));
+    // Init all site weights to 1 (normal, unweighted mode); skipped in Sankoff mode
+    if (mem->d_siteWeights)
+    {
+        unsigned int* h_sw = new unsigned int[(size_t)K * width];
+        for (size_t i = 0; i < (size_t)K * width; ++i) h_sw[i] = 1u;
+        CUDA_CHECK(cudaMemcpy(mem->d_siteWeights, h_sw, siteWeightsBytes, cudaMemcpyHostToDevice));
+        delete[] h_sw;
+    }
+
+    return mem;
+}
+
+void gpuParsimonyMemFree(
+    GpuParsimonyMem* mem
+)
+{
+    if (!mem)
+    {
+        return;
+    }
+    if (mem->d_parsVect)
+    {
+        cudaFree(mem->d_parsVect);
+    }
+    if (mem->d_parsScore)
+    {
+        cudaFree(mem->d_parsScore);
+    }
+    if (mem->d_topos)
+    {
+        cudaFree(mem->d_topos);
+    }
+    if (mem->d_siteWeights)
+    {
+        cudaFree(mem->d_siteWeights);
+    }
+    if (mem->d_ratchetScratch)
+    {
+        cudaFree(mem->d_ratchetScratch);
+    }
+    if (mem->d_postSprScores)
+    {
+        cudaFree(mem->d_postSprScores);
+    }
+    if (mem->d_poolScores)
+    {
+        cudaFree(mem->d_poolScores);
+    }
+    if (mem->d_poolBackVf)
+    {
+        cudaFree(mem->d_poolBackVf);
+    }
+    if (mem->d_poolFilled)     cudaFree(mem->d_poolFilled);
+    if (mem->d_poolSlotLocks)  cudaFree(mem->d_poolSlotLocks);
+    if (mem->d_poolHashes)     cudaFree(mem->d_poolHashes);
+    if (mem->d_globalBest)     cudaFree(mem->d_globalBest);
+    if (mem->d_cost_matrix)    cudaFree(mem->d_cost_matrix);
+    if (mem->d_treelsScores)   cudaFree(mem->d_treelsScores);
+    if (mem->d_treelsBackVf)   cudaFree(mem->d_treelsBackVf);
+    if (mem->d_treelsFilled)   cudaFree(mem->d_treelsFilled);
+    if (mem->d_treelsCutoff)   cudaFree(mem->d_treelsCutoff);
+    delete mem;
+}
+
+// ─── resetTreelsRound ────────────────────────────────────────────────────────
+void resetTreelsRound(GpuParsimonyMem* mem, unsigned int cutoff_pars)
+{
+    if (!mem->d_treelsFilled) return;
+    int h_zero = 0;
+    CUDA_CHECK(cudaMemcpy(mem->d_treelsFilled, &h_zero,     sizeof(int),          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(mem->d_treelsCutoff, &cutoff_pars, sizeof(unsigned int), cudaMemcpyHostToDevice));
+}
+
+// ─── uploadTipParsVect ────────────────────────────────────────────────────────
+// Fitch mode only (Sankoff handled by uploadSankoffTipParsVect in gpu_init_trees.cu).
+// CPU layout per node: [state][block]  stride = parsimonyLength (= width)
+// GPU layout per node: [state][block]  — same → direct memcpy, no reorder needed
+void uploadTipParsVect(
+    GpuParsimonyMem* mem, const pllInstance* tr, const partitionList* pr, cudaStream_t stream
+)
+{
+    const int N = mem->mxtips;
+    const int width = mem->width;
+    const int states = mem->states;
+    const size_t parsVT = mem->parsVectPerTree;  // elements per tree
+
+    // Build one host buffer for a single tree, then broadcast to all K.
+    std::vector<parsimonyNumber> h_buf(parsVT, 0);
+
+    // Only partition 0 for now (single-partition case).
+    const parsimonyNumber* cpu_pars = pr->partitionData[0]->parsVect;
+
+    // Fitch: CPU and GPU both use [node][state][block] → direct memcpy
+    const int parsimonyLength = width;
+    for (int tipNum = 1; tipNum <= N; ++tipNum)
+    {
+        memcpy(
+            &h_buf[(size_t)tipNum * parsimonyLength * states],
+            cpu_pars + (size_t)tipNum * parsimonyLength * states,
+            (size_t)parsimonyLength * states * sizeof(parsimonyNumber)
+        );
+    }
+
+    // Upload the same tip data into every tree slot.
+    for (int k = 0; k < mem->K; ++k)
+    {
+        parsimonyNumber* dst = mem->d_parsVect + (size_t)k * parsVT;
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst, h_buf.data(), parsVT * sizeof(parsimonyNumber), cudaMemcpyHostToDevice, stream
+        ));
+    }
+}
+
+// ─── Topology upload / download ───────────────────────────────────────────────
+void uploadTopology(
+    GpuParsimonyMem* mem, int k, const GpuTopology* h_topo, cudaStream_t stream
+)
+{
+    GpuTopology* dst = mem->d_topos + k;
+    CUDA_CHECK(cudaMemcpyAsync(dst, h_topo, sizeof(GpuTopology), cudaMemcpyHostToDevice, stream));
+}
+
+void downloadTopology(
+    const GpuParsimonyMem* mem, int k, GpuTopology* h_out, cudaStream_t stream
+)
+{
+    const GpuTopology* src = mem->d_topos + k;
+    CUDA_CHECK(cudaMemcpyAsync(h_out, src, sizeof(GpuTopology), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void downloadParsScore(
+    const GpuParsimonyMem* mem, int k, unsigned int* h_out, cudaStream_t stream
+)
+{
+    const unsigned int* src = mem->d_parsScore + (size_t)k * mem->parsScorePerTree;
+    const size_t count = mem->parsScorePerTree;
+    CUDA_CHECK(
+        cudaMemcpyAsync(h_out, src, count * sizeof(unsigned int), cudaMemcpyDeviceToHost, stream)
+    );
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+// ─── Pool helpers ─────────────────────────────────────────────────────────────
+
+void downloadPoolScores(const GpuParsimonyMem* mem, unsigned int* h_out)
+{
+    CUDA_CHECK(cudaMemcpy(
+        h_out, mem->d_poolScores,
+        (size_t)mem->pool_size * sizeof(unsigned int),
+        cudaMemcpyDeviceToHost
+    ));
+}
+
+void downloadPoolBackVf(const GpuParsimonyMem* mem, int slot, int* h_back_vf)
+{
+    const int* src = mem->d_poolBackVf + (size_t)slot * kMaxVFaces;
+    CUDA_CHECK(cudaMemcpy(
+        h_back_vf, src,
+        (size_t)kMaxVFaces * sizeof(int),
+        cudaMemcpyDeviceToHost
+    ));
+}
+
+void resetPoolRound(GpuParsimonyMem* mem)
+{
+    CUDA_CHECK(cudaMemset(mem->d_poolHashes, 0xFF, (size_t)mem->pool_size * sizeof(unsigned int)));
+}
+
+}  // namespace mpbootgpu
