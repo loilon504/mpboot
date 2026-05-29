@@ -436,6 +436,13 @@ BootValTypePars * IQTree::getPatternPars(){
 	return _pattern_pars;
 }
 
+void IQTree::gpuSetPatternPars(const BootValTypePars* src, int nptn) {
+    if (!_pattern_pars)
+        _pattern_pars = aligned_alloc<BootValTypePars>(nptn + 16);
+    memcpy(_pattern_pars, src, (size_t)nptn * sizeof(BootValTypePars));
+}
+
+
 IQTree::~IQTree() {
     //if (bonus_values)
     //delete bonus_values;
@@ -3317,14 +3324,19 @@ void IQTree::saveCurrentTree(double cur_logl) {
     string tree_str;
     StringIntMap::iterator it = treels.end();
     if (params->store_candidate_trees) {
-    	if(params->spr_parsimony && !(params->ratchet_iter >= 0 && on_ratchet_hclimb1 && params->hclimb1_nni)){
-			pllTreeToNewick(pllInst->tree_string, pllInst, pllPartitions, pllInst->start->back, PLL_TRUE, PLL_TRUE, 0, 0, 0, PLL_SUMMARIZE_LH, 0, 0);
-			string imd_tree = string(pllInst->tree_string);
-			readTreeString(imd_tree);
-    	}
-
-        printTree(ostr, WT_TAXON_ID | WT_SORT_TAXA);
-        tree_str = ostr.str();
+        if (!_gpu_newick_key.empty()) {
+            // GPU fast path: use pllTreeToNewick output directly as treels key.
+            // Skips readTreeString + printTree (topology already in pllInst via gpuTopoToCpu).
+            tree_str = _gpu_newick_key;
+        } else {
+    	    if(params->spr_parsimony && !(params->ratchet_iter >= 0 && on_ratchet_hclimb1 && params->hclimb1_nni)){
+			    pllTreeToNewick(pllInst->tree_string, pllInst, pllPartitions, pllInst->start->back, PLL_TRUE, PLL_TRUE, 0, 0, 0, PLL_SUMMARIZE_LH, 0, 0);
+			    string imd_tree = string(pllInst->tree_string);
+			    readTreeString(imd_tree);
+    	    }
+            printTree(ostr, WT_TAXON_ID | WT_SORT_TAXA);
+            tree_str = ostr.str();
+        }
         it = treels.find(tree_str);
     }
     int tree_index = -1;
@@ -3379,7 +3391,9 @@ void IQTree::saveCurrentTree(double cur_logl) {
 	if (params->maximum_parsimony){
 		if(params->spr_parsimony && !(params->ratchet_iter >= 0 && on_ratchet_hclimb1 && params->hclimb1_nni)){
 			int test_pars = 0;
-			pllComputePatternParsimony(pllInst, pllPartitions, _pattern_pars, &test_pars);
+			{ auto _t0 = std::chrono::high_resolution_clock::now();
+			  pllComputePatternParsimony(pllInst, pllPartitions, _pattern_pars, &test_pars);
+			  _gpu_t_pp += std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-_t0).count(); }
 			if(!on_ratchet_hclimb1 && test_pars != -int(cur_logl))
 				outError("WRONG pllComputeSiteParsimony: sum of site parsimony is different from alignment parsimony");
 		}
@@ -3425,19 +3439,27 @@ void IQTree::saveCurrentTree(double cur_logl) {
         int updated = 0;
         int nsamples = (params->maximum_parsimony) ? boot_samples_pars.size() : boot_samples.size();
 
-        // GPU REPS path: evaluate all B replicates in parallel before the sample loop
-        if (gpu_boot_mem_ != nullptr && params->maximum_parsimony && _pattern_pars != nullptr) {
+        // GPU REPS path: evaluate all B replicates in parallel before the sample loop.
+        // Skipped when _gpu_precomputed_rell is set (batch REPS already done externally).
+        if (gpu_boot_mem_ != nullptr && params->maximum_parsimony && _pattern_pars != nullptr
+            && _gpu_precomputed_rell == nullptr) {
+            auto _t0 = std::chrono::high_resolution_clock::now();
             mpbootgpu::gpuREPSEval(gpu_boot_mem_, _pattern_pars);
+            _gpu_t_reps += std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-_t0).count();
         }
 
+        auto _t_bupdate = std::chrono::high_resolution_clock::now();
         for (int sample = 0; sample < nsamples; sample++) {
             double rell = 0.0;
             bool skipped = false;
 
 			if (params->maximum_parsimony) {
-				// --- GPU REPS: use pre-computed h_rell ---
+				// --- GPU REPS: use pre-computed rell (batch or per-tree) ---
 				if (gpu_boot_mem_ != nullptr && _pattern_pars != nullptr) {
-					rell = -(double)gpu_boot_mem_->h_rell[sample];
+					const int* rell_buf = (_gpu_precomputed_rell != nullptr)
+					                       ? _gpu_precomputed_rell
+					                       : gpu_boot_mem_->h_rell;
+					rell = -(double)rell_buf[sample];
 				} else {
 				BootValTypePars *boot_sample = boot_samples_pars[sample];
 
@@ -3758,6 +3780,7 @@ void IQTree::saveCurrentTree(double cur_logl) {
 				}
 			}
         }
+        _gpu_t_bupdate += std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-_t_bupdate).count();
         if (updated && verbose_mode >= VB_MAX)
             cout << updated << " boot trees updated" << endl;
 

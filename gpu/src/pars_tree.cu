@@ -176,13 +176,16 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
     mem->d_treelsBackVf   = nullptr;
     mem->d_treelsFilled   = nullptr;
     mem->d_treelsCutoff   = nullptr;
+    mem->d_treelsHashes   = nullptr;
     if (max_treels > 0) {
         const size_t treelsScoreBytes = (size_t)max_treels * sizeof(unsigned int);
         const size_t treelsBackVfBytes = (size_t)max_treels * kMaxVFaces * sizeof(int);
+        const size_t treelsHashBytes  = (size_t)max_treels * sizeof(unsigned int);
         CUDA_CHECK(cudaMalloc(&mem->d_treelsScores,  treelsScoreBytes));  total_bytes += treelsScoreBytes;
         CUDA_CHECK(cudaMalloc(&mem->d_treelsBackVf,  treelsBackVfBytes)); total_bytes += treelsBackVfBytes;
         CUDA_CHECK(cudaMalloc(&mem->d_treelsFilled,  sizeof(int)));       total_bytes += sizeof(int);
         CUDA_CHECK(cudaMalloc(&mem->d_treelsCutoff,  sizeof(unsigned int))); total_bytes += sizeof(unsigned int);
+        CUDA_CHECK(cudaMalloc(&mem->d_treelsHashes,  treelsHashBytes));   total_bytes += treelsHashBytes;
         CUDA_CHECK(cudaMemset(mem->d_treelsScores, 0xFF, treelsScoreBytes));
         CUDA_CHECK(cudaMemcpy(mem->d_treelsFilled, &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(mem->d_treelsCutoff, &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
@@ -253,6 +256,7 @@ void gpuParsimonyMemFree(
     if (mem->d_treelsBackVf)   cudaFree(mem->d_treelsBackVf);
     if (mem->d_treelsFilled)   cudaFree(mem->d_treelsFilled);
     if (mem->d_treelsCutoff)   cudaFree(mem->d_treelsCutoff);
+    if (mem->d_treelsHashes)   cudaFree(mem->d_treelsHashes);
     delete mem;
 }
 

@@ -296,7 +296,8 @@ __device__ void gpuSPRHillClimb(
     int*          treels_back_vf = nullptr,
     int*          treels_filled  = nullptr,
     unsigned int* treels_cutoff  = nullptr,
-    int           max_treels     = 0
+    int           max_treels     = 0,
+    unsigned int* treels_hashes  = nullptr
 )
 {
     int* const back_vf = topo->back_vf;
@@ -536,6 +537,14 @@ __device__ void gpuSPRHillClimb(
                 int* dst = treels_back_vf + (size_t)sh.bcast[6] * kMaxVFaces;
                 for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
                     dst[vf] = topo->back_vf[vf];
+                // Compute topology hash (lane 0) for dedup on CPU
+                if (lane == 0 && treels_hashes != nullptr)
+                {
+                    unsigned int h = 0;
+                    for (int vf = 0; vf < topo->num_vfaces; vf++)
+                        h = h * 2654435761u ^ (unsigned int)topo->back_vf[vf];
+                    treels_hashes[sh.bcast[6]] = h;
+                }
                 __syncwarp();
                 if (sh.bcast[9] < 0)
                 {
@@ -659,7 +668,8 @@ __device__ void runPhase3(
     int*   treels_back_vf,        // [max_treels × kMaxVFaces] or nullptr
     int*   treels_filled,         // atomic fill counter or nullptr
     unsigned int* treels_cutoff,  // score ≤ cutoff → write to treels; nullptr = disabled
-    int    max_treels             // treels buffer capacity
+    int    max_treels,            // treels buffer capacity
+    unsigned int* treels_hashes   // [max_treels] topology hash per slot; nullptr = disabled
 )
 {
     // ── Step 1: Pool restart — random slot in [0, pool_size) ─────────────────
@@ -738,7 +748,7 @@ __device__ void runPhase3(
         __syncwarp();
 
         gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane,
-            treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels);
+            treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels, treels_hashes);
     }
     else
     {
@@ -773,7 +783,7 @@ __device__ void runPhase3(
         __syncwarp();
 
         gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane,
-            treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels);
+            treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels, treels_hashes);
 
         if (lane == 0)
             sh.site_weights = sh.use_sankoff ? sw_k : nullptr;  // restore original weights
@@ -790,7 +800,7 @@ __device__ void runPhase3(
         __syncwarp();
 
         gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane,
-            treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels);
+            treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels, treels_hashes);
     }
 
     // ── Step 3: Stagnation tracking + pool insert with hash dedup ────────────
@@ -933,6 +943,14 @@ __device__ void runPhase3(
             int* dst = treels_back_vf + (size_t)sh.bcast[6] * kMaxVFaces;
             for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
                 dst[vf] = topo->back_vf[vf];
+            // Compute topology hash (lane 0) and store alongside back_vf
+            if (lane == 0 && treels_hashes != nullptr)
+            {
+                unsigned int h = 0;
+                for (int vf = 0; vf < topo->num_vfaces; vf++)
+                    h = h * 2654435761u ^ (unsigned int)topo->back_vf[vf];
+                treels_hashes[sh.bcast[6]] = h;
+            }
             __syncwarp();
         }
         __syncwarp();
@@ -1161,6 +1179,7 @@ __global__ void buildPhase3Kernel(
     int*   treels_filled,
     unsigned int* treels_cutoff,
     int    max_treels,
+    unsigned int* treels_hashes,       // [max_treels] topology hash per slot; nullptr = disabled
     const unsigned int* d_cost_matrix  // nullptr = Fitch mode
 )
 {
@@ -1194,7 +1213,8 @@ __global__ void buildPhase3Kernel(
     runPhase3<STATES>(
         pars_tree, score_tree, topo, sh, sw_k, ratchet_k, N, sprDist, numNNI, lane, k, width,
         pool_size, pool_scores, pool_back_vf, pool_filled, pool_slot_locks, pool_hashes,
-        global_best, treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels
+        global_best, treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels,
+        treels_hashes
     );
 }
 
@@ -1320,7 +1340,7 @@ void gpuStepwiseBuildTrees(
             mem->d_poolScores, mem->d_poolBackVf, mem->d_poolFilled, mem->d_poolSlotLocks,
             mem->d_poolHashes, mem->d_globalBest,
             mem->d_treelsScores, mem->d_treelsBackVf, mem->d_treelsFilled,
-            mem->d_treelsCutoff, mem->max_treels,
+            mem->d_treelsCutoff, mem->max_treels, mem->d_treelsHashes,
             mem->d_cost_matrix
         );
         cudaEventRecord(k2_end, stream);

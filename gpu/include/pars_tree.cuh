@@ -74,7 +74,7 @@ struct GpuTopology
 // CPU layout (Fitch): [node][state][block]  — same → direct memcpy on upload
 struct GpuParsimonyMem
 {
-    parsimonyNumber* d_parsVect;  // [K][2N+1][width][states]
+    parsimonyNumber* d_parsVect;  // [K][2N+1][states][width] i.e. [node][state][block]
     unsigned int* d_parsScore;    // [K][2N+1]
     GpuTopology* d_topos;         // [K] topology per tree (global mem)
     unsigned int* d_siteWeights;  // [K][width] per-block weights; 1=normal, 2=ratchet-doubled
@@ -96,6 +96,7 @@ struct GpuParsimonyMem
     int*   d_treelsBackVf;          // [max_treels × kMaxVFaces] back_vf snapshots
     int*   d_treelsFilled;          // atomic fill counter (0..max_treels)
     unsigned int* d_treelsCutoff;   // score ≤ cutoff → write to treels (UINT_MAX = all qualify)
+    unsigned int* d_treelsHashes;   // [max_treels] topology hash per slot (Knuth over back_vf)
 
     int K;  // number of trees
     int mxtips;
@@ -206,7 +207,7 @@ void gpuParsimonyMemFree(GpuParsimonyMem* mem);
 void resetTreelsRound(GpuParsimonyMem* mem, unsigned int cutoff_pars);
 
 // Upload tip parsVect for ALL K trees (shared; tips are read-only).
-// Reorders from CPU [node][state][block] → GPU [node][block][state].
+// CPU and GPU both use [node][state][block] layout → direct memcpy, no reorder needed.
 // pr must be the pllInstance whose compressDNA has already been called.
 void uploadTipParsVect(
     GpuParsimonyMem* mem, const pllInstance* tr, const partitionList* pr, cudaStream_t stream = 0

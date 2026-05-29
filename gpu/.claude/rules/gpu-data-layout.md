@@ -38,12 +38,12 @@ Concrete operations:
 
 ### parsVect layout
 
-GPU stores parsVect as `d_parsVect[K][2N+1][width][states]` (C order):
+Both CPU and GPU use `[node][state][block]` layout:
 ```
-index = k * parsVectPerTree + node * width * states + block * states + state
+index = k * parsVectPerTree + node * width * states + state * width + block
 ```
-CPU stores as `parsVect[node][state][block]` — **reordering required on upload**.
-`uploadTipParsVect` handles this transposition via `reorderParsVect`.
+Direct `memcpy` from CPU to GPU — no reordering needed. `uploadTipParsVect` copies tip
+parsVect directly without transposition.
 
 ### score_tree
 
