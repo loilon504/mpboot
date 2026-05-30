@@ -1045,3 +1045,104 @@ Allocation là upfront cho 100,000 trees nhưng chỉ dùng 7,000–25,000/round
 - **Protein nhỏ (50–88T)**: cải thiện vs GPU cũ chỉ 1.2–1.9× vì ít treels/round, ít tiết kiệm
 - **prot_M8175 194T**: GPU cũ còn CHẬM HƠN CPU (147s vs 103s!) → GPU mới sửa được: 14.6s (**10× vs GPU cũ**)
 - **Protein lớn hơn (137–194T)**: cải thiện rõ hơn (3.3–10×) do có nhiều treels hơn
+
+---
+
+## Q: Tại sao gpuComputeTreelsPatternPars và gpuBatchREPSEval có thể hoạt động đồng thời? Phân tích nsys/ncu thực tế
+
+**Date**: 2026-05-29  
+**Dataset**: `dna_M1110_330_1711.phy` (N=330, bb=1000, gpu_worker=200)  
+**Tool**: `nsys profile --trace=cuda` + `ncu --metrics gpu__time_duration.sum,...`  
+**Output**: `build/output/profiling/nsys_pipeline.nsys-rep`, `ncu_kernels.ncu-rep`
+
+### Phát hiện 1: Không dùng null stream nữa (sau fix 2026-05-29)
+
+Trước khi fix, `gpuBatchREPSEval` dùng **null stream (stream 0)**:
+- `cudaMemcpy H→D` (blocking, null stream)
+- `batchREPSKernel<<<grid,32>>>` (null stream)
+- `cudaMemcpy D→H` (blocking, null stream)
+
+Null stream (legacy) là **implicit sync barrier**: mọi operation trên null stream phải đợi TẤT CẢ non-default streams hoàn thành trước. Nghĩa là ppars (stream non-default) phải xong trước khi REPS H→D bắt đầu → không overlap.
+
+**Fix**: Thêm `stream_reps` (non-default):
+```cpp
+// gpu_init_trees.cu: tạo 2 streams riêng
+cudaStream_t stream, stream_reps;
+cudaStreamCreate(&stream);       // stream 20: K2 + ppars
+cudaStreamCreate(&stream_reps);  // stream 21: REPS H→D + kernel + D→H
+
+// pars_bootstrap.cu: dùng cudaMemcpyAsync + stream
+cudaMemcpyAsync(d_batch_pars, h_batch_pars, ..., stream);
+batchREPSKernel<<<grid, 32, 0, stream>>>(...);
+cudaMemcpyAsync(h_batch_rell, d_batch_rell, ..., stream);
+cudaStreamSynchronize(stream);  // host vẫn block, nhưng stream 20 không bị chặn
+```
+
+### Phát hiện 2: nsys kernel timeline (dna_M1110 N=330)
+
+Từ SQLite query trên `nsys_pipeline.nsys-rep`:
+
+| Kernel | Stream | Instances | Avg duration | Total |
+|--------|--------|-----------|-------------|-------|
+| `buildPhase3Kernel` (K2) | stream 20 | 6 | **1733ms** | 10401ms |
+| `treelsPatternParsKernel` (ppars) | stream 20 | 365 | **0.98ms** | 357ms |
+| `batchREPSKernel` (REPS) | stream 21 | 3 | **60ms** | 180ms |
+| `buildParsimonyTreesKernel` (K1) | stream 7 | 1 | 2192ms | 2192ms |
+
+**Xác nhận**: ppars = stream 20, REPS = stream 21 ✅ — không còn null stream conflict.
+
+### Phát hiện 3: Timeline chi tiết 1 round (từ nsys absolute timestamps)
+
+```
+t=0ms       K2[N] khởi động (stream 20, 1750ms)
+t=0ms       PASS1[N-1] bắt đầu (CPU, 6100ms) — concurrent với K2
+t=1750ms    K2[N] kết thúc
+t=1750ms    ppars[N] bắt đầu (stream 20, 365 batches × 1ms = 365ms tổng)
+t=2115ms    ppars[N] kết thúc
+             --- GPU IDLE: ~4000ms ---  ← PASS1 vẫn đang chạy
+t=6100ms    PASS1[N-1] kết thúc
+t=6100ms    REPS H→D bắt đầu (stream 21, 8ms, 86MB)
+t=6108ms    batchREPSKernel bắt đầu (stream 21, 87ms)
+t=6195ms    REPS D→H (stream 21, 5ms, 111MB)
+t=6200ms    PASS2: saveCurrentTree loop (CPU, 570ms)
+t=6770ms    D→H treels data (stream 7, 60ms, 366MB)
+t=7100ms    Round kết thúc → K2[N+1] khởi động
+```
+
+**Round total: 7100ms** vs sequential 8930ms → **+21% speedup từ async**
+
+### Phát hiện 4: Overlap 2 (ppars ∥ REPS) KHÔNG xảy ra trong thực tế
+
+ppars[N] kết thúc t=2115ms, REPS[N-1] bắt đầu t=6100ms → **khoảng cách 4s**.
+
+Lý do: PASS1 (6100ms) dominate pipeline. ppars xong từ lâu trước khi PASS1 xong và REPS bắt đầu.
+
+**Overlap 1 (K2 ∥ PASS1) là overlap thật duy nhất** — tiết kiệm 1750ms/round (K2 che được 28% PASS1).
+
+**Overlap 2 (ppars ∥ REPS) nominal** — stream separation đúng về kiến trúc (không còn null stream barrier), nhưng không tiết kiệm thời gian thực tế cho dataset lớn vì PASS1 dominate.
+
+### Phát hiện 5: GPU Utilization từ ncu (A100 CC 8.0)
+
+Dataset: `dna_M8984_201_3931.phy` (N=201, bb=1000)
+
+| Kernel | SM throughput | DRAM throughput | Warp occupancy |
+|--------|-------------|-----------------|----------------|
+| K2 `buildPhase3Kernel` | **3.9%** | 0.1% | 2.8% |
+| ppars `treelsPatternParsKernel` | **5.2%** | 4.6% | 2.9% |
+| REPS `batchREPSKernel` | **24.6%** | **45.5%** | 49.3% |
+
+**K2 và ppars severely underutilized**: design 1 warp/tree (32 threads/block), A100 có 108 SMs × 64 warps/SM = 6912 warps. Với 200 workers chỉ có 200 warps active → 200/6912 = 2.9% lý thuyết. Không thể tăng occupancy vì thuật toán warp-per-tree.
+
+**REPS tốt nhất**: DRAM-bound (45.5%) do đọc `boot_samples[1000×nunit]` cho mỗi tree. Grid = T×B blocks cho phép nhiều blocks hơn → warp occupancy 49.3%.
+
+### Bottleneck thực sự
+
+```
+PASS1 (CPU): 6100ms = 86% của round time
+K2 (GPU):    1750ms = 25% (được che bởi PASS1)
+ppars (GPU):  365ms =  5% (chạy sau K2, không che được gì)
+REPS (GPU):    87ms =  1%
+PASS2 (CPU):  570ms =  8%
+```
+
+**Để tăng tốc thêm cần giảm PASS1**: hiện tại gpuTopoToCpu + pllTreeToNewick + hash dedup cho ~28000 trees/round là bottleneck chính. GPU idle 4s/round sau ppars.

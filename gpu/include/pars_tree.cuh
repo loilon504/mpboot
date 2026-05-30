@@ -204,7 +204,7 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(int K, int mxtips, int width, int states,
 void gpuParsimonyMemFree(GpuParsimonyMem* mem);
 
 // Reset treels buffer and set new cutoff threshold (call before each K2 bootstrap round).
-void resetTreelsRound(GpuParsimonyMem* mem, unsigned int cutoff_pars);
+void resetTreelsRound(GpuParsimonyMem* mem, unsigned int cutoff_pars, cudaStream_t stream);
 
 // Upload tip parsVect for ALL K trees (shared; tips are read-only).
 // CPU and GPU both use [node][state][block] layout → direct memcpy, no reorder needed.
@@ -239,7 +239,7 @@ void downloadPoolBackVf(
 );
 
 // Reset pool topology hashes to 0xFFFFFFFF (call before each K2 bootstrap round).
-void resetPoolRound(GpuParsimonyMem* mem);
+void resetPoolRound(GpuParsimonyMem* mem, cudaStream_t stream);
 
 // ─── Validation kernel (Phase 1 test) ─────────────────────────────────────────
 // Runs newview for all (p,q,r) triples in h_ti[0..tiCount-1]

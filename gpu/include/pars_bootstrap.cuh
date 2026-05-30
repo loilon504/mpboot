@@ -1,5 +1,6 @@
 #pragma once
 #include <vector>
+#include <cuda_runtime_api.h>
 
 namespace mpbootgpu
 {
@@ -47,9 +48,12 @@ void gpuBatchREPSInit(GpuBootstrapMem* mem, int max_batch);
 
 // Batch REPS: compute scores for T trees × B replicates in one kernel launch.
 //   h_batch_pars: CPU buffer [T × nunit] — pattern_pars for each tree (row-major).
+//   stream: CUDA stream to use; defaults to null stream. Pass a dedicated non-default
+//           stream to allow overlap with kernels running on other streams (e.g. ppars).
 //   On return, mem->h_batch_rell[t * B + i] = REPS score for tree t, replicate i.
-// Synchronous.
+// Synchronous from the caller's perspective (cudaStreamSynchronize called internally).
 void gpuBatchREPSEval(GpuBootstrapMem* mem,
-                      const unsigned short* h_batch_pars, int T);
+                      const unsigned short* h_batch_pars, int T,
+                      cudaStream_t stream = 0);
 
 }  // namespace mpbootgpu

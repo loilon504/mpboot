@@ -129,21 +129,22 @@ void gpuBootstrapMemFree(GpuBootstrapMem* mem)
 }
 
 void gpuBatchREPSEval(GpuBootstrapMem* mem,
-                      const unsigned short* h_batch_pars, int T)
+                      const unsigned short* h_batch_pars, int T,
+                      cudaStream_t stream)
 {
     if (T <= 0 || !mem->d_batch_pars) return;
 
     // Upload compacted pattern_pars for all T trees
-    CUDA_CHECK(cudaMemcpy(
+    CUDA_CHECK(cudaMemcpyAsync(
         mem->d_batch_pars, h_batch_pars,
         (size_t)T * mem->nunit * sizeof(unsigned short),
-        cudaMemcpyHostToDevice
+        cudaMemcpyHostToDevice, stream
     ));
 
     // Launch: one warp per (tree, replicate) pair
     // gridDim.x=T (limit 2^31-1), gridDim.y=B (limit 65535) — avoids gridDim.y overflow
     dim3 grid(T, mem->B);
-    batchREPSKernel<<<grid, 32>>>(
+    batchREPSKernel<<<grid, 32, 0, stream>>>(
         mem->d_batch_pars,
         mem->d_boot_samples,
         mem->d_batch_rell,
@@ -151,12 +152,15 @@ void gpuBatchREPSEval(GpuBootstrapMem* mem,
     );
     CUDA_CHECK(cudaGetLastError());
 
-    // Download all T × B scores
-    CUDA_CHECK(cudaMemcpy(
+    // Download all T × B scores (h_batch_rell is pinned — true async DMA)
+    CUDA_CHECK(cudaMemcpyAsync(
         mem->h_batch_rell, mem->d_batch_rell,
         (size_t)T * mem->B * sizeof(int),
-        cudaMemcpyDeviceToHost
+        cudaMemcpyDeviceToHost, stream
     ));
+
+    // Block host until h_batch_rell is ready for CPU consumption
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 void gpuUploadBootSamples(

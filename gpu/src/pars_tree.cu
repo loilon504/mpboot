@@ -261,12 +261,15 @@ void gpuParsimonyMemFree(
 }
 
 // ─── resetTreelsRound ────────────────────────────────────────────────────────
-void resetTreelsRound(GpuParsimonyMem* mem, unsigned int cutoff_pars)
+void resetTreelsRound(GpuParsimonyMem* mem, unsigned int cutoff_pars, cudaStream_t stream)
 {
     if (!mem->d_treelsFilled) return;
-    int h_zero = 0;
-    CUDA_CHECK(cudaMemcpy(mem->d_treelsFilled, &h_zero,     sizeof(int),          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(mem->d_treelsCutoff, &cutoff_pars, sizeof(unsigned int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemsetAsync(mem->d_treelsFilled, 0, sizeof(int), stream));
+    // Synchronous copy for cutoff: source is a stack variable (non-pinned).
+    // cudaMemcpyAsync from non-pinned host memory is undefined; cudaMemcpy is safe.
+    // 4 bytes: negligible overhead.
+    CUDA_CHECK(cudaMemcpy(mem->d_treelsCutoff, &cutoff_pars, sizeof(unsigned int),
+                          cudaMemcpyHostToDevice));
 }
 
 // ─── uploadTipParsVect ────────────────────────────────────────────────────────
@@ -360,9 +363,10 @@ void downloadPoolBackVf(const GpuParsimonyMem* mem, int slot, int* h_back_vf)
     ));
 }
 
-void resetPoolRound(GpuParsimonyMem* mem)
+void resetPoolRound(GpuParsimonyMem* mem, cudaStream_t stream)
 {
-    CUDA_CHECK(cudaMemset(mem->d_poolHashes, 0xFF, (size_t)mem->pool_size * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemsetAsync(mem->d_poolHashes, 0xFF,
+                               (size_t)mem->pool_size * sizeof(unsigned int), stream));
 }
 
 }  // namespace mpbootgpu
