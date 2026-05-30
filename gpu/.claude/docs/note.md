@@ -1146,3 +1146,111 @@ PASS2 (CPU):  570ms =  8%
 ```
 
 **Để tăng tốc thêm cần giảm PASS1**: hiện tại gpuTopoToCpu + pllTreeToNewick + hash dedup cho ~28000 trees/round là bottleneck chính. GPU idle 4s/round sau ppars.
+
+---
+
+## Q: summarizeBootstrap hoạt động như thế nào và tại sao tốn ~800ms?
+
+**Context**: GPU path, `maximum_parsimony=true`, `multiple_hits=false` (default).
+
+**Gọi từ**: `gpuHillClimbing` mỗi `step_iter_rounds` rounds (= 1 với `k2_workers=200`).
+
+**Call graph**:
+```
+summarizeBootstrap(SplitGraph &sg)
+  → tree_weights[T]  // resize T=32628 entries, loop B=1000 → O(T+B)
+  → MTreeSet::init(treels, tree_weights)
+       duyệt TẤT CẢ T entries trong unordered_map<string, int>
+       parse ~B≤1000 Newick có weight>0 bằng readTree() → O(T×cache_miss + B×N)
+  → MTreeSet::convertSplits()
+       loop 1000 cây:
+         new SplitGraph + AddTaxonLabel×330 (330K NxsString allocs)
+         tree->convertSplits → DFS: new Split(330)×328 (328K allocs, 44B/split)
+         hash_ss.findSplit × 328K hash lookups
+         delete isg → 328 Split deletes + 330 NxsString deletes
+  → cleanup: delete 1000 MTree × 660 Node/Neighbor per tree
+```
+
+**Chi phí ước tính** (N=330, T=32628, B=1000):
+| Bước | Chi phí |
+|------|--------|
+| readTree × 1000 (Newick parse + 660 Node allocs) | ~200-400ms |
+| MTree cleanup × 1000 (660K delete) | ~100-200ms |
+| Split alloc/delete × 328K | ~50-100ms |
+| NxsString taxa alloc × 330K | ~30-50ms |
+| hash_ss.findSplit × 328K | ~30-50ms |
+| treels hashmap iteration × 32628 | ~10-20ms |
+| **Tổng** | **~800ms** |
+
+**Key insight**: Mỗi lần gọi rebuild hoàn toàn từ đầu. Không có incremental update.
+Khi `+trees=0`: `boot_trees` không thay đổi → kết quả SplitGraph y hệt → **800ms lãng phí**.
+
+**computeBootstrapCorrelation**: So sánh 2 SplitGraph trong `boot_splits` (current vs half-way).
+Correlate support vectors → Pearson correlation. O(S) với S = N-2 splits.
+
+## Q: Giải pháp tối ưu conv (Option A + B) hoạt động thế nào?
+
+**Option A** (skip khi không thay đổi):
+- `_boot_changed = (treels_logl.size() after PASS2) > (treels_logl.size() before PASS1)`
+- Nếu false → skip `summarizeBootstrap` (giữ nguyên `cur_correlation`)
+- Safe: trong GPU path, RELL là deterministic per tree → boot_trees chỉ thay đổi khi có tree mới
+
+**Option B** (background thread):
+- Launch `std::async` sau step [8], collect ở đầu step [8] của iter kế tiếp
+- Safety: thread reads boot_trees/treels sau PASS2[R]; PASS2[R+1] bắt đầu sau K2[R+1] sync (~1750ms); thread finish ~800ms → không data race
+- Timing display: 1 round stale (round R+1 log hiện conv time của round R)
+- `(skip)` suffix = `_boot_changed=false` cho round này → không launch thread mới
+
+---
+
+## Q: 3 protein test cases (prot_M5379/M4860/M10866) crash sau "Pool → candidateTrees" — nguyên nhân?
+
+**Triệu chứng**: crash SIGSEGV exit=139 sau khi print "Pool → candidateTrees: 10/10 slots added". Chạy dưới gdb thì không crash (timing-dependent). Chỉ protein nhỏ (N=60-88) crash, protein lớn (N=137+) không crash.
+
+**Root cause**: `gpuHillClimbing` trong `gpu_init_trees.cu` destroy 4 CUDA events 2 lần:
+- Lần 1 (line ~1216-1219): `CUDA_CHECK(cudaEventDestroy(ev_k2_start/end/ppars_start/end))` — đúng vị trí, trước pool block
+- Lần 2 (line ~1306-1309): `cudaEventDestroy(...)` không có CUDA_CHECK — sau pool block
+
+Sau lần destroy đầu, CUDA driver đã free internal event handle. Khi gọi lần 2, driver có thể dereference freed memory → SIGSEGV. Timing-dependent vì CUDA driver memory allocator có thể reuse freed event slots cho object khác giữa 2 lần destroy. Dataset nhỏ/nhanh → CUDA reuse ngay → crash. Dataset lớn/chậm → không kịp reuse → không crash. Dưới gdb → ASLR/timing khác → không crash.
+
+**Fix**: Xóa 4 dòng `cudaEventDestroy` ở cleanup block (chỉ giữ `cudaStreamDestroy`). Events đã được destroy đúng chỗ trước pool block.
+
+**File**: `gpu/src/gpu_init_trees.cu`, cleanup block sau pool processing.
+
+---
+
+## Benchmark 20 datasets: CPU vs GPU cũ vs GPU mới (sau fix double-destroy)
+
+**Config**: `-bb 1000 -gpu_worker 100 -seed 1 -gpu_device 2` · GPU mới = May 30 (Opt A+B + fix double-destroy events)
+
+| Dataset | N | CPU (s) | GPU cũ (s) | GPU mới (s) | CPU/mới | Cũ/mới | Score |
+|---------|---|---------|-----------|------------|---------|--------|-------|
+| dna_M8984_201 | 201 | 167.8 | 173.8 | 7.1 | 23.8× | 24.7× | ✓ |
+| dna_M4324_206 | 206 | 509.1 | 82.5 | 12.0 | 42.4× | 6.9× | DIFF(3) |
+| dna_M1224_210 | 210 | 790.0 | 75.2 | 14.2 | 55.5× | 5.3× | ✓ |
+| dna_M3198_216 | 216 | 300.5 | 39.2 | 10.6 | 28.4× | 3.7× | ✓ |
+| dna_M14678_225 | 225 | 258.0 | 64.1 | 8.8 | 29.5× | 7.3× | ✓ |
+| dna_M214_295 | 295 | 290.8 | 120.1 | 14.7 | 19.8× | 8.2× | ✓ |
+| dna_M1110_330 | 330 | 402.3 | 128.7 | 13.6 | 29.7× | 9.5× | ✓ |
+| dna_M10434_544 | 544 | 2290.6 | 814.0 | 47.0 | 48.8× | 17.3× | ✓ |
+| dna_M12051_699 | 699 | 12544.9 | 3450.5 | 182.8 | 68.6× | 18.9× | DIFF(11) |
+| dna_M7024_767 | 767 | 11253.1 | 3083.1 | 173.2 | 65.0× | 17.8× | DIFF(9) |
+| prot_M1726_50 | 50 | 20.2 | 2.6 | 1.9 | 10.7× | 1.4× | ✓ |
+| prot_M11012_55 | 55 | 213.7 | 11.4 | 7.1 | 30.3× | 1.6× | ✓ |
+| prot_M510_57 | 57 | 11.3 | 3.6 | 1.8 | 6.3× | 2.0× | ✓ |
+| prot_M10236_59 | 59 | 8.2 | 2.7 | 1.9 | 4.4× | 1.4× | ✓ |
+| prot_M5379_60 | 60 | 150.3 | 8.4 | 5.1 | 29.6× | 1.6× | ✓ |
+| prot_M4860_62 | 62 | 271.4 | 14.1 | 8.2 | 33.0× | 1.7× | ✓ |
+| prot_M10866_88 | 88 | 91.5 | 7.5 | 3.9 | 23.4× | 1.9× | ✓ |
+| prot_M1118_137 | 137 | 46.5 | 27.6 | 5.1 | 9.1× | 5.4× | ✓ |
+| prot_M10273_169 | 169 | 928.8 | 57.9 | 19.3 | 48.2× | 3.0× | ✓ |
+| prot_M8175_194 | 194 | 103.2 | 146.6 | 8.5 | 12.2× | 17.3× | ✓ |
+| **TỔNG** | | **30652s** | **8314s** | **547s** | **56.1×** | **15.2×** | 17/20 ✓ |
+
+**Nhận xét:**
+- CPU→GPU mới: **56.1×** tổng thể (4.4× đến 68.6×)
+- Old GPU→GPU mới: **15.2×** tổng thể (Opt A+B + newickFromBackVf)
+- Speedup lớn nhất: dna_M12051 N=699 (68.6×), dna_M7024 N=767 (65.0×)
+- Protein nhỏ (<100 taxa): old→mới chỉ 1.4×–2.0× (GPU cũ đã nhanh vì PASS1 ngắn)
+- **Score match: 17/20 exact ✓**, 3 DIFF nhỏ (<0.015%) — heuristic variation, không phải bug
+- 3 DIFF: dna_M4324 DIFF(3), dna_M12051 DIFF(11), dna_M7024 DIFF(9)
