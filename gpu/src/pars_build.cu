@@ -27,7 +27,13 @@ __device__ void testInsert(
     int q,
     int N,
     int width,
-    int lane
+    int lane,
+    unsigned int* treels_scores  = nullptr,
+    int*          treels_back_vf = nullptr,
+    int*          treels_filled  = nullptr,
+    unsigned int* treels_cutoff  = nullptr,
+    int           max_treels     = 0,
+    unsigned int* treels_hashes  = nullptr
 )
 {
     if (lane == 0)
@@ -122,6 +128,46 @@ __device__ void testInsert(
         }
     }
     __syncwarp();
+
+    // Save to treels if mp improves running best and passes cutoff.
+    // Topology is currently "p inserted at q" (before rollback) — valid to copy directly.
+    // Uses bcast[7] for slot index (safe: outer bcast[7] consumed before this call).
+    if (treels_scores != nullptr)
+    {
+        if (lane == 0)
+        {
+            sh.bcast[7] = -1;
+            if (mp < sh.randomMP + sh.save_margin)
+            {
+                unsigned int cutoff = *((volatile unsigned int*)treels_cutoff);
+                if (mp <= cutoff && *((volatile int*)treels_filled) < max_treels)
+                {
+                    int slot = atomicAdd(treels_filled, 1);
+                    if (slot < max_treels)
+                    {
+                        treels_scores[slot] = mp;
+                        sh.bcast[7] = slot;
+                    }
+                }
+            }
+        }
+        __syncwarp();
+        if (sh.bcast[7] >= 0)
+        {
+            int* dst = treels_back_vf + (size_t)sh.bcast[7] * kMaxVFaces;
+            for (int vf = lane; vf < topo->num_vfaces; vf += kWarpSize)
+                dst[vf] = topo->back_vf[vf];
+            if (lane == 0 && treels_hashes != nullptr)
+            {
+                unsigned int h = 0;
+                for (int vf = 0; vf < topo->num_vfaces; vf++)
+                    h = h * 2654435761u ^ (unsigned int)topo->back_vf[vf];
+                treels_hashes[sh.bcast[7]] = h;
+            }
+            __syncwarp();
+        }
+    }
+
     if (lane == 0)
     {
         gpuHookup(topo->back_vf, q, sh.bcast[0]);
@@ -144,7 +190,13 @@ __device__ void doAddTraverse(
     int maxtrav,
     int N,
     int width,
-    int lane
+    int lane,
+    unsigned int* treels_scores  = nullptr,
+    int*          treels_back_vf = nullptr,
+    int*          treels_filled  = nullptr,
+    unsigned int* treels_cutoff  = nullptr,
+    int           max_treels     = 0,
+    unsigned int* treels_hashes  = nullptr
 )
 {
     if (lane == 0)
@@ -181,7 +233,9 @@ __device__ void doAddTraverse(
                                     + score_tree[vfToNum(topo->back_vf[cur_q], N)];
             if (lb < sh.randomMP)
             {
-                testInsert<STATES>(pars_tree, score_tree, topo, sh, p, cur_q, N, width, lane);
+                testInsert<STATES>(pars_tree, score_tree, topo, sh, p, cur_q, N, width, lane,
+                    treels_scores, treels_back_vf, treels_filled, treels_cutoff,
+                    max_treels, treels_hashes);
             }
         }
 
@@ -364,22 +418,30 @@ __device__ void gpuSPRHillClimb(
                     {
                         doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, p, back_vf[vfNextFace(p1, N)], 1,
-                            sprDist, N, width, lane
+                            sprDist, N, width, lane,
+                            treels_scores, treels_back_vf, treels_filled, treels_cutoff,
+                            max_treels, treels_hashes
                         );
                         doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, p, back_vf[vfNnxtFace(p1, N)], 1,
-                            sprDist, N, width, lane
+                            sprDist, N, width, lane,
+                            treels_scores, treels_back_vf, treels_filled, treels_cutoff,
+                            max_treels, treels_hashes
                         );
                     }
                     if (p2 >= N)
                     {
                         doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, p, back_vf[vfNextFace(p2, N)], 1,
-                            sprDist, N, width, lane
+                            sprDist, N, width, lane,
+                            treels_scores, treels_back_vf, treels_filled, treels_cutoff,
+                            max_treels, treels_hashes
                         );
                         doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, p, back_vf[vfNnxtFace(p2, N)], 1,
-                            sprDist, N, width, lane
+                            sprDist, N, width, lane,
+                            treels_scores, treels_back_vf, treels_filled, treels_cutoff,
+                            max_treels, treels_hashes
                         );
                     }
 
@@ -428,22 +490,30 @@ __device__ void gpuSPRHillClimb(
                     {
                         doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, q, back_vf[vfNextFace(q1, N)], 2,
-                            sprDist, N, width, lane
+                            sprDist, N, width, lane,
+                            treels_scores, treels_back_vf, treels_filled, treels_cutoff,
+                            max_treels, treels_hashes
                         );
                         doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, q, back_vf[vfNnxtFace(q1, N)], 2,
-                            sprDist, N, width, lane
+                            sprDist, N, width, lane,
+                            treels_scores, treels_back_vf, treels_filled, treels_cutoff,
+                            max_treels, treels_hashes
                         );
                     }
                     if (q2 >= N)
                     {
                         doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, q, back_vf[vfNextFace(q2, N)], 2,
-                            sprDist, N, width, lane
+                            sprDist, N, width, lane,
+                            treels_scores, treels_back_vf, treels_filled, treels_cutoff,
+                            max_treels, treels_hashes
                         );
                         doAddTraverse<STATES>(
                             pars_tree, score_tree, topo, sh, q, back_vf[vfNnxtFace(q2, N)], 2,
-                            sprDist, N, width, lane
+                            sprDist, N, width, lane,
+                            treels_scores, treels_back_vf, treels_filled, treels_cutoff,
+                            max_treels, treels_hashes
                         );
                     }
 
@@ -1000,6 +1070,7 @@ __global__ void buildParsimonyTreesKernel(
         sh.use_sankoff = (d_cost_matrix != nullptr);
         sh.cost_matrix = d_cost_matrix;
         sh.site_weights = sh.use_sankoff ? sw_k : nullptr;
+        sh.save_margin = 0;  // K1 doesn't write to treels
 
         for (int i = 1; i <= N; i++)
         {
@@ -1180,7 +1251,8 @@ __global__ void buildPhase3Kernel(
     unsigned int* treels_cutoff,
     int    max_treels,
     unsigned int* treels_hashes,       // [max_treels] topology hash per slot; nullptr = disabled
-    const unsigned int* d_cost_matrix  // nullptr = Fitch mode
+    const unsigned int* d_cost_matrix, // nullptr = Fitch mode
+    unsigned int save_margin           // testInsert near-optimal save margin
 )
 {
     __shared__ BuildSharedT<NTAXA> sh;
@@ -1206,6 +1278,7 @@ __global__ void buildPhase3Kernel(
         sh.cost_matrix = d_cost_matrix;
         sh.site_weights = sh.use_sankoff ? sw_k : nullptr;
         sh.bestParsimony = topo->bestParsimony;
+        sh.save_margin = save_margin;
         (void)k;
     }
     __syncwarp();
@@ -1341,7 +1414,7 @@ void gpuStepwiseBuildTrees(
             mem->d_poolHashes, mem->d_globalBest,
             mem->d_treelsScores, mem->d_treelsBackVf, mem->d_treelsFilled,
             mem->d_treelsCutoff, mem->max_treels, mem->d_treelsHashes,
-            mem->d_cost_matrix
+            mem->d_cost_matrix, mem->save_margin
         );
         cudaEventRecord(k2_end, stream);
         CUDA_CHECK(cudaGetLastError());

@@ -112,6 +112,7 @@ struct GpuParsimonyMem
     size_t siteWeightsPerTree;  // = width (elements). Fitch: ratchet weights; Sankoff: pattern frequencies
 
     size_t total_gpu_bytes;     // total GPU memory allocated (sum of all cudaMalloc calls)
+    unsigned int save_margin;  // testInsert near-optimal save margin (0 = strict improvement only)
 };
 
 // ─── Shared memory per block ──────────────────────────────────────────────────
@@ -169,6 +170,7 @@ struct alignas(16) BuildSharedT
     // ── [Sankoff] Cost matrix pointer (nullptr = Fitch uniform mode) ─────────
     bool use_sankoff;                    // true = Sankoff parsimony
     const unsigned int* cost_matrix;     // device ptr to [states×states] cost matrix
+    unsigned int save_margin;            // testInsert near-optimal margin: save if mp < randomMP + margin
 
     // ── [BUILD-ONLY] Phase 0-1 scalars (not touched during SPR) ─────────────
     int insertVf;
@@ -374,6 +376,7 @@ __device__ __forceinline__ unsigned int newviewParsimony(
             {
                 // Sankoff: each b = one pattern; elements are costs (not bitmasks)
                 // partial_p[s][b] = min_j(q[j][b] + cost[s][j]) + min_j(r[j][b] + cost[s][j])
+                unsigned int min_cost_b = kSankoffInf;
                 #pragma unroll
                 for (int ii = 0; ii < STATES; ++ii)
                 {
@@ -387,8 +390,13 @@ __device__ __forceinline__ unsigned int newviewParsimony(
                         best_left  = min(best_left,  lv + c);
                         best_right = min(best_right, rv + c);
                     }
-                    p_base[(size_t)ii * width + b] = (parsimonyNumber)(best_left + best_right);
+                    unsigned int val = best_left + best_right;
+                    p_base[(size_t)ii * width + b] = (parsimonyNumber)val;
+                    min_cost_b = min(min_cost_b, val);
                 }
+                // Accumulate subtree lower-bound for Opt-B pruning in doAddTraverse.
+                // min_cost_b = min_s(p[s][b]) = minimum Sankoff cost of this subtree at site b.
+                score += (min_cost_b < kSankoffInf) ? min_cost_b : 0u;
             }
         }
         score = warpReduceU32(score);

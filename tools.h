@@ -1692,8 +1692,9 @@ struct Params {
     bool use_gpu;
     float gpu_nni_strength;   // Phase 3 NNI perturbation: numNNI = strength*(N-3), min 1; default=0.1
     int gpu_pool_size;    // number of pool slots for population-based restarts (default 20)
-    int gpu_worker;       // number of K2 blocks; -1 = same as K (default -1)
+    int gpu_worker;       // number of K2 blocks; default 200
     int gpu_worker_stop;  // stop threshold multiplier: unsuccess_iteration + K*gpu_worker_stop (default 1)
+    int gpu_treels_margin;  // near-optimal treels save margin: save candidates with mp < randomMP + margin (default 10)
     int gpu_device;    // CUDA device ID to use (default 1)
 };
 

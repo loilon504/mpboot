@@ -1254,3 +1254,126 @@ Sau lần destroy đầu, CUDA driver đã free internal event handle. Khi gọi
 - Protein nhỏ (<100 taxa): old→mới chỉ 1.4×–2.0× (GPU cũ đã nhanh vì PASS1 ngắn)
 - **Score match: 17/20 exact ✓**, 3 DIFF nhỏ (<0.015%) — heuristic variation, không phải bug
 - 3 DIFF: dna_M4324 DIFF(3), dna_M12051 DIFF(11), dna_M7024 DIFF(9)
+
+---
+
+## 2026-05-31 — nsplits=1 bug investigation & DNA Sankoff crash fix
+
+**Q: Tại sao DNA non-uniform crash với "illegal memory access" tại pars_treels.cu:365?**
+
+`treelsPatternParsKernelSankoff<20>` hardcoded STATES=20, nhưng DNA có states=4. Kernel đọc cost matrix 20×20=400 entries nhưng chỉ có 4×4=16 valid → OOB. Fix: dispatch `<4>` hoặc `<20>` dựa theo `states`.
+
+**Q: Thứ tự implement Save A/B/C?**
+
+- Save C (final tree sau runPhase3): implement đầu tiên
+- Save B (best per-node-i candidate): implement thứ hai  
+- Save A (mọi testInsert candidate): implement hôm nay (2026-05-31)
+**C là cây tốt nhất kiếm được từ nhiều B (best sequence of B moves applied). A > B > C về độ granular.**
+
+---
+
+## 2026-06-01 — nsplits=1 real root cause: per-BLOCK vs per-PATTERN dimensional mismatch
+
+**Context**: Chat mới vì chat cũ reach 1M context. Bug nsplits=1 vẫn còn.
+
+**Root cause thực sự** (không phải pool diversity như investigation trước):
+
+GPU ppars kernel (`treelsPatternParsKernel`) output `pars_ptn[b] = __popc(t_N)` — parsimony của **32 SITES gộp vào SIMD block b** (per-block, Fitch bit-packed representation). `width = parsimonyLength = ceil(numInformativeSites/32)` blocks.
+
+Batch REPS nhân `pars_ptn[b] * boot_samples_pars[i][b]` — nhưng `boot_samples_pars[i][b]` là bootstrap weight của **ORIGINAL PATTERN b** (original alignment index), không phải block b.
+
+Dimensional mismatch: `pars_block_b * boot_original_pattern_b` = vô nghĩa về mặt thống kê. T* luôn thắng vì nó minimize parsimony ở mọi block → REPS score của T* ≤ mọi tree khác dưới mọi resample → nsplits=1.
+
+CPU path cũ (`computeParsimony()`) fill `_pattern_pars[ptn]` đúng per-original-pattern — REPS indexing khớp với `boot_samples_pars[i][ptn]`.
+
+**Fix (2026-06-01)**:
+
+Trong PASS1 batch_reps block và final section của `gpu_init_trees.cu`:
+- Thay `memcpy(h_batch_pars ← h_treels_ptn_pars)` (GPU block-level ppars) bằng:
+  ```
+  readTreeString(newick) → initializeAllPartialPars() → clearAllPartialLH() → computeParsimony()
+  copy _pattern_pars[0..nptn-1] → h_batch_pars[u*nptn_padded + 0..nptn-1]
+  ```
+- Thay `gpuSetPatternPars(h_treels_ptn_pars[t])` (per-tree fallback) bằng cùng flow trên.
+- Xóa `gpuSetPatternPars` khỏi PASS2 loop (không cần vì `_gpu_precomputed_rell` override, và `_pattern_pars` non-null từ PASS1).
+- `newickFromBackVf` vẫn giữ để fast newick generation.
+
+**Trade-off**: Mất speedup từ GPU ppars kernel cho REPS (vẫn cần CPU `computeParsimony()` per tree). Nhưng vẫn nhanh hơn code cũ nhờ `newickFromBackVf` thay thế `gpuTopoToCpu + pllTreeToNewick`. Batch GPU REPS vẫn được dùng (1 kernel launch cho T trees thay vì T launches).
+
+**Files thay đổi**: `gpu/src/gpu_init_trees.cu` (4 sites: 2 PASS1 blocks, 2 PASS2 loops).
+
+**Bug thứ 2 (data race) cũng gây nsplits=1** (phát hiện 2026-06-01):
+
+Background thread `conv_future` (chạy `summarizeBootstrap`) đọc `treels` và `boot_trees`. PASS1 step [2] ghi vào `treels` và `boot_trees` (qua `saveCurrentTree`). Cả hai chạy concurrently → data race → UB → nsplits=1.
+
+Timeline vi phạm:
+- End of round R step [8]: launch `conv_future` (đọc treels/boot_trees)
+- Round R+1 step [1]: launch K2 GPU (non-blocking, instant)  
+- Round R+1 step [2]: PASS1 ghi treels/boot_trees ← DATA RACE với conv_future!
+
+Fix: thêm step [0] ở đầu mỗi vòng lặp, collect `conv_future` TRƯỚC khi PASS1 bắt đầu. Thread mới vẫn launch ở cuối step [8] sau PASS2.
+
+
+---
+
+## Q: Bug nsplits=1 — Root cause thực sự (2026-06-01)
+
+**Sau 2 lần fix (per-block vs per-pattern REPS, data race), vẫn còn nsplits=1 weight=58700.**
+
+### Root cause: Newick format mismatch giữa GPU và MTreeSet::init
+
+**Chuỗi lỗi**:
+
+1. `newickFromBackVf()` trong `gpu_init_trees.cu` output newick với **taxon NAMES** (ví dụ `(Ajellomyces_capsulatum:0.1,...)`), dùng `nameList[num]` trực tiếp.
+
+2. Newick này được dùng làm key trong `treels` map (vì `store_candidate_trees=true` được set tại đầu `gpuHillClimbing`).
+
+3. `summarizeBootstrap(params)` → `MTreeSet::init(treels, ...)` → iterate treels → với mỗi entry, gọi:
+   ```cpp
+   tree->readTree(ss, myrooted);   // parse newick OK (names khớp)
+   // ...
+   for (NodeVector::iterator taxit = taxa.begin(); ...) {
+       (*taxit)->id = atoi((*taxit)->name.c_str());  // BUG!
+   }
+   ```
+   `atoi("Ajellomyces_capsulatum") = 0` cho **tất cả** tên không phải số → tất cả taxa có `id = 0`.
+
+4. `MTree::convertSplits(...)` dùng `node->id` để set bit trong split bitmask:
+   ```cpp
+   resp->addTaxon(node->id);  // node->id = 0 cho mọi taxa
+   ```
+   → Tất cả splits có cùng bitmask (chỉ bit 0) → SplitGraph chỉ có 1 split với weight rất lớn (accumulation từ tất cả trees) → **nsplits=1, weight=58700**.
+
+5. CPU mode không bị bug này vì CPU dùng `printTree(ostr, WT_TAXON_ID | WT_SORT_TAXA)` để tạo treels key → leaf names là integers ("1", "2",...) → `atoi("1") = 1` → đúng.
+
+### Fix (2026-06-01)
+
+Trong PASS1 của `gpu_init_trees.cu`, sau `readTreeString(newick)` + `computeParsimony()`, **sinh integer-ID newick** và dùng đó thay vì name-based newick:
+
+```cpp
+// Thêm sau computeParsimony():
+std::ostringstream _id_ostr;
+iqtree.printTree(_id_ostr, WT_TAXON_ID | WT_SORT_TAXA);
+// unique_trees.push_back({_id_ostr.str(), cpu_pars, t});  // batch path
+// iqtree._gpu_newick_key = _id_ostr.str();  // per-tree path
+```
+
+`printTree(WT_TAXON_ID | WT_SORT_TAXA)` output leaf names là 0-indexed integers → `MTreeSet::init` → `atoi("k") = k` → đúng.
+
+**Áp dụng ở 4 chỗ**: 2 PASS1 blocks (main loop + final section) × 2 paths (batch + per-tree).
+
+**Debug code fix**: Remove `if (round == 1)` block dùng `readTreeString(unique_trees[0].newick)` vì `unique_trees[0].newick` giờ là integer-ID newick → `setAlignment` thất bại khi tìm tên thật.
+
+### Kết quả sau fix
+
+| | CPU bootstrap | GPU bootstrap (sau fix) |
+|--|--|--|
+| nsplits | 7635 | 1530 |
+| splits >50% | 493 | 537 |
+| max support | 100% | 100% |
+| cor | - | 0.9954 |
+
+GPU có ít tổng splits hơn (1530 vs 7635) nhưng MORE splits >50% (537 vs 493). Bổ sung splits thấp do GPU treels pool nhỏ hơn (max 2000/round) và ít rounds hơn.
+
+**Files thay đổi**: `gpu/src/gpu_init_trees.cu` (4 PASS1 sites + remove debug block).
+

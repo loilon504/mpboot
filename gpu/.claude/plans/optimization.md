@@ -26,6 +26,8 @@
 | **Pool restart simplify** | **Lane-0 O(pool_size²) selection-sort, unsigned long long bitmask (pool_size ≤ 60); accessible=10+outer** | **K2 regs 151→128; simpler code** |
 | **Opt-S: Per-slot locks** | **pool_lock→pool_slot_locks[pool_size]; thundering herd fix** | **Contention 1000→50 blocks/lock (pool=20)** |
 | **Sankoff encoding fix** | **uploadSankoffTipParsVect: width=parsimonyLength, tr->yVector PLL bitmask** | **GPU Sankoff đúng, 6662=CPU** |
+| **Fix 2 — AA tip bitmask** | **`uploadSankoffTipParsVect`: one-hot convert AA index→bitmask (DNA dùng PLL_MAP_NT, AA dùng PLL_MAP_AA)** | **20/20 protein non-bootstrap diff ≤ 0 ✅ (2026-05-31)** |
+| **Bug A — score_tree Sankoff** | **`warpNewviewStep`: accumulate `min_s(p[s][b])` vào `score` để Opt-B prune hoạt động** | **Applied; benchmark pending** |
 | **Sankoff ratchet (d_ratchetScratch)** | **Buffer scratch riêng; iter_is_nni bỏ use_sankoff||** | **K=200 đạt 6662 (cần K=5000 trước)** |
 | **Opt 1: parsVect layout [ptn][state]→[state][ptn]** | **Coalesced warp access; Fitch→memcpy; Sankoff h_buf reindex** | **Fitch 2.5×, Sankoff 2.1× ms/tree** |
 | **Opt 3: Remove dead min_site in Sankoff newview** | **Xóa score_tree accumulation không được đọc** | **Minor; absorbed into Opt 1** |
