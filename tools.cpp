@@ -830,7 +830,8 @@ void parseArg(int argc, char *argv[], Params &params) {
 	params.gpu_pool_size = 20;
 	params.gpu_worker = 200;
 	params.gpu_worker_stop = 1;
-	params.gpu_treels_margin = 10;
+	params.gpu_treels_margin = 0.0;   // default: strict improvement only
+	params.gpu_boot_nni_rounds = 1;   // default: 1 outer SPR round per replicate for GPU
 	params.gpu_device = 0;
 
 	if (params.nni5) {
@@ -2725,7 +2726,11 @@ void parseArg(int argc, char *argv[], Params &params) {
 				continue;
 			}
 			if (strcmp(argv[cnt], "-gpu_treels_margin") == 0) {
-				params.gpu_treels_margin = convert_int(argv[++cnt]);
+				params.gpu_treels_margin = convert_double(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_boot_nni_rounds") == 0) {
+				params.gpu_boot_nni_rounds = convert_int(argv[++cnt]);
 				continue;
 			}
 			if (strcmp(argv[cnt], "-gpu_device") == 0) {

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "gpu/include/pars_tree.cuh"
+#include "gpu/include/pars_build.cuh"
 #include "gpu/include/utils.cuh"
 
 namespace mpbootgpu
@@ -137,13 +138,13 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
         total_bytes += siteWeightsBytes;
     }
 
-    // Upload cost matrix for Sankoff mode
+    // Opt-5: upload cost matrix into constant memory (defined in pars_build.cu, same TU as kernels).
+    // Also allocate a 4-byte sentinel so kernels can detect Sankoff mode via d_cost_matrix != nullptr.
+    // The actual cost data is accessed through g_sankoff_cm, not d_cost_matrix.
     if (use_sankoff)
     {
-        const size_t costBytes = (size_t)nstates * nstates * sizeof(unsigned int);
-        CUDA_CHECK(cudaMalloc(&mem->d_cost_matrix, costBytes));
-        CUDA_CHECK(cudaMemcpy(mem->d_cost_matrix, cost_matrix, costBytes, cudaMemcpyHostToDevice));
-        total_bytes += costBytes;
+        gpuUploadSankoffCostMatrix(cost_matrix, nstates);
+        CUDA_CHECK(cudaMalloc(&mem->d_cost_matrix, sizeof(unsigned int)));
     }
     const size_t postSprBytes = (size_t)K * sizeof(unsigned int);
     CUDA_CHECK(cudaMalloc(&mem->d_postSprScores, postSprBytes));  total_bytes += postSprBytes;
@@ -189,6 +190,37 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(
         CUDA_CHECK(cudaMemset(mem->d_treelsScores, 0xFF, treelsScoreBytes));
         CUDA_CHECK(cudaMemcpy(mem->d_treelsFilled, &h_zero, sizeof(int),          cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(mem->d_treelsCutoff, &h_inf,  sizeof(unsigned int), cudaMemcpyHostToDevice));
+    }
+
+    // ppars dedicated scratch: allocate extra blocks using remaining free VRAM (up to 1000).
+    // K_ppars > K → fewer ppars kernel launches → higher GPU occupancy per launch.
+    // Falls back to d_parsVect alias when no VRAM is available (K_ppars == K).
+    {
+        mem->d_ppars_parsVect = mem->d_parsVect;
+        mem->K_ppars = K;
+        size_t _free = 0, _total = 0;
+        cudaMemGetInfo(&_free, &_total);
+        const size_t _pv_per = mem->parsVectPerTree * sizeof(parsimonyNumber);
+        if (_pv_per > 0) {
+            const int _K_by_mem = (int)((_free * 8 / 10) / _pv_per);
+            const int _K_target = std::min(1000, std::max(K, _K_by_mem));
+            if (_K_target > K) {
+                const size_t _ppars_bytes = (size_t)_K_target * _pv_per;
+                cudaError_t _err = cudaMalloc(&mem->d_ppars_parsVect, _ppars_bytes);
+                if (_err == cudaSuccess) {
+                    total_bytes += _ppars_bytes;
+                    mem->K_ppars = _K_target;
+                    printf("[ppars] K_ppars=%d (+%.0f MB scratch, batch %d→%d blocks)\n",
+                        _K_target, _ppars_bytes / 1048576.0, K, _K_target);
+                } else {
+                    mem->d_ppars_parsVect = mem->d_parsVect;
+                    printf("[ppars] K_ppars fallback K=%d (cudaMalloc %zu B failed: %s)\n",
+                        K, _ppars_bytes, cudaGetErrorString(_err));
+                }
+            } else {
+                printf("[ppars] K_ppars=%d (no extra VRAM for more blocks)\n", K);
+            }
+        }
     }
 
     mem->total_gpu_bytes = total_bytes;
@@ -257,6 +289,8 @@ void gpuParsimonyMemFree(
     if (mem->d_treelsFilled)   cudaFree(mem->d_treelsFilled);
     if (mem->d_treelsCutoff)   cudaFree(mem->d_treelsCutoff);
     if (mem->d_treelsHashes)   cudaFree(mem->d_treelsHashes);
+    if (mem->d_ppars_parsVect && mem->d_ppars_parsVect != mem->d_parsVect)
+        cudaFree(mem->d_ppars_parsVect);
     delete mem;
 }
 

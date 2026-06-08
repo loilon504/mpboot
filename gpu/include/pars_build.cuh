@@ -26,6 +26,10 @@ using AfterK1Callback = std::function<void(cudaStream_t, GpuParsimonyMem*)>;
 //   - Callback MUST call cudaStreamSynchronize(stream) before returning (to ensure K2 done).
 using AfterK2Callback = std::function<void(cudaStream_t)>;
 
+// Upload Sankoff cost matrix into constant memory (g_sankoff_cm, defined in pars_build.cu).
+// Must be called after cudaSetDevice. nstates ≤ kMaxSankoffStates (= 20).
+void gpuUploadSankoffCostMatrix(const unsigned int* cm, int nstates);
+
 // Run stepwise-addition + SPR + iterative NNI+SPR search for all K trees.
 // sprDist          = SPR radius (used for all phases)
 // numNNI           = NNI moves per even-worker iteration

@@ -202,13 +202,15 @@ int mpbootGpu(
     t0 = std::chrono::high_resolution_clock::now();
     // Treels buffer: only needed for bootstrap (-bb). Non-bootstrap uses pool directly.
     const bool need_treels = (params.gbo_replicates > 0);
-    const int max_treels_boot = need_treels ? K_alloc * 3000 : 0;
+    // Per-round treels scales with K × N: observed ~28K/round at N=767, K=200.
+    // K_alloc × mxtips gives ~5× margin and auto-scales with dataset size.
+    const int max_treels_boot = need_treels ? K_alloc * mxtips : 0;
     GpuParsimonyMem* mem = gpuParsimonyMemAlloc(
         K_alloc, mxtips, width, states, params.gpu_pool_size, max_treels_boot,
         use_sankoff ? iqtree.cost_matrix : nullptr,
         use_sankoff ? iqtree.cost_nstates : 0
     );
-    mem->save_margin = (unsigned int)params.gpu_treels_margin;
+    mem->save_margin = (float)params.gpu_treels_margin;
     GPU_LOG("[GPU]   [2]      %-28s: %8.3f s  (%.2f GB)\n", "GPU memory alloc",
             msSince(t0) / 1e3, mem->total_gpu_bytes / 1073741824.0);
     GPU_LOG("[GPU]            K1=%d  K2=%d  K_alloc=%d  per_worker=%.1f MB  free=%.1f GB\n",
@@ -538,7 +540,8 @@ static std::string newickFromBackVf(
     const int*         back_vf,      // h_treels_bvf + t * kMaxVFaces
     int                start_vface,  // h_tpl.start_vface (= 0)
     int                N,            // mem->mxtips
-    const char* const* nameList      // pllInst->nameList (1-indexed, nameList[1..N])
+    const char* const* nameList,     // pllInst->nameList (1-indexed); nullptr if use_int_ids
+    bool               use_int_ids = false  // true → output 0-indexed integers for treels key
 )
 {
     const int root_vf = back_vf[start_vface];
@@ -570,7 +573,10 @@ static std::string newickFromBackVf(
 
         // OPEN
         if (is_tip) {
-            out += nameList[num];
+            if (use_int_ids)
+                out += std::to_string(num - 1);  // 0-indexed integer (MTreeSet::init uses atoi)
+            else
+                out += nameList[num];
             out += (vf == root_vf) ? ":0.0;\n" : ":0.10000000000000000555";
         } else {
             const int left_vf  = back_vf[vfNextFace(vf, N)];
@@ -634,15 +640,21 @@ void gpuHillClimbing(
     memset(h_tpl.xpars, 0, sizeof(h_tpl.xpars));
 
     // Reusable host buffer for batch-downloading treels back_vf each round.
+    // Pinned (page-locked) memory eliminates page-fault stalls on first D2H:
+    // pageable gives ~200 MB/s (cold pages), pinned gives ~6 GB/s consistently.
     const int max_treels = mem->max_treels;
-    std::vector<int>          h_treels_bvf;
-    std::vector<unsigned int> h_treels_scores;
-    std::vector<unsigned int> h_treels_hashes;
+    int*          h_treels_bvf    = nullptr;
+    unsigned int* h_treels_scores = nullptr;
+    unsigned int* h_treels_hashes = nullptr;
     if (max_treels > 0)
     {
-        h_treels_bvf.resize((size_t)max_treels * kMaxVFaces);
-        h_treels_scores.resize((size_t)max_treels);
-        h_treels_hashes.resize((size_t)max_treels, 0u);
+        CUDA_CHECK(cudaMallocHost(&h_treels_bvf,
+            (size_t)max_treels * kMaxVFaces * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost(&h_treels_scores,
+            (size_t)max_treels * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMallocHost(&h_treels_hashes,
+            (size_t)max_treels * sizeof(unsigned int)));
+        memset(h_treels_hashes, 0, (size_t)max_treels * sizeof(unsigned int));
     }
     // Hash → best parsimony seen: persisted across rounds for dedup (same as saveCurrentTree's treels map).
     std::unordered_map<unsigned int, unsigned int> seen_hash_pars;
@@ -652,38 +664,29 @@ void gpuHillClimbing(
     const int nptn = iqtree.getAlnNPattern();
     const int nptn_padded = nptn + 16;  // VCSIZE_USHORT padding (matches CPU _pattern_pars alloc)
     uint16_t* d_treels_ptn_pars = nullptr;
-    std::vector<uint16_t> h_treels_ptn_pars;
+    uint16_t* h_treels_ptn_pars = nullptr;
     const bool use_gpu_treels_pars =
         is_bootstrap && (mem->states == 4 || mem->states == 20);
     if (use_gpu_treels_pars && max_treels > 0)
     {
         CUDA_CHECK(cudaMalloc(&d_treels_ptn_pars,
             (size_t)max_treels * nptn_padded * sizeof(uint16_t)));
-        h_treels_ptn_pars.resize((size_t)max_treels * nptn_padded);
+        CUDA_CHECK(cudaMallocHost(&h_treels_ptn_pars,
+            (size_t)max_treels * nptn_padded * sizeof(uint16_t)));
     }
 
     // Batch REPS: allocate batch buffers and host staging buffer once.
     // use_batch_reps is active when gpu_boot_mem_ has been initialized (non-null + batch alloc).
-    std::vector<uint16_t> h_batch_pars;   // [max_reps_per_round × nptn_padded] staging for batch
+    std::vector<uint16_t> h_batch_pars;   // [n_treels × nptn_padded] staging for batch REPS (grows dynamically)
     const bool use_batch_reps = use_gpu_treels_pars && max_treels > 0
                                  && iqtree.gpu_boot_mem_ != nullptr;
-    // Per-round limit for CPU computeParsimony() calls.
-    // TODO: remove this limit once GPU ppars kernel outputs per-ORIGINAL-PATTERN parsimony
-    // (instead of per-BLOCK); see bug note 2026-06-01 in note.md.
-    // Current GPU ppars outputs pars_ptn[block_b] = __popc(t_N) which has wrong dimensional
-    // indexing for REPS — hence we fall back to CPU computeParsimony() which is slow for large
-    // treels (100K+ unique trees from Save A). Limit to 2000 per round to keep runtime bounded.
-    const int max_reps_per_round = std::min(max_treels, 2000);
-    if (use_batch_reps)
-    {
-        gpuBatchREPSInit(iqtree.gpu_boot_mem_, max_reps_per_round);
-        h_batch_pars.resize((size_t)max_reps_per_round * nptn_padded);
-    }
+    // Per-round treels limit: no hard cap — process ALL unique trees saved per round.
+    // h_batch_pars and batch REPS GPU buffers grow dynamically to fit actual n_treels.
+    int current_max_reps = 0;  // current allocated capacity (grows per round as needed)
 
     // Per-round: info for each unique tree accumulated during Pass 1 (batch REPS path).
     struct UniqueTreeEntry { std::string newick; int pars; int t_ptn; };
     std::vector<UniqueTreeEntry> unique_trees;
-    if (use_batch_reps) unique_trees.reserve(max_reps_per_round);
 
     double cur_correlation = 0.0;
     int round = 0, total_done = 0;
@@ -787,12 +790,21 @@ void gpuHillClimbing(
         int _t_skip_hash = 0;
         iqtree._gpu_t_pp = iqtree._gpu_t_reps = iqtree._gpu_t_bupdate = 0.0;
         if (use_batch_reps) unique_trees.clear();
+        // Grow batch REPS buffers if this round has more trees than current capacity.
+        if (use_batch_reps && has_prev && prev.n_treels > current_max_reps)
+        {
+            int new_cap = prev.n_treels;
+            h_batch_pars.resize((size_t)new_cap * nptn_padded);
+            gpuBatchREPSGrow(iqtree.gpu_boot_mem_, new_cap);
+            unique_trees.reserve(new_cap);
+            current_max_reps = new_cap;
+        }
         if (has_prev && prev.n_treels > 0)
         {
             for (int t = 0; t < prev.n_treels; t++)
             {
                 // Option C: hash-based dedup — skip before Newick generation
-                if (is_bootstrap && !h_treels_hashes.empty()) {
+                if (is_bootstrap && h_treels_hashes != nullptr) {
                     auto _th = std::chrono::high_resolution_clock::now();
                     unsigned int h  = h_treels_hashes[t];
                     unsigned int ps = h_treels_scores[t];
@@ -806,10 +818,16 @@ void gpuHillClimbing(
                     _t_hash_ms += msSince(_th);
                 }
 
+                // Bootstrap batch path: output integer-ID newick directly (MTreeSet::init uses atoi).
+                // Other paths (non-bootstrap, Sankoff fallback, per-tree fallback) need name-based
+                // newick for readTreeString/setAlignment → use nameList.
+                const bool _need_int_ids = (is_bootstrap && use_gpu_treels_pars && use_batch_reps);
                 auto _tn = std::chrono::high_resolution_clock::now();
                 std::string newick = newickFromBackVf(
-                    h_treels_bvf.data() + (size_t)t * kMaxVFaces,
-                    h_tpl.start_vface, mem->mxtips, iqtree.pllInst->nameList);
+                    h_treels_bvf + (size_t)t * kMaxVFaces,
+                    h_tpl.start_vface, mem->mxtips,
+                    _need_int_ids ? nullptr : iqtree.pllInst->nameList,
+                    _need_int_ids);
                 _t_newick_ms += msSince(_tn);
                 if (newick.empty()) continue;
 
@@ -818,47 +836,25 @@ void gpuHillClimbing(
                     if (use_batch_reps)
                     {
                         int u = (int)unique_trees.size();
-                        if (u < max_reps_per_round) {
-                            // BUG FIX 1: GPU ppars outputs per-BLOCK parsimony (32 sites packed),
-                            // but REPS needs per-ORIGINAL-PATTERN parsimony (same indexing as
-                            // boot_samples_pars[i][p]).  Use CPU computeParsimony() to fill
-                            // _pattern_pars[0..nptn-1] correctly, then copy into h_batch_pars.
-                            // BUG FIX 2: newickFromBackVf outputs taxon NAMES; MTreeSet::init
-                            // uses atoi(name) to assign taxon IDs → atoi("Name")=0 for all taxa
-                            // → split bitmasks all-zero → nsplits=1.  After readTreeString we
-                            // use printTree(WT_TAXON_ID) to get integer-ID newick for treels key.
-                            auto _tb = std::chrono::high_resolution_clock::now();
-                            iqtree.readTreeString(newick);
-                            iqtree.initializeAllPartialPars();
-                            iqtree.clearAllPartialLH();
-                            int cpu_pars = iqtree.computeParsimony();
-                            // _pattern_pars is now correctly filled per-original-pattern
-                            uint16_t* dst = h_batch_pars.data() + (size_t)u * nptn_padded;
-                            const BootValTypePars* ppars = iqtree.getPatternPars();
-                            for (int p = 0; p < nptn; p++)
-                                dst[p] = (uint16_t)ppars[p];
-                            for (int p = nptn; p < nptn_padded; p++)
-                                dst[p] = 0;
-                            // Generate integer-ID newick as treels key (MTreeSet::init uses atoi).
-                            std::ostringstream _id_ostr;
-                            iqtree.printTree(_id_ostr, WT_TAXON_ID | WT_SORT_TAXA);
-                            _t_bpars_ms += msSince(_tb);
-                            unique_trees.push_back({_id_ostr.str(), cpu_pars, t});
-                        }
+                        // Fast path: GPU ppars kernel already computed per-original-pattern
+                        // parsimony in d_treels_ptn_pars (fixed kernel output).
+                        // newick is already integer-ID (use_int_ids=true above).
+                        uint16_t* dst = h_batch_pars.data() + (size_t)u * nptn_padded;
+                        const uint16_t* src = h_treels_ptn_pars + (size_t)t * nptn_padded;
+                        std::copy(src, src + nptn_padded, dst);
+                        unique_trees.push_back({newick, (int)h_treels_scores[t], t});
                     }
                     else
                     {
-                        // Per-tree fallback (batch not allocated).
-                        // BUG FIX: use computeParsimony() and integer-ID newick key.
+                        // Per-tree fallback (batch not allocated — rare edge case).
+                        // newick is name-based here (need_int_ids=false), readTreeString works.
                         iqtree.readTreeString(newick);
                         iqtree.initializeAllPartialPars();
                         iqtree.clearAllPartialLH();
                         const int pars = iqtree.computeParsimony();
-                        // Generate integer-ID newick key (atoi-safe for MTreeSet::init).
                         std::ostringstream _id_ostr;
                         iqtree.printTree(_id_ostr, WT_TAXON_ID | WT_SORT_TAXA);
                         iqtree._gpu_newick_key = _id_ostr.str();
-                        // _pattern_pars correctly filled; gpuREPSEval uses it inside saveCurrentTree
                         bool saved = iqtree.params->spr_parsimony;
                         iqtree.params->spr_parsimony = false;
                         { auto _ts = std::chrono::high_resolution_clock::now();
@@ -948,38 +944,10 @@ void gpuHillClimbing(
                 iqtree._gpu_t_reps += msSince(_t_br);
 
                 const int B_reps = iqtree.gpu_boot_mem_->B;
-                // DEBUG: print min batch_rell across all T_unique trees for rep 0 and rep 1
-                if (T_unique > 0 && round <= 4) {
-                    const int* rell = iqtree.gpu_boot_mem_->h_batch_rell;
-                    int min_r0 = rell[0], max_r0 = rell[0];
-                    int min_r1 = rell[1], max_r1 = rell[1];
-                    int min_pars = unique_trees[0].pars, max_pars = unique_trees[0].pars;
-                    int min_tree_r0 = 0;
-                    for (int u = 0; u < T_unique; u++) {
-                        int v0 = rell[(size_t)u * B_reps + 0];
-                        int v1 = rell[(size_t)u * B_reps + 1];
-                        if (v0 < min_r0) { min_r0 = v0; min_tree_r0 = u; }
-                        if (v0 > max_r0) max_r0 = v0;
-                        if (v1 < min_r1) min_r1 = v1;
-                        if (v1 > max_r1) max_r1 = v1;
-                        if (unique_trees[u].pars < min_pars) min_pars = unique_trees[u].pars;
-                        if (unique_trees[u].pars > max_pars) max_pars = unique_trees[u].pars;
-                    }
-                    // Verify: sum(h_batch_pars[0]) should equal unique_trees[0].pars (uniform weights)
-                    int pars_sum0 = 0;
-                    for (int p = 0; p < nptn; p++)
-                        pars_sum0 += h_batch_pars[p];  // tree[0], pattern p
-                    GPU_LOG("[DEBUG REPS] round=%d T=%d  pars_range=[%d,%d]  rep0: min=%d(t%d) max=%d  rep1: min=%d max=%d\n",
-                            round+1, T_unique, min_pars, max_pars, min_r0, min_tree_r0, max_r0, min_r1, max_r1);
-                    GPU_LOG("[DEBUG REPS]   tree[0].pars=%d  sum(batch_pars[0])=%d  match=%s\n",
-                            unique_trees[0].pars, pars_sum0, (pars_sum0==unique_trees[0].pars)?"YES":"NO");
-                }
                 for (int u = 0; u < T_unique; u++)
                 {
                     auto& info = unique_trees[u];
                     iqtree._gpu_newick_key = info.newick;
-                    // _pattern_pars already filled correctly by computeParsimony() in PASS1.
-                    // gpuSetPatternPars() removed — it set per-BLOCK data which is wrong for REPS.
                     iqtree._gpu_precomputed_rell =
                         iqtree.gpu_boot_mem_->h_batch_rell + (size_t)u * B_reps;
 
@@ -1011,21 +979,21 @@ void gpuHillClimbing(
         if (n_treels > 0 && max_treels > 0)
         {
             CUDA_CHECK(cudaMemcpy(
-                h_treels_bvf.data(), mem->d_treelsBackVf,
+                h_treels_bvf, mem->d_treelsBackVf,
                 (size_t)n_treels * kMaxVFaces * sizeof(int), cudaMemcpyDeviceToHost
             ));
             CUDA_CHECK(cudaMemcpy(
-                h_treels_scores.data(), mem->d_treelsScores,
+                h_treels_scores, mem->d_treelsScores,
                 (size_t)n_treels * sizeof(unsigned int), cudaMemcpyDeviceToHost
             ));
             if (is_bootstrap && mem->d_treelsHashes != nullptr)
                 CUDA_CHECK(cudaMemcpy(
-                    h_treels_hashes.data(), mem->d_treelsHashes,
+                    h_treels_hashes, mem->d_treelsHashes,
                     (size_t)n_treels * sizeof(unsigned int), cudaMemcpyDeviceToHost
                 ));
             if (use_gpu_treels_pars)
                 CUDA_CHECK(cudaMemcpy(
-                    h_treels_ptn_pars.data(), d_treels_ptn_pars,
+                    h_treels_ptn_pars, d_treels_ptn_pars,
                     (size_t)n_treels * nptn_padded * sizeof(uint16_t), cudaMemcpyDeviceToHost
                 ));
         }
@@ -1061,23 +1029,25 @@ void gpuHillClimbing(
                 // Update logl_cutoff for next round's d_treelsCutoff
                 if (!iqtree.treels_logl.empty())
                 {
-                    if (params.gpu_treels_margin > 0)
+                    if (params.gpu_treels_margin < 0.0)
                     {
-                        // Margin-based: save trees within margin of best parsimony.
-                        // logl = -parsimony → best_logl = max(logl) = -min_parsimony
-                        // logl_cutoff = -min_parsimony - margin → boot_cutoff = min_parsimony + margin
-                        double best_logl = *std::max_element(
-                            iqtree.treels_logl.begin(), iqtree.treels_logl.end());
-                        iqtree.logl_cutoff = best_logl - (double)params.gpu_treels_margin;
-                    }
-                    else
-                    {
+                        // save-all: SAVE A saves all testInsert hits; use percentile to
+                        // keep quality threshold for SAVE B/C gates.
                         DoubleVector logl = iqtree.treels_logl;
                         nth_element(
                             logl.begin(), logl.begin() + logl.size() * params.cutoff_percent / 100,
                             logl.end(), std::greater<double>()
                         );
                         iqtree.logl_cutoff = logl[logl.size() * params.cutoff_percent / 100];
+                    }
+                    else
+                    {
+                        // Relative margin: cutoff consistent with SAVE A gate.
+                        // logl = -parsimony → best_logl = -min_parsimony < 0
+                        // boot_cutoff = min_parsimony*(1+r) ↔ logl_cutoff = best_logl*(1+r)
+                        double best_logl = *std::max_element(
+                            iqtree.treels_logl.begin(), iqtree.treels_logl.end());
+                        iqtree.logl_cutoff = best_logl * (1.0 + params.gpu_treels_margin);
                     }
                 }
                 // Convergence check — collect done at step [0] before PASS1 to avoid data race.
@@ -1122,24 +1092,12 @@ void gpuHillClimbing(
             best_pool_round = prev.pool_best;
             if (is_bootstrap)
             {
+                const int _delta_treels = (int)iqtree.treels_logl.size() - _treels_size_pre_pass;
                 GPU_LOG(
-                    "%s Round %2d  +trees=%6d(skip%4d)  k2=%5.2fs"
+                    "%s Round %2d  +uniq=%5d  k2=%5.2fs"
                     "  treels=%6zu  best=%6u  cor=%6.4f\n",
-                    tag, round, _n_new_treels, _t_skip_hash, prev.k2_ms / 1e3,
+                    tag, round, _delta_treels, prev.k2_ms / 1e3,
                     iqtree.treels_logl.size(), prev.pool_best, cur_correlation
-                );
-                GPU_LOG(
-                    "%s         newk=%5.0fms  hash=%4.0fms  bpars=%4.0fms"
-                    "  reps=%4.0fms  save=%5.0fms  |cpu=%6.0fms\n",
-                    tag,
-                    _t_newick_ms, _t_hash_ms, _t_bpars_ms,
-                    iqtree._gpu_t_reps, _t_save_ms, _cpu_ms
-                );
-                GPU_LOG(
-                    "%s         d2h=%5.0fms  ppars=%4.0fms  conv=%4.0fms%s\n",
-                    tag,
-                    prev.d2h_ms, prev.ppars_ms, _t_conv_ms,
-                    _boot_changed ? "" : "(skip)"
                 );
             }
             else
@@ -1198,10 +1156,19 @@ void gpuHillClimbing(
         int _t_skip_hash = 0;
         iqtree._gpu_t_pp = iqtree._gpu_t_reps = iqtree._gpu_t_bupdate = 0.0;
         if (use_batch_reps) unique_trees.clear();
+        // Grow batch REPS buffers for this final round if needed.
+        if (use_batch_reps && prev.n_treels > current_max_reps)
+        {
+            int new_cap = prev.n_treels;
+            h_batch_pars.resize((size_t)new_cap * nptn_padded);
+            gpuBatchREPSGrow(iqtree.gpu_boot_mem_, new_cap);
+            unique_trees.reserve(new_cap);
+            current_max_reps = new_cap;
+        }
 
         for (int t = 0; t < prev.n_treels; t++)
         {
-            if (is_bootstrap && !h_treels_hashes.empty()) {
+            if (is_bootstrap && h_treels_hashes != nullptr) {
                 auto _th = std::chrono::high_resolution_clock::now();
                 unsigned int h  = h_treels_hashes[t];
                 unsigned int ps = h_treels_scores[t];
@@ -1215,38 +1182,27 @@ void gpuHillClimbing(
                 _t_hash_ms += msSince(_th);
             }
 
+            const bool _need_int_ids2 = (is_bootstrap && use_gpu_treels_pars && use_batch_reps);
             auto _tn = std::chrono::high_resolution_clock::now();
             std::string newick = newickFromBackVf(
-                h_treels_bvf.data() + (size_t)t * kMaxVFaces,
-                h_tpl.start_vface, mem->mxtips, iqtree.pllInst->nameList);
+                h_treels_bvf + (size_t)t * kMaxVFaces,
+                h_tpl.start_vface, mem->mxtips,
+                _need_int_ids2 ? nullptr : iqtree.pllInst->nameList,
+                _need_int_ids2);
             _t_newick_ms += msSince(_tn);
             if (newick.empty()) continue;
 
             if (is_bootstrap && use_gpu_treels_pars && use_batch_reps)
             {
                 int u = (int)unique_trees.size();
-                if (u < max_reps_per_round) {
-                    // BUG FIX 1+2: same as main loop — computeParsimony() + integer-ID newick key.
-                    auto _tb = std::chrono::high_resolution_clock::now();
-                    iqtree.readTreeString(newick);
-                    iqtree.initializeAllPartialPars();
-                    iqtree.clearAllPartialLH();
-                    int cpu_pars = iqtree.computeParsimony();
-                    uint16_t* dst = h_batch_pars.data() + (size_t)u * nptn_padded;
-                    const BootValTypePars* ppars2 = iqtree.getPatternPars();
-                    for (int p = 0; p < nptn; p++)
-                        dst[p] = (uint16_t)ppars2[p];
-                    for (int p = nptn; p < nptn_padded; p++)
-                        dst[p] = 0;
-                    std::ostringstream _id_ostr;
-                    iqtree.printTree(_id_ostr, WT_TAXON_ID | WT_SORT_TAXA);
-                    _t_bpars_ms += msSince(_tb);
-                    unique_trees.push_back({_id_ostr.str(), cpu_pars, t});
-                }
+                uint16_t* dst = h_batch_pars.data() + (size_t)u * nptn_padded;
+                const uint16_t* src = h_treels_ptn_pars + (size_t)t * nptn_padded;
+                std::copy(src, src + nptn_padded, dst);
+                unique_trees.push_back({newick, (int)h_treels_scores[t], t});
             }
             else if (is_bootstrap && use_gpu_treels_pars)
             {
-                // BUG FIX 1+2: per-tree fallback — computeParsimony() + integer-ID newick key.
+                // Per-tree fallback (rare): newick is name-based here.
                 iqtree.readTreeString(newick);
                 iqtree.initializeAllPartialPars();
                 iqtree.clearAllPartialLH();
@@ -1301,8 +1257,6 @@ void gpuHillClimbing(
                 {
                     auto& info = unique_trees[u];
                     iqtree._gpu_newick_key = info.newick;
-                    // _pattern_pars correctly filled by computeParsimony() in PASS1 above.
-                    // gpuSetPatternPars() removed — per-block data is wrong for REPS.
                     iqtree._gpu_precomputed_rell =
                         iqtree.gpu_boot_mem_->h_batch_rell + (size_t)u * B_reps;
                     bool saved = iqtree.params->spr_parsimony;
@@ -1426,11 +1380,15 @@ void gpuHillClimbing(
         );
     }
 
-    // Free per-pattern pars device buffer and destroy streams.
+    // Free per-pattern pars device buffer, pinned host treels buffers, and destroy streams.
     // Events (ev_k2_*/ev_ppars_*) are already destroyed above (before pool block).
     // Ignore stream-destroy errors here: under nsys profiling the CUDA context may
     // already be torn down by the time cleanup runs, causing spurious errors.
     if (d_treels_ptn_pars) cudaFree(d_treels_ptn_pars);
+    if (h_treels_ptn_pars) cudaFreeHost(h_treels_ptn_pars);
+    if (h_treels_bvf)      cudaFreeHost(h_treels_bvf);
+    if (h_treels_scores)   cudaFreeHost(h_treels_scores);
+    if (h_treels_hashes)   cudaFreeHost(h_treels_hashes);
     cudaStreamDestroy(stream_reps);
     cudaStreamDestroy(stream);
 }

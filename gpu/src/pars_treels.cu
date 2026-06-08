@@ -128,10 +128,17 @@ __global__ void treelsPatternParsKernel(
             for (int s = 0; s < STATES; s++)
                 p_base[(size_t)s * width + b] = isect_s[s] | (t_N & union_s[s]);
 
-            // Per-pattern accumulation: each b = one informative pattern (per-block format).
-            // __popc(t_N) = number of site occurrences of pattern b requiring substitution.
-            if (b < nptn)
-                pars_ptn[b] += (uint16_t)__popc((unsigned int)t_N);
+            // Per-pattern accumulation: bit i of t_N → pattern b*32+i needs substitution.
+            // Write pars_ptn[ptn] = 1 for each set bit (Fitch: 0 or 1 per pattern per edge).
+            {
+                unsigned int tN = (unsigned int)t_N;
+                const int base_ptn = b * 32;
+                for (int bit = 0; bit < 32; bit++) {
+                    const int ptn = base_ptn + bit;
+                    if (ptn < nptn)
+                        pars_ptn[ptn] += (uint16_t)((tN >> bit) & 1u);
+                }
+            }
         }
     }
     __syncwarp();
@@ -150,8 +157,15 @@ __global__ void treelsPatternParsKernel(
             #pragma unroll
             for (int s = 0; s < STATES; s++)
                 ored |= t_base[(size_t)s * width + b] & i_base[(size_t)s * width + b];
-            if (b < nptn)
-                pars_ptn[b] += (uint16_t)__popc((unsigned int)(~ored));
+            {
+                unsigned int cross = (unsigned int)(~ored);
+                const int base_ptn = b * 32;
+                for (int bit = 0; bit < 32; bit++) {
+                    const int ptn = base_ptn + bit;
+                    if (ptn < nptn)
+                        pars_ptn[ptn] += (uint16_t)((cross >> bit) & 1u);
+                }
+            }
         }
     }
     __syncwarp();
@@ -326,6 +340,13 @@ bool gpuComputeTreelsPatternPars(
 
     if (states != 4 && states != 20) return false;
 
+    // Use K_ppars (>= K) blocks per launch to improve GPU occupancy.
+    // d_ppars_parsVect provides scratch for K_ppars concurrent blocks.
+    // Batches execute sequentially on the same stream — no data race.
+    // Caller's cudaStreamSynchronize waits for all batches to finish.
+    const int Kp = mem->K_ppars;
+    parsimonyNumber* d_pv = mem->d_ppars_parsVect;
+
     if (is_sankoff)
     {
         // Sankoff kernel: shared = ti + tiStack + cost_matrix
@@ -333,23 +354,22 @@ bool gpuComputeTreelsPatternPars(
             (size_t)(3 * (N - 1) + 256) * sizeof(int)
             + (size_t)(states * states) * sizeof(unsigned int);
 
-        for (int batch_start = 0; batch_start < n_treels; batch_start += K)
+        for (int batch_start = 0; batch_start < n_treels; batch_start += Kp)
         {
-            const int batch_size = std::min(K, n_treels - batch_start);
+            const int batch_size = std::min(Kp, n_treels - batch_start);
             if (states == 4)
                 treelsPatternParsKernelSankoff<4><<<dim3(batch_size), dim3(32), smem_bytes, stream>>>(
                     batch_start, n_treels, N, width, nptn_padded, start_vf,
-                    mem->d_treelsBackVf, mem->d_parsVect, mem->parsVectPerTree,
+                    mem->d_treelsBackVf, d_pv, mem->parsVectPerTree,
                     mem->d_cost_matrix, d_treels_ptn_pars
                 );
             else
                 treelsPatternParsKernelSankoff<20><<<dim3(batch_size), dim3(32), smem_bytes, stream>>>(
                     batch_start, n_treels, N, width, nptn_padded, start_vf,
-                    mem->d_treelsBackVf, mem->d_parsVect, mem->parsVectPerTree,
+                    mem->d_treelsBackVf, d_pv, mem->parsVectPerTree,
                     mem->d_cost_matrix, d_treels_ptn_pars
                 );
             CUDA_CHECK(cudaGetLastError());
-            cudaStreamSynchronize(stream);
         }
     }
     else
@@ -358,25 +378,24 @@ bool gpuComputeTreelsPatternPars(
         const size_t smem_bytes =
             (size_t)(3 * (N - 1) + 256) * sizeof(int);
 
-        for (int batch_start = 0; batch_start < n_treels; batch_start += K)
+        for (int batch_start = 0; batch_start < n_treels; batch_start += Kp)
         {
-            const int batch_size = std::min(K, n_treels - batch_start);
+            const int batch_size = std::min(Kp, n_treels - batch_start);
 
             if (states == 4)
                 treelsPatternParsKernel<4><<<dim3(batch_size), dim3(32), smem_bytes, stream>>>(
                     batch_start, n_treels, N, width, nptn, nptn_padded, start_vf,
-                    mem->d_treelsBackVf, mem->d_parsVect, mem->parsVectPerTree,
+                    mem->d_treelsBackVf, d_pv, mem->parsVectPerTree,
                     d_treels_ptn_pars
                 );
             else
                 treelsPatternParsKernel<20><<<dim3(batch_size), dim3(32), smem_bytes, stream>>>(
                     batch_start, n_treels, N, width, nptn, nptn_padded, start_vf,
-                    mem->d_treelsBackVf, mem->d_parsVect, mem->parsVectPerTree,
+                    mem->d_treelsBackVf, d_pv, mem->parsVectPerTree,
                     d_treels_ptn_pars
                 );
 
             CUDA_CHECK(cudaGetLastError());
-            cudaStreamSynchronize(stream);
         }
     }
 

@@ -128,6 +128,22 @@ void gpuBootstrapMemFree(GpuBootstrapMem* mem)
     delete mem;
 }
 
+void gpuBatchREPSGrow(GpuBootstrapMem* mem, int new_max)
+{
+    if (!mem || new_max <= mem->max_batch) return;
+    if (mem->d_batch_pars) { cudaFree(mem->d_batch_pars);   mem->d_batch_pars = nullptr; }
+    if (mem->d_batch_rell) { cudaFree(mem->d_batch_rell);   mem->d_batch_rell = nullptr; }
+    if (mem->h_batch_rell) { cudaFreeHost(mem->h_batch_rell); mem->h_batch_rell = nullptr; }
+    mem->max_batch = 0;
+    CUDA_CHECK(cudaMalloc(&mem->d_batch_pars,
+        (size_t)new_max * mem->nunit * sizeof(unsigned short)));
+    CUDA_CHECK(cudaMalloc(&mem->d_batch_rell,
+        (size_t)new_max * mem->B * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&mem->h_batch_rell,
+        (size_t)new_max * mem->B * sizeof(int)));
+    mem->max_batch = new_max;
+}
+
 void gpuBatchREPSEval(GpuBootstrapMem* mem,
                       const unsigned short* h_batch_pars, int T,
                       cudaStream_t stream)

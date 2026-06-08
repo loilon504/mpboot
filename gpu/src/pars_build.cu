@@ -1,5 +1,8 @@
 #include <type_traits>
 
+// Opt-5: causes pars_tree.cuh to define g_sankoff_cm here (not extern) — avoids NVCC redefinition.
+#define PARS_BUILD_DEFINE_CM
+
 #include "gpu/include/pars_build.cuh"
 #include "gpu/include/pars_tree.cuh"
 #include "gpu/include/topo_helpers.cuh"
@@ -7,6 +10,12 @@
 
 namespace mpbootgpu
 {
+
+void gpuUploadSankoffCostMatrix(const unsigned int* cm, int nstates)
+{
+    const size_t costBytes = (size_t)nstates * nstates * sizeof(unsigned int);
+    CUDA_CHECK(cudaMemcpyToSymbol(g_sankoff_cm, cm, costBytes));
+}
 
 __device__ __forceinline__ void gpuHookup(
     GpuTopology* t, int a, int b
@@ -137,7 +146,10 @@ __device__ void testInsert(
         if (lane == 0)
         {
             sh.bcast[7] = -1;
-            if (mp < sh.randomMP + sh.save_margin)
+            bool pass_save_a = (sh.save_margin < 0.0f)
+                               ? true
+                               : (mp < (unsigned int)((float)sh.randomMP * (1.0f + sh.save_margin)));
+            if (pass_save_a)
             {
                 unsigned int cutoff = *((volatile unsigned int*)treels_cutoff);
                 if (mp <= cutoff && *((volatile int*)treels_filled) < max_treels)
@@ -739,10 +751,18 @@ __device__ void runPhase3(
     int*   treels_filled,         // atomic fill counter or nullptr
     unsigned int* treels_cutoff,  // score ≤ cutoff → write to treels; nullptr = disabled
     int    max_treels,            // treels buffer capacity
-    unsigned int* treels_hashes   // [max_treels] topology hash per slot; nullptr = disabled
+    unsigned int* treels_hashes,  // [max_treels] topology hash per slot; nullptr = disabled
+    int    treels_writers         // only blockIdx.x < treels_writers write to treels
 )
 {
-    // ── Step 1: Pool restart — random slot in [0, pool_size) ─────────────────
+    // Writer flag: only the first treels_writers blocks may write to the treels buffer.
+    // Non-writers still update the pool and global best, contributing to search diversity.
+    const bool is_writer = (blockIdx.x < treels_writers);
+
+    // ── Step 1: Pool restart ─────────────────────────────────────────────────
+    // Writers: deterministic slot (blockIdx.x/2 % pool_size) ensures each pool tree
+    // gets exactly one NNI worker + one ratchet worker exploring it per round.
+    // Non-writers: random probe for diversity in pool updates.
     if (pool_scores != nullptr)
     {
         if (lane == 0)
@@ -751,12 +771,22 @@ __device__ void runPhase3(
             int filled = *pool_filled;
             if (filled > 0)
             {
-                // Random starting slot based on blockIdx.x; linear probe for non-empty slot.
-                unsigned int rv = (unsigned int)(blockIdx.x * 2654435761u ^ 1013904223u);
-                rv = rv ^ (rv >> 16);
+                int start_slot;
+                if (is_writer)
+                {
+                    // Deterministic: pair (0,1)→slot 0, pair (2,3)→slot 1, …
+                    start_slot = (blockIdx.x / 2) % pool_size;
+                }
+                else
+                {
+                    // Random: linear probe from a hash of blockIdx.x
+                    unsigned int rv = (unsigned int)(blockIdx.x * 2654435761u ^ 1013904223u);
+                    rv = rv ^ (rv >> 16);
+                    start_slot = (int)(rv % (unsigned int)pool_size);
+                }
                 for (int attempt = 0; attempt < pool_size; attempt++)
                 {
-                    int slot = (int)((rv + (unsigned int)attempt) % (unsigned int)pool_size);
+                    int slot = (start_slot + attempt) % pool_size;
                     if (pool_scores[slot] != 0xFFFFFFFFu)
                     {
                         sh.bcast[2] = slot;
@@ -802,6 +832,14 @@ __device__ void runPhase3(
     }
 
     // ── Step 2: Even workers → NNI, odd workers → ratchet (fixed per worker) ─
+    // Non-writers pass nullptr for treels to gpuSPRHillClimb, suppressing SAVE A writes.
+    unsigned int* w_treels_scores  = is_writer ? treels_scores  : nullptr;
+    int*          w_treels_back_vf = is_writer ? treels_back_vf : nullptr;
+    int*          w_treels_filled  = is_writer ? treels_filled  : nullptr;
+    unsigned int* w_treels_cutoff  = is_writer ? treels_cutoff  : nullptr;
+    int           w_max_treels     = is_writer ? max_treels     : 0;
+    unsigned int* w_treels_hashes  = is_writer ? treels_hashes  : nullptr;
+
     const bool iter_is_nni = (blockIdx.x % 2 == 0);
     if (iter_is_nni)
     {
@@ -818,7 +856,7 @@ __device__ void runPhase3(
         __syncwarp();
 
         gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane,
-            treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels, treels_hashes);
+            w_treels_scores, w_treels_back_vf, w_treels_filled, w_treels_cutoff, w_max_treels, w_treels_hashes);
     }
     else
     {
@@ -853,7 +891,7 @@ __device__ void runPhase3(
         __syncwarp();
 
         gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane,
-            treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels, treels_hashes);
+            w_treels_scores, w_treels_back_vf, w_treels_filled, w_treels_cutoff, w_max_treels, w_treels_hashes);
 
         if (lane == 0)
             sh.site_weights = sh.use_sankoff ? sw_k : nullptr;  // restore original weights
@@ -870,7 +908,7 @@ __device__ void runPhase3(
         __syncwarp();
 
         gpuSPRHillClimb<STATES>(pars_tree, score_tree, topo, sh, N, sprDist, width, lane,
-            treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels, treels_hashes);
+            w_treels_scores, w_treels_back_vf, w_treels_filled, w_treels_cutoff, w_max_treels, w_treels_hashes);
     }
 
     // ── Step 3: Stagnation tracking + pool insert with hash dedup ────────────
@@ -991,7 +1029,8 @@ __device__ void runPhase3(
 
     // ── Treels write: add current tree to bootstrap output buffer if score ≤ cutoff ──
     // No lock needed: each slot assigned uniquely via atomicAdd → no two warps collide.
-    if (treels_scores != nullptr && treels_filled != nullptr && treels_cutoff != nullptr)
+    // Only writer blocks (blockIdx.x < treels_writers) may write here.
+    if (is_writer && treels_scores != nullptr && treels_filled != nullptr && treels_cutoff != nullptr)
     {
         if (lane == 0)
         {
@@ -1068,9 +1107,8 @@ __global__ void buildParsimonyTreesKernel(
     {
         sh.seed = d_seeds[k];
         sh.use_sankoff = (d_cost_matrix != nullptr);
-        sh.cost_matrix = d_cost_matrix;
         sh.site_weights = sh.use_sankoff ? sw_k : nullptr;
-        sh.save_margin = 0;  // K1 doesn't write to treels
+        sh.save_margin = -1.0f;  // K1 doesn't write to treels
 
         for (int i = 1; i <= N; i++)
         {
@@ -1252,7 +1290,8 @@ __global__ void buildPhase3Kernel(
     int    max_treels,
     unsigned int* treels_hashes,       // [max_treels] topology hash per slot; nullptr = disabled
     const unsigned int* d_cost_matrix, // nullptr = Fitch mode
-    unsigned int save_margin           // testInsert near-optimal save margin
+    float save_margin,                 // relative SAVE A margin: -1=save all, r≥0 → mp < randomMP*(1+r)
+    int treels_writers                 // only blockIdx.x < treels_writers write to treels
 )
 {
     __shared__ BuildSharedT<NTAXA> sh;
@@ -1275,7 +1314,6 @@ __global__ void buildPhase3Kernel(
         sh.randomMP = topo->postSprParsimony;
         sh.randomMPHits = 1;
         sh.use_sankoff = (d_cost_matrix != nullptr);
-        sh.cost_matrix = d_cost_matrix;
         sh.site_weights = sh.use_sankoff ? sw_k : nullptr;
         sh.bestParsimony = topo->bestParsimony;
         sh.save_margin = save_margin;
@@ -1287,7 +1325,7 @@ __global__ void buildPhase3Kernel(
         pars_tree, score_tree, topo, sh, sw_k, ratchet_k, N, sprDist, numNNI, lane, k, width,
         pool_size, pool_scores, pool_back_vf, pool_filled, pool_slot_locks, pool_hashes,
         global_best, treels_scores, treels_back_vf, treels_filled, treels_cutoff, max_treels,
-        treels_hashes
+        treels_hashes, treels_writers
     );
 }
 
@@ -1401,6 +1439,14 @@ void gpuStepwiseBuildTrees(
             CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 4096));
         }
 
+        // In bootstrap mode (max_treels > 0): restrict treels writes to pool_size*2 workers.
+        // Writers (blockIdx.x < treels_writers) use deterministic pool assignment
+        // (pair 0,1→slot 0; pair 2,3→slot 1; …) and write to treels.
+        // Non-writers still explore and update the pool, but skip treels writes.
+        const int treels_writers = (mem->max_treels > 0)
+            ? std::min(k2_workers, poolSize * 2)
+            : k2_workers;
+
         // Launch K2 async — AfterK2Callback (if any) runs CPU work while K2 executes
         cudaEvent_t k2_start, k2_end;
         cudaEventCreate(&k2_start);
@@ -1414,7 +1460,7 @@ void gpuStepwiseBuildTrees(
             mem->d_poolHashes, mem->d_globalBest,
             mem->d_treelsScores, mem->d_treelsBackVf, mem->d_treelsFilled,
             mem->d_treelsCutoff, mem->max_treels, mem->d_treelsHashes,
-            mem->d_cost_matrix, mem->save_margin
+            mem->d_cost_matrix, mem->save_margin, treels_writers
         );
         cudaEventRecord(k2_end, stream);
         CUDA_CHECK(cudaGetLastError());

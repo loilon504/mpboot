@@ -1694,7 +1694,8 @@ struct Params {
     int gpu_pool_size;    // number of pool slots for population-based restarts (default 20)
     int gpu_worker;       // number of K2 blocks; default 200
     int gpu_worker_stop;  // stop threshold multiplier: unsuccess_iteration + K*gpu_worker_stop (default 1)
-    int gpu_treels_margin;  // near-optimal treels save margin: save candidates with mp < randomMP + margin (default 10)
+    double gpu_treels_margin;  // relative SAVE A margin: -1=save all, r≥0 → mp < randomMP*(1+r)
+    int gpu_boot_nni_rounds;   // max outer SPR rounds per replicate in GPU optimizeBootTrees; -1=full convergence
     int gpu_device;    // CUDA device ID to use (default 1)
 };
 

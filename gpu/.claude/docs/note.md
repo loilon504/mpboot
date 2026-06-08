@@ -1377,3 +1377,224 @@ GPU có ít tổng splits hơn (1530 vs 7635) nhưng MORE splits >50% (537 vs 49
 
 **Files thay đổi**: `gpu/src/gpu_init_trees.cu` (4 PASS1 sites + remove debug block).
 
+---
+
+## Q: nsplits=1 — Phân tích lại sau khi fix (2026-06-01)
+
+**Date**: 2026-06-01
+
+### 1. Fix newick format có thật sự đúng không?
+
+**Có.** Chuỗi nhân quả xác nhận được:
+
+- `newickFromBackVf()` → newick dạng `(Ajellomyces_capsulatum:0.1,...)` (tên thật)
+- PASS1 set `_gpu_newick_key = newick_tên_thật`
+- `saveCurrentTree()` với `_gpu_newick_key` ≠ "" → dùng nó trực tiếp làm key trong `iqtree.treels`
+- `summarizeBootstrap` → `MTreeSet::init` → `atoi("Ajellomyces_capsulatum") = 0` cho **tất cả** taxa
+- `MTree::convertSplits` → `resp->addTaxon(0)` cho mọi lá → tất cả splits = {bit 0} → nsplits=1
+
+Fix (`printTree(WT_TAXON_ID | WT_SORT_TAXA)` → lưu integer-ID newick vào `_gpu_newick_key`) đúng.
+
+CPU mode không bị vì CPU từ trước đã lưu integer-ID newick làm key (do `saveCurrentTree` gọi `printTree` khi `_gpu_newick_key` rỗng). GPU mode dùng `_gpu_newick_key` để bypass phần đó → tạo ra bug khi `_gpu_newick_key` không phải integer-ID.
+
+---
+
+### 2. treelsPatternParsKernel: kernel đang chạy nhưng output bị BỎ QUA
+
+**Vấn đề thiết kế**:
+
+`treelsPatternParsKernel` (alias `gpuComputeTreelsPatternPars`) được thiết kế để tính per-pattern parsimony trên GPU, tránh phải gọi `readTreeString + computeParsimony()` trên CPU (rất chậm, ~4ms/tree).
+
+Tuy nhiên, kernel có bug: output `pars_ptn[block_b] = __popc(t_N)` là parsimony của **32 sites gộp thành 1 SIMD block**, trong khi batch REPS cần parsimony của **original pattern b** (indexing alignment). Hai cái này **KHÔNG tương đương** → dimensional mismatch → REPS score sai → nsplits=1 (Fix 1 trong chuỗi fix).
+
+**Trạng thái hiện tại** (sau các fix):
+
+```
+Mỗi round:
+  Step [5]: gpuComputeTreelsPatternPars → d_treels_ptn_pars  ← CHẠY nhưng SẼ BỊ BỎ QUA
+  Step [7]: download d_treels_ptn_pars → h_treels_ptn_pars  ← DOWNLOAD nhưng SẼ BỊ BỎ QUA
+  PASS1:   for each tree: readTreeString + computeParsimony()  ← CPU per-tree (chậm)
+                          + printTree(WT_TAXON_ID)              ← thêm overhead
+```
+
+Kernel vẫn chạy + download → **tốn thời gian GPU + PCIe bandwidth vô ích**.
+
+---
+
+### 3. Treels count bị giới hạn: max_reps_per_round = 2000
+
+**Trước fix** (code với GPU ppars memcpy):
+```cpp
+memcpy(h_batch_pars[u], h_treels_ptn_pars[t], nptn_padded)  // ~0.01ms/tree
+unique_trees.push_back({newick, score, t})  // chỉ 2000 đầu
+// Trees 2001+ bị drop hoàn toàn — không saveCurrentTree
+```
+
+**Sau fix**:
+```cpp
+readTreeString(newick)      // parse PLL tree
+initializeAllPartialPars()
+clearAllPartialLH()
+computeParsimony()          // ~4ms/tree (O(N×width))
+printTree(WT_TAXON_ID)      // ~0.5ms/tree
+unique_trees.push_back(...)  // vẫn chỉ 2000 đầu
+// Trees 2001+ vẫn bị drop
+```
+
+Giới hạn 2000/round **đã tồn tại trước khi fix nsplits=1** (do comment ở `gpu_init_trees.cu:671-675` ghi rõ là TODO). Fix nsplits=1 không thay đổi con số này.
+
+Tác động: Round 1 của N=295 có ~18071 treels từ GPU, nhưng chỉ 2000 cái đầu được `saveCurrentTree()`. 16071 cây còn lại bị drop vĩnh viễn → `iqtree.treels` thiếu đa dạng topology.
+
+Lý do chưa tăng giới hạn: với `computeParsimony()` 4ms/tree × 2000 = **8 giây/round** CPU. Nếu tăng lên 10000 → 40 giây/round → quá chậm.
+
+---
+
+### 4. Con đường sửa đúng (TODO)
+
+Để khôi phục speedup GPU + đồng thời sửa cả 3 vấn đề:
+
+**Bước A**: Fix `treelsPatternParsKernel` (trong `pars_treels.cu`) để output per-original-pattern parsimony:
+- Cần upload `site_to_pattern_map[site_b]` từ CPU lên GPU (mapping từ SIMD block → original pattern index)
+- Kernel mới: `pars_ptn[pattern_id] = __popc(t_N)` đúng indexing → không còn dimensional mismatch
+
+**Bước B**: Fix `newickFromBackVf` để output integer-ID newick (thay `nameList[num]` bằng `std::to_string(num-1)`):
+- `num` ∈ 1..N (1-indexed tip) → `num-1` = 0-indexed integer, match output của `printTree(WT_TAXON_ID)`
+- `MTreeSet::init` sẽ parse đúng: `atoi("0")=0, atoi("1")=1,...`
+- Loại bỏ hoàn toàn `readTreeString + printTree()` trong PASS1
+
+**Kết quả sau A+B**:
+```
+PASS1: for each tree:
+  newick = newickFromBackVf(...)   // ~0.01ms — integer-ID output (Bước B)
+  pars_ptn = h_treels_ptn_pars[t] // GPU kernel output, đúng (Bước A)
+  unique_trees.push_back(...)      // không cần readTreeString hay computeParsimony!
+```
+
+→ PASS1 trở lại ~0.01ms/tree → có thể tăng `max_reps_per_round` lên 10000-20000 mà không ảnh hưởng tốc độ.
+
+
+---
+
+## ppars async fix — Bug trong gpuComputeTreelsPatternPars (2026-06-01)
+
+**Q**: Tại sao `ppars` kernel (treelsPatternParsKernel) vẫn blocking dù được launch "async"?
+
+**A**: Bug: `cudaStreamSynchronize(stream)` nằm **bên trong vòng lặp batch** của `gpuComputeTreelsPatternPars`. Với n_treels=300k và batch_size=K=100: 3000 lần sync × ~1ms mỗi lần = ~5.5s blocking trên host. Trong khi đó REPS + save (concurrent với ppars) không thể chạy song song.
+
+**Root cause**:
+```cpp
+for (int batch_start = 0; batch_start < n_treels; batch_start += K) {
+    const int batch_size = std::min(K, n_treels - batch_start);
+    treelsPatternParsKernel<4><<<dim3(batch_size), ...>>>(batch_start, ...);
+    CUDA_CHECK(cudaGetLastError());
+    cudaStreamSynchronize(stream);  // ← BUG: sync sau mỗi batch!
+}
+```
+
+**Tại sao không thể dùng 1 kernel call cho toàn bộ n_treels?**  
+Kernel dùng `blockIdx.x` làm index vào `d_parsVect[k]` scratch space (K=100 slots). Với single-call và n_treels=300k blocks: `k=blockIdx.x` vượt quá K=100 → out-of-bounds memory access → `cudaErrorIllegalAddress`.
+
+**Fix đúng**: Giữ vòng lặp batch, **chỉ xóa `cudaStreamSynchronize`** bên trong. Batches queue lên stream asynchronously; caller (step [7] của `gpuHillClimbing`) sẽ sync sau khi REPS+PASS2 hoàn thành.
+
+```cpp
+for (int batch_start = 0; batch_start < n_treels; batch_start += K) {
+    const int batch_size = std::min(K, n_treels - batch_start);
+    treelsPatternParsKernel<4><<<dim3(batch_size), ...>>>(batch_start, ...);
+    CUDA_CHECK(cudaGetLastError());
+    // KHÔNG có cudaStreamSynchronize — batches chạy async trên stream
+}
+```
+
+**Kết quả (N=295, tree1.phy)**: 142s → **120s** (−15%), 14 rounds → 11 rounds, splits≥50%: 566 → 569.
+
+**ncu metrics (Jun 1, N=241, ds=3)**:
+| Kernel | SM% | DRAM% | Warp% | Dur/call |
+|--------|-----|-------|-------|----------|
+| K2 (buildPhase3Kernel) | 2.08% | 0.04% | 1.56% | 1.08s |
+| ppars (treelsPatternParsKernel) | 1.58% | 0.44% | 1.56% | 1.56ms |
+| REPS (batchREPSKernel) | 24.19% | 43.26% | 48.93% | 51.7ms |
+
+**nsys totals (N=241, 6 rounds)**:
+- K2: 6.80s (49%), ppars: 5.55s (40%), K1: 1.43s (10%), REPS: 217ms (1.5%)
+
+**ppars bottleneck analysis**:
+- 1.58% SM utilization (chỉ 100 blocks/batch trên 108 SMs)
+- Latency-bound: mỗi block traverses cây tuần tự (~240 inner nodes cho N=241)
+- Để cải thiện: cần batch_size lớn hơn → cần thêm scratch space (hiện tại bị giới hạn bởi K=100 slots trong d_parsVect)
+
+---
+
+## Q: nsys + ncu profile của buildPhase3Kernel<20,800> (Sankoff protein prot_M10236_59_164) sau Opt-4+Opt-5
+
+**Môi trường**: Device 5 (A100, CC 8.0), numpars=20, prot_M10236_59_164 (59 taxa, width=164, STATES=20)
+
+### Kết quả ncu chính
+
+| Metric | Giá trị | Ý nghĩa |
+|--------|---------|---------|
+| Registers Per Thread | **255** | Max phần cứng (65,536 regs/SM ÷ 32 threads/warp ÷ 8 warps = 256 max, giới hạn thực là 255) |
+| Stack Size | **4096 bytes** | Register spill → local memory (đã bump từ 1024 → 4096 trước đó) |
+| Theoretical Occupancy | **12.5%** | 8 blocks/SM, giới hạn bởi registers (8×32×255=65,280 ≤ 65,536) |
+| Achieved Occupancy | **1.56%** | 20 blocks / 108 SMs → chỉ ~18% SMs có block, nên achieved rất thấp |
+| DRAM Throughput | **0.00%** | ✅ Opt-5 hoạt động: cost matrix từ constant cache, không có DRAM traffic |
+| L1/TEX Hit Rate | **68.87%** | parsVect cho 59 taxa fit tốt trong L1 |
+| L2 Hit Rate | **99.9%** | Gần như toàn bộ từ L2 |
+| Compute Throughput | **1.93%** | Thấp vì ít blocks (measurement artifact, không phải bottleneck thực) |
+| Warp Cycles Per Issued Inst | **2.93** | Rất tốt — không có latency stall đáng kể |
+| Memory Throughput | **~41 MB/s** | Rất thấp, kernel là compute-bound |
+
+### Phân tích
+
+1. **Register maxed (255)**: Opt-4 thêm 40 registers (lv_[20]+rv_[20]) đã đẩy compiler đến hardware limit. Compiler buộc spill vào local memory (stack). Tuy nhiên warp cycles 2.93 cho thấy spill không dominate latency — vì parsVect nhỏ (59 taxa), tất cả từ L1/L2 cache.
+
+2. **DRAM = 0%**: Opt-5 constant memory broadcast hoàn toàn thành công. 400 uint32 = 1600 bytes của cost matrix được served từ constant cache (64KB dedicated), không có L2/DRAM roundtrip. Đây là speedup chính cho Sankoff.
+
+3. **Occupancy bottleneck**: 12.5% theoretical do register limit (255 regs × 32 threads × 8 blocks = 65,280). Với NTAXA=800 → shared mem 11.6 KB/block → 8 blocks fit theo shared mem (8×11.6 = 92.8 KB < 102.4 KB limit). Bottleneck là registers, không phải shared mem.
+
+4. **Low achieved occupancy (1.56%)**: Chỉ do test nhỏ (20 workers, 108 SMs). Trong benchmark thực với 200 workers, achieved occupancy sẽ cao hơn đáng kể.
+
+5. **Warp Cycles Per Instruction = 2.93**: Tốt hơn expected — CUDA A100 issue rate ~4 cycles/instruction khi đầy đủ. Giá trị 2.93 nghĩa là pipeline gần như full, ít stall.
+
+### Bottleneck hiện tại
+
+Không phải memory bandwidth (DRAM≈0%). Bottleneck chính là **compute**: STATES²=400 iterations per pattern, mỗi iteration là `min(lv+c, best_left)`. Với width=164, tổng = 164×400×2 = ~131K min operations per warp per newview call. Đây là fundamental algorithmic cost của Sankoff.
+
+**Opt tiếp theo có thể**: Giảm register pressure bằng cách giới hạn compile-time STATES (template STATES=20 thay vì kMaxSankoffStates=20 dynamic array), hoặc tách lv_/rv_ preload thành shared memory thay vì registers.
+
+
+---
+
+## GPU Bootstrap: "Luôn 300 reps" — Nguyên nhân và so sánh với old GPU
+
+**Date**: 2026-06-08
+
+### Q: Tại sao GPU bootstrap Sankoff luôn hội tụ ở 300 reps?
+
+**A: Cơ chế dừng:**
+```
+unsuccess_thresh = k2_workers × gpu_worker_stop = 100 × 1 = 100
+Dừng khi: (total_done − last_impr_at) > unsuccess_thresh AND cor ≥ 0.99
+```
+`last_impr_at` chỉ cập nhật khi best pool parsimony score cải thiện. Round 1 luôn set `last_impr_at=100` (lần đầu thấy best score). Các round sau không cải thiện → sau Round 3: `300−100=200 > 100` → **dừng cơ học**.
+
+**Old GPU (May 21 build) dùng threshold khác:**
+- `dna_M10243`: `unsuccess=400` → dừng ở Round 6 (600 reps)
+- `prot_M10236/M10866`: `unsuccess=200` → dừng ở Round 4 (400 reps)
+- Current: `unsuccess=100` → dừng ở Round 3 (300 reps, mọi dataset)
+
+**Fix:** dùng `-gpu_worker_stop 2` để `unsuccess_thresh=200` (~5 rounds), hoặc `-gpu_worker_stop 4` (~7 rounds).
+
+### Q: `best_pool` của old GPU protein rất thấp (292 vs BEST SCORE 1182)?
+
+**A:** Old GPU protein bootstrap pool score không bằng original Sankoff parsimony:
+- `prot_M10236`: best_pool=292 vs BEST_SCORE=1182 (ratio=0.25), Fitch=996
+- `prot_M10866`: best_pool=5862 vs BEST_SCORE=33170 (ratio=0.18)
+- `dna_M10243`: best_pool=3389 = BEST_SCORE=3389 ✓ (DNA correct)
+
+Khả năng: old GPU K2 bootstrap phase dùng **bootstrap-resampled data parsimony** làm pool score thay vì original data, gây treels có cấu trúc khác. Kết quả support values protein không so sánh được trực tiếp giữa old và new GPU.
+
+### Q: Support values khác nhau bao nhiêu?
+
+DNA (algorithm giống nhau): small diff (dna_M10243: 125→124 splits, mean 61→59%).
+Protein: diff lớn hơn do pool scoring khác (prot_M10236: 35→32 splits, mean 57→79%).
+

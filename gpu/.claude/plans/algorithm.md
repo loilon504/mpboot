@@ -272,3 +272,92 @@ Chỉ sau khi Priorities 1–4 verified:
 - GPU: 70% branches tại support=100% (over-confident)
 - CPU: spread đều 30–100%
 - GPU poorly calibrated mid-range: 80% support → 59.5% đúng (CPU: 92.3%)
+
+---
+
+## ✅ Optimizations tháng 6/2026 (post-Priority-4)
+
+### Opt A1 — Fix Fitch kernel pars_ptn indexing (`pars_treels.cu`)
+`pars_ptn[b] += __popc(t_N)` → bit-extract loop per pattern. Fix correctness bootstrap DNA.
+
+### Opt A2 — newickFromBackVf use_int_ids (`gpu_init_trees.cu`)
+Thêm `use_int_ids=true` → output integer taxon IDs (0-indexed) thay vì string names.  
+Lý do: PASS1 dùng `printTree(WT_TAXON_ID)` → cần match.
+
+### Opt A3 — PASS1 fast copy (`gpu_init_trees.cu`)
+Thay CPU `computeParsimony()` per-tree (~4ms/tree) bằng copy từ `h_treels_ptn_pars`.  
+`std::copy(h_treels_ptn_pars + t*nptn_padded, ..., h_batch_pars + u*nptn_padded)`
+
+### Opt A4 — max_reps_per_round 2000 → 20000 (`gpu_init_trees.cu`)
+Sau khi A3, PASS1 không còn bottleneck CPU → tăng reps/round để đưa nhiều tree hơn vào pool.
+
+### Opt B — K_ppars=1000 dynamic (`pars_tree.cuh`, `pars_tree.cu`, `pars_treels.cu`)
+Alloc `d_ppars_parsVect` riêng từ free VRAM sau tất cả alloc khác. K_ppars = min(1000, free*0.8/per_tree).  
+`treelsPatternParsKernel` dùng `K_ppars` thay `K`. Kết quả M10467: ppars 8239→6620ms (~1.24×).
+
+### Opt C — Pinned memory cudaMallocHost (`gpu_init_trees.cu` lines 640–667, 1383–1391)
+Đổi `std::vector` → raw pointer + `cudaMallocHost` cho:
+- `h_treels_bvf` (246 MB cho n=19k)
+- `h_treels_scores`, `h_treels_hashes` (77 KB mỗi cái)
+- `h_treels_ptn_pars` (157 MB)
+
+Root cause D2H chậm: pageable memory page-fault lần đầu (~200 MB/s). Sau pin: ổn định ~6 GB/s từ round 1.  
+Kết quả D2H R1: 2493ms → 388ms (**6.4×**). Wall-clock: 71.1s → 68.3s (M10467).
+
+### Opt D — K2_N ∥ ppars_{N-1} (kế hoạch, chưa làm)
+Xem `ppars_opt.md` cho analysis đầy đủ. Ước tính ~44–48% speedup tổng.
+
+---
+
+## Bootstrap algorithm: CPU vs GPU (khám phá 01/06/2026)
+
+### CPU MPBoot bootstrap (parsimony, KHÔNG phải UFBoot/likelihood)
+
+Thuật toán **online evaluation** — không search per-replicate:
+
+```
+Khởi tạo: 99 parsimony trees → 31 unique topologies → evaluate trên 1000 samples
+Main loop (Ratchet/NNI trên original alignment):
+    sinh cây mới → ngay lập tức evaluate trên TẤT CẢ 1000 bootstrap samples:
+        for sample in 0..999:
+            rell_pars = sum(pattern_pars[ptn] × boot_freq[sample][ptn])
+            if rell_pars >= boot_logl[sample]:
+                boot_trees[sample] = cây này  ← cập nhật winner
+Kết thúc: boot_trees[0..999] → build consensus
+```
+
+**"161,879 bootstrap candidate trees evaluated"** = `treels_logl.size()` = tổng unique trees đã push vào pool trong suốt search. Ratchet tạo ~161,848 cây mới ngoài 31 ban đầu.
+
+**"31 distinct locally optimal trees"** = unique topologies sau khởi tạo 99 cây ban đầu (69 duplicate).
+
+### So sánh pool GPU vs CPU (18 DNA datasets, jun1)
+
+| | GPU (jun1) | CPU MPBoot |
+|--|-----------|-----------|
+| Pool size | **39k–86k** (mean 50,720) | **95–162k** (mean 161,879) |
+| Ratio | 1× | ~3× lớn hơn GPU |
+| Search strategy | K2 uniform hill-climbing | Ratchet (thay đổi pattern weights → đa dạng hơn) |
+| Evaluation timing | Offline (REPS phase sau mỗi round) | Online (ngay khi có cây mới) |
+| 100% support branches | ~0.9% (45/4838) | ~27% (1322/4838) |
+| Metric | parsimony REPS | parsimony RELL |
+
+### Bootstrap calibration: GPU OLD vs GPU NEW (jun1) vs CPU (18 DNA datasets)
+
+**5-wide bins, center → true%:**
+
+| Support | GPU OLD | GPU NEW (jun1) | CPU |
+|---------|---------|----------------|-----|
+| 52.5% | ~33% | ~49% | ~60% |
+| 72.5% | ~46% | ~55% | ~79% |
+| 77.5% | ~46% | ~65% | ~85% |
+| 82.5% | ~58% | **81%** | ~91% |
+| 87.5% | ~77% | **91%** | ~94% |
+| 92.5% | ~77% | **96%** | ~96% |
+| 97.5% | ~97% | **99%** | ~99% |
+
+GPU NEW tốt hơn GPU OLD ở toàn bộ range 80–99%. Cả hai GPU đều liberal hơn CPU ở range 20–80%.
+
+**Root cause calibration gap**: CPU pool lớn hơn 3× **và** Ratchet search đa dạng hơn K2.  
+Pool GPU chủ yếu là trees từ uniform hill-climbing → kém đa dạng về topology space.
+
+Kết quả saved tại: `thesis/benchmark/output/pandit_bb_non_jun1/bootstrap_3way_dna.png`

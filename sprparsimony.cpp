@@ -3418,6 +3418,7 @@ int pllOptimizeSprParsimony(pllInstance * tr, partitionList * pr, int mintrav, i
 	unsigned int bestIterationScoreHits = 1;
 	randomMP = tr->bestParsimony;
 	tr->ntips = tr->mxtips;
+	int _outer_round = 0;
 	do{
 		startMP = randomMP;
 		nodeRectifierPars(tr);
@@ -3440,6 +3441,11 @@ int pllOptimizeSprParsimony(pllInstance * tr, partitionList * pr, int mintrav, i
 				randomMP = tr->bestParsimony;
 			}
 		}
+		_outer_round++;
+		if (iqtree && iqtree->on_opt_btree && globalParam->use_gpu &&
+		    globalParam->gpu_boot_nni_rounds > 0 &&
+		    _outer_round >= globalParam->gpu_boot_nni_rounds)
+			break;
 	}while(randomMP < startMP && !tr->stop_search);
 
 	return startMP;

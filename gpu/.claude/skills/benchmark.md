@@ -1,57 +1,29 @@
 ---
 name: benchmark
-description: Khi được giao nhiệm vụ benchmark, dùng /usr/bin/time -v để thu thập elapsed time và peak memory, đảm bảo dữ liệu đầy đủ cho summarize.py.
+description: Bắt buộc wrap mọi lệnh benchmark bằng /usr/bin/time -v để summarize.py đọc được elapsed time và peak memory.
 ---
 
-## Mục đích
+## Ràng buộc bắt buộc
 
-Mỗi lần chạy benchmark GPU hoặc CPU, bắt buộc wrap lệnh bằng `/usr/bin/time -v` để log file
-chứa đủ `Elapsed (wall clock) time` và `Maximum resident set size` — hai trường này được
-`summarize.py` dùng để tính speedup và peak memory trong Excel.
-
-## Khi nào dùng
-
-Khi được giao bất kỳ nhiệm vụ benchmark nào, kể cả:
-- Chạy thử nhanh một dataset
-- Chạy sweep parameters
-- Chạy full benchmark nhiều datasets
-
-## Cách dùng
+Mọi lần chạy benchmark — dù chỉ 1 dataset — phải dùng `/usr/bin/time -v`, KHÔNG dùng `time` builtin.
+Output của `/usr/bin/time -v` ra **stderr**, phải có `2>&1` để capture vào log.
 
 ```bash
-# Thay vì:
-./mpboot-avx -s data.phy -use_gpu ... > out.log 2>&1
-
-# Luôn dùng:
-/usr/bin/time -v ./mpboot-avx -s data.phy -use_gpu ... > out.log 2>&1
+/usr/bin/time -v ./mpboot-avx -s <file.phy> [flags] > out.log 2>&1
 ```
 
-Trong script benchmark (vòng lặp nhiều dataset):
+## Tại sao bắt buộc
 
-```bash
-for phy in $DATASETS; do
-    name="$(basename "$phy" .phy)"
-    /usr/bin/time -v "$BIN" -s "$phy" -use_gpu \
-        -numpars 400 -sprdist 3 -gpu_stop 4 \
-        > "$OUT_DIR/${name}.log" 2>&1
-done
-```
-
-## Output cần có trong log
-
-`summarize.py` đọc các dòng sau từ mỗi `.log`:
-
+`summarize.py` đọc hai dòng này để tính speedup và memory:
 ```
 Elapsed (wall clock) time (h:mm:ss or m:ss): 0:45.32
 Maximum resident set size (kbytes): 145816
 ```
+Thiếu một trong hai → cột `elapsed_s` hoặc `Speedup` ra `None` trong Excel.
 
-Cả hai chỉ xuất hiện khi dùng `/usr/bin/time -v`. Thiếu hai dòng này:
-- `elapsed_s` → None trong Excel
-- `Speedup` → không tính được
+## Params benchmark chuẩn (treebase GPU)
 
-## Lưu ý
-
-- `/usr/bin/time -v` khác với shell builtin `time` (bash/zsh) — phải chỉ rõ đường dẫn đầy đủ.
-- Trên macOS dùng `gtime -v` (GNU time từ `brew install gnu-time`).
-- Output của `/usr/bin/time -v` đi vào **stderr**, nên cần `2>&1` để redirect vào log file.
+```bash
+-use_gpu -seed 1 -sprdist 6 -gpu_device $DEV -gpu_worker 200
+```
+Thêm `-cost $COST` cho non-uniform. Không cần `-numpars` (default = 100, K2 workers = 200).

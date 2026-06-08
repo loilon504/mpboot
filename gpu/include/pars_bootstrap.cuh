@@ -1,6 +1,11 @@
 #pragma once
 #include <vector>
+#ifdef __CUDACC__
 #include <cuda_runtime_api.h>
+#else
+// Forward declaration for C++ TUs that include this header but don't compile with nvcc.
+typedef struct CUstream_st* cudaStream_t;
+#endif
 
 namespace mpbootgpu
 {
@@ -45,6 +50,9 @@ void gpuREPSEval(GpuBootstrapMem* mem, const unsigned short* pattern_pars);
 // Allocate batch REPS buffers for up to max_batch trees per round.
 // Call once after gpuBootstrapMemAlloc when max_treels is known.
 void gpuBatchREPSInit(GpuBootstrapMem* mem, int max_batch);
+
+// Grow batch REPS buffers if new_max > current capacity. No-op if already large enough.
+void gpuBatchREPSGrow(GpuBootstrapMem* mem, int new_max);
 
 // Batch REPS: compute scores for T trees × B replicates in one kernel launch.
 //   h_batch_pars: CPU buffer [T × nunit] — pattern_pars for each tree (row-major).
