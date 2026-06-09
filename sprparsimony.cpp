@@ -8,7 +8,6 @@
 #include "parstree.h"
 #include <string>
 #include "gpu/include/profiler.hpp"
-#include "gpu/include/sprparsimony.hpp"
 /**
  * PLL (version 1.0.0) a software library for phylogenetic inference
  * Copyright (C) 2013 Tomas Flouri and Alexandros Stamatakis

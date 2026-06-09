@@ -1598,3 +1598,44 @@ Khả năng: old GPU K2 bootstrap phase dùng **bootstrap-resampled data parsimo
 DNA (algorithm giống nhau): small diff (dna_M10243: 125→124 splits, mean 61→59%).
 Protein: diff lớn hơn do pool scoring khác (prot_M10236: 35→32 splits, mean 57→79%).
 
+
+---
+
+### Q: Opt-6 (giảm register pressure Sankoff S=20) — kết quả thực nghiệm (2026-06-08)
+
+**Bối cảnh**: Sau Opt-4+5, NCU báo 255 regs/thread (A100 max), 12.5% theoretical occupancy (8 blocks/SM). Mục tiêu: giảm về 128 regs → 25% occupancy (16 blocks/SM).
+
+**Thử nghiệm Opt-6B: `__launch_bounds__(32, 16)`**
+
+Thêm annotation vào `buildPhase3Kernel` và `buildParsimonyTreesKernel`. Kết quả cuobjdump:
+- REG: 255 → **128** ✓ (đúng target)
+- STACK: tăng lên 600B (S=20) và 384B (S=4)
+- LOCAL: 0 (không spill ra local memory)
+
+**Benchmark kết quả:**
+
+| Dataset | width | Opt-5 baseline | Opt-6B | Kết quả |
+|---------|-------|---------------|--------|---------|
+| prot_M10236 | 164 | 25.66ms/tree | 25.64ms/tree | = không đổi |
+| prot_M3807 | 591 | 137.40ms/tree | 191.06ms/tree | **1.39× chậm hơn** |
+| prot_M11740 | 4427 | ~1037ms/tree (est.) | 1557ms/tree | **~1.5× chậm hơn** |
+
+**Root cause regression:**
+
+`__launch_bounds__` khiến compiler đưa biến vào STACK (hardware call stack, 600B/thread) thay vì register. Stack nằm trong local memory, truy cập qua L2 cache. Overhead per b-iteration nhỏ nhưng nhân với width:
+- width=164 → 5 b-iterations → overhead không đáng kể
+- width=4427 → 138 b-iterations → overhead tích lũy → 1.5× chậm hơn
+
+**Phân tích register breakdown:**
+- Sankoff inner loop (lv_[20]/rv_[20]): ~40 regs
+- SPR logic + DFS + xPars + pool: ~215 regs
+- Giảm lv_/rv_ về shared memory → còn ~215 regs → 9 blocks/SM (14%) — không đủ
+
+**Kết luận:**
+
+Giảm register pressure về 128 cần restructure kernel hoàn toàn:
+- Warp-level state parallelism: 20 lanes/warp = 1 state, broadcast lv_jj via `__shfl_sync`
+- Giảm Sankoff body registers 40 → 4, nhưng 12/32 lanes lãng phí
+- Cộng thêm phải giảm SPR/DFS registers (215 → 88) — quá phức tạp
+
+**Quyết định: Revert Opt-6B.** Bottleneck là compute-bound (không phải memory-bound) ngay cả ở 12.5% occupancy. Opt-4+5 (2.79-3.96× vs GPU cũ) là kết quả tốt cho luận văn. Opt-6 phù hợp làm future work.

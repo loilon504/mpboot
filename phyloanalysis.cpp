@@ -55,7 +55,6 @@
 #include "sprparsimony.h"
 #include <algorithm>
 #include "gpu/include/profiler.hpp"
-#include "gpu/include/sprparsimony.hpp"
 #include "gpu/include/gpu_init_trees.cuh"
 #include "gpu/include/pars_bootstrap.cuh"
 #include <chrono>

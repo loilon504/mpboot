@@ -1094,9 +1094,10 @@ void gpuHillClimbing(
             {
                 const int _delta_treels = (int)iqtree.treels_logl.size() - _treels_size_pre_pass;
                 GPU_LOG(
-                    "%s Round %2d  +uniq=%5d  k2=%5.2fs"
+                    "%s Round %2d  +uniq=%5d  k2=%5.2fs  ppars=%5.0fms  d2h=%4.0fms"
                     "  treels=%6zu  best=%6u  cor=%6.4f\n",
                     tag, round, _delta_treels, prev.k2_ms / 1e3,
+                    prev.ppars_ms, prev.d2h_ms,
                     iqtree.treels_logl.size(), prev.pool_best, cur_correlation
                 );
             }
