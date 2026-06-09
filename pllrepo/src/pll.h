@@ -1259,6 +1259,8 @@ typedef  struct  {
   double         likelihoodEpsilon;
   pllBoolean        useCheckpoint;
 
+  volatile int      stop_search;    /* set to 1 by GPU monitor thread to abort SPR early */
+
 } pllInstance;
 
 /** @brief Stores data related to a NNI move  */

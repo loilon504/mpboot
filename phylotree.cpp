@@ -21,6 +21,7 @@
 #include "phylosupertree.h"
 #include "parstree.h"
 #include "sprparsimony.h"
+#include "gpu/include/profiler.hpp"
 //const static int BINARY_SCALE = floor(log2(1/SCALING_THRESHOLD));
 //const static double LOG_BINARY_SCALE = -(log(2) * BINARY_SCALE);
 

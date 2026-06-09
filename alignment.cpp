@@ -13,6 +13,7 @@
 #include "myreader.h"
 #include <numeric>
 #include <sstream>
+#include "gpu/include/profiler.hpp"
 using namespace std;
 
 char symbols_protein[] = "ARNDCQEGHILKMFPSTWYVX"; // X for unknown AA

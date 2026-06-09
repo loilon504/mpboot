@@ -31,6 +31,8 @@
 #include "vectorclass/vectorclass.h"
 #include "vectorclass/vectormath_common.h"
 #include "parstree.h"
+#include "gpu/include/profiler.hpp"
+#include "gpu/include/pars_bootstrap.cuh"
 
 Params *globalParam;
 Alignment *globalAlignment;
@@ -79,6 +81,7 @@ void IQTree::init() {
     reps_segments = -1;
     segment_upper = NULL;
     original_sample = NULL;
+    gpu_boot_mem_ = nullptr;
 }
 
 IQTree::IQTree(Alignment *aln) : PhyloTree(aln) {
@@ -433,6 +436,13 @@ BootValTypePars * IQTree::getPatternPars(){
 	return _pattern_pars;
 }
 
+void IQTree::gpuSetPatternPars(const BootValTypePars* src, int nptn) {
+    if (!_pattern_pars)
+        _pattern_pars = aligned_alloc<BootValTypePars>(nptn + 16);
+    memcpy(_pattern_pars, src, (size_t)nptn * sizeof(BootValTypePars));
+}
+
+
 IQTree::~IQTree() {
     //if (bonus_values)
     //delete bonus_values;
@@ -476,6 +486,11 @@ IQTree::~IQTree() {
     if(original_sample){
     	aligned_free(original_sample);
     	original_sample = NULL;
+    }
+
+    if (gpu_boot_mem_) {
+        mpbootgpu::gpuBootstrapMemFree(gpu_boot_mem_);
+        gpu_boot_mem_ = nullptr;
     }
 
 #if (defined(__SSE3) || defined(__AVX))
@@ -1085,6 +1100,7 @@ void IQTree::doRandomNNIs(int numNNI) {
     NodeVector nodeList1, nodeList2;
     getInternalBranches(nodeList1, nodeList2);
     int numInBran = nodeList1.size();
+    if (numInBran != aln->getNSeq() - 3)
     assert(numInBran == aln->getNSeq() - 3);
     for (int i = 0; i < numNNI; i++) {
         int index = random_int(numInBran);
@@ -1618,7 +1634,6 @@ double IQTree::doTreeSearch() {
     printTree(bestTreeStream, WT_TAXON_ID + WT_BR_LEN);
     printTree(bestTopoStream, WT_TAXON_ID + WT_SORT_TAXA);
     string best_tree_topo = bestTopoStream.str();
-
     stop_rule.addImprovedIteration(1);
     searchinfo.curPerStrength = params->initPerStrength;
 
@@ -1693,6 +1708,7 @@ double IQTree::doTreeSearch() {
 //		long tmp_num_ratchet_bootcands = treels.size();
         if(params->ratchet_iter >= 0){
         	if(params->ratchet_iter == ratchet_iter_count){
+                // cout << "Iteration " << curIt << ", perturb alignment\n";
 //				string candidateTree = candidateTrees.getRandCandVecTree(); // Diep: to pick from vector-stored candidates
 				string candidateTree = candidateTrees.getRandCandTree();
 				readTreeString(candidateTree);
@@ -1722,6 +1738,8 @@ double IQTree::doTreeSearch() {
     	 *---------------------------------------*/
 		double perturbScore;
 		if(!on_ratchet_hclimb1){
+            // cout << "Iteration " << curIt << ", perturb tree\n";
+            // cout << "REACH " << 1725 << " iqtree.cpp: what is this\n";
 			if (iqp_assess_quartet == IQP_BOOTSTRAP) {
 				// create bootstrap sample
 				Alignment* bootstrap_alignment;
@@ -1764,6 +1782,7 @@ double IQTree::doTreeSearch() {
 				}
 
 				if(params->maximum_parsimony && params->spr_parsimony && (params->snni || params->pll)){ // SPR for mpars
+                    // cout << "   Just computeParsimony\n";
 //					pllNewickTree *perturbTree = pllNewickParseString(perturb_tree_string.c_str());
 //					assert(perturbTree != NULL);
 //					pllTreeInitTopologyNewick(pllInst, perturbTree, PLL_FALSE);
@@ -1772,6 +1791,7 @@ double IQTree::doTreeSearch() {
 					curScore = perturbScore = -computeParsimony();
 //                    pllNewickParseDestroy(&perturbTree);
 				}else if (params->pll) {
+                    // cout << "   pll\n";
 					pllNewickTree *perturbTree = pllNewickParseString(perturb_tree_string.c_str());
 					assert(perturbTree != NULL);
 					pllTreeInitTopologyNewick(pllInst, perturbTree, PLL_FALSE);
@@ -1799,7 +1819,7 @@ double IQTree::doTreeSearch() {
         int nni_count = 0;
         int nni_steps = 0;
 
-		imd_tree = doNNISearch(nni_count, nni_steps);
+        imd_tree = doNNISearch(nni_count, nni_steps);
 
         if (iqp_assess_quartet == IQP_BOOTSTRAP) {
             // restore alignment
@@ -1817,6 +1837,7 @@ double IQTree::doTreeSearch() {
          * PARSIMONY RATCHET-LIKE IDEA
          * -------------------------------------------------------------------------*/
         if(on_ratchet_hclimb1){
+            // cout << "Iteration " << curIt << ", on_ratchet_hclimb1 = true\n";
 			ratchet_iter_count = 0;
 
 			// restore alignment
@@ -2107,6 +2128,7 @@ string IQTree::doNNISearch(int& nniCount, int& nniSteps) {
 			curScore = optimizeNNI(nniCount, nniSteps);
 			treeString = getTreeString();
 		}else{
+            // cout << "--REACH 2112, else\n";
 			string treeString1 = getTreeString();
 			size_t index = 0;
 			while (true) {
@@ -2117,8 +2139,10 @@ string IQTree::doNNISearch(int& nniCount, int& nniSteps) {
 				 /* Make the replacement. */
 				 treeString1.replace(index, 4, ":0");
 
-				 /* Advance index forward so the next iteration doesn't pick it up as well. */
-				 index += 4;
+				 /* Bug fix: advance by 2 (length of ":0"), not 4 (length of ":nan").
+				    Advancing by 4 skipped over the next character after ":0", causing
+				    adjacent ":nan" tokens to be missed. */
+				 index += 2;
 			}
 
 			int max_spr_rad = params->spr_maxtrav;
@@ -3300,14 +3324,19 @@ void IQTree::saveCurrentTree(double cur_logl) {
     string tree_str;
     StringIntMap::iterator it = treels.end();
     if (params->store_candidate_trees) {
-    	if(params->spr_parsimony && !(params->ratchet_iter >= 0 && on_ratchet_hclimb1 && params->hclimb1_nni)){
-			pllTreeToNewick(pllInst->tree_string, pllInst, pllPartitions, pllInst->start->back, PLL_TRUE, PLL_TRUE, 0, 0, 0, PLL_SUMMARIZE_LH, 0, 0);
-			string imd_tree = string(pllInst->tree_string);
-			readTreeString(imd_tree);
-    	}
-
-        printTree(ostr, WT_TAXON_ID | WT_SORT_TAXA);
-        tree_str = ostr.str();
+        if (!_gpu_newick_key.empty()) {
+            // GPU fast path: use pllTreeToNewick output directly as treels key.
+            // Skips readTreeString + printTree (topology already in pllInst via gpuTopoToCpu).
+            tree_str = _gpu_newick_key;
+        } else {
+    	    if(params->spr_parsimony && !(params->ratchet_iter >= 0 && on_ratchet_hclimb1 && params->hclimb1_nni)){
+			    pllTreeToNewick(pllInst->tree_string, pllInst, pllPartitions, pllInst->start->back, PLL_TRUE, PLL_TRUE, 0, 0, 0, PLL_SUMMARIZE_LH, 0, 0);
+			    string imd_tree = string(pllInst->tree_string);
+			    readTreeString(imd_tree);
+    	    }
+            printTree(ostr, WT_TAXON_ID | WT_SORT_TAXA);
+            tree_str = ostr.str();
+        }
         it = treels.find(tree_str);
     }
     int tree_index = -1;
@@ -3362,7 +3391,9 @@ void IQTree::saveCurrentTree(double cur_logl) {
 	if (params->maximum_parsimony){
 		if(params->spr_parsimony && !(params->ratchet_iter >= 0 && on_ratchet_hclimb1 && params->hclimb1_nni)){
 			int test_pars = 0;
-			pllComputePatternParsimony(pllInst, pllPartitions, _pattern_pars, &test_pars);
+			{ auto _t0 = std::chrono::high_resolution_clock::now();
+			  pllComputePatternParsimony(pllInst, pllPartitions, _pattern_pars, &test_pars);
+			  _gpu_t_pp += std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-_t0).count(); }
 			if(!on_ratchet_hclimb1 && test_pars != -int(cur_logl))
 				outError("WRONG pllComputeSiteParsimony: sum of site parsimony is different from alignment parsimony");
 		}
@@ -3408,11 +3439,28 @@ void IQTree::saveCurrentTree(double cur_logl) {
         int updated = 0;
         int nsamples = (params->maximum_parsimony) ? boot_samples_pars.size() : boot_samples.size();
 
+        // GPU REPS path: evaluate all B replicates in parallel before the sample loop.
+        // Skipped when _gpu_precomputed_rell is set (batch REPS already done externally).
+        if (gpu_boot_mem_ != nullptr && params->maximum_parsimony && _pattern_pars != nullptr
+            && _gpu_precomputed_rell == nullptr) {
+            auto _t0 = std::chrono::high_resolution_clock::now();
+            mpbootgpu::gpuREPSEval(gpu_boot_mem_, _pattern_pars);
+            _gpu_t_reps += std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-_t0).count();
+        }
+
+        auto _t_bupdate = std::chrono::high_resolution_clock::now();
         for (int sample = 0; sample < nsamples; sample++) {
             double rell = 0.0;
             bool skipped = false;
 
 			if (params->maximum_parsimony) {
+				// --- GPU REPS: use pre-computed rell (batch or per-tree) ---
+				if (gpu_boot_mem_ != nullptr && _pattern_pars != nullptr) {
+					const int* rell_buf = (_gpu_precomputed_rell != nullptr)
+					                       ? _gpu_precomputed_rell
+					                       : gpu_boot_mem_->h_rell;
+					rell = -(double)rell_buf[sample];
+				} else {
 				BootValTypePars *boot_sample = boot_samples_pars[sample];
 
 				if(params->auto_vectorize){
@@ -3447,6 +3495,7 @@ void IQTree::saveCurrentTree(double cur_logl) {
 
 					rell = -(double)res;
 				}
+				} // end CPU REPS else-branch
 			} else {
 				// TODO: The following parallel is not very efficient, should wrap the above loop
 	//#ifdef _OPENMP
@@ -3731,6 +3780,7 @@ void IQTree::saveCurrentTree(double cur_logl) {
 				}
 			}
         }
+        _gpu_t_bupdate += std::chrono::duration<double,std::milli>(std::chrono::high_resolution_clock::now()-_t_bupdate).count();
         if (updated && verbose_mode >= VB_MAX)
             cout << updated << " boot trees updated" << endl;
 

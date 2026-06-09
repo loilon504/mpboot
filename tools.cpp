@@ -825,6 +825,15 @@ void parseArg(int argc, char *argv[], Params &params) {
     params.write_init_tree = false;
     params.write_local_optimal_trees = false;
 
+	params.use_gpu = false;
+	params.gpu_nni_strength = 0.5;
+	params.gpu_pool_size = 20;
+	params.gpu_worker = 200;
+	params.gpu_worker_stop = 1;
+	params.gpu_treels_margin = 0.0;   // default: strict improvement only
+	params.gpu_boot_nni_rounds = 1;   // default: 1 outer SPR round per replicate for GPU
+	params.gpu_device = 0;
+
 	if (params.nni5) {
 	    params.nni_type = NNI5;
 	} else {
@@ -2694,6 +2703,38 @@ void parseArg(int argc, char *argv[], Params &params) {
 				if (cnt >= argc)
 					throw "Use -sprdist <SPR distance used in parsimony search>";
 				params.sprDist = convert_int(argv[cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-use_gpu") == 0) {
+				params.use_gpu = true;
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_nni_strength") == 0) {
+				params.gpu_nni_strength = (float)atof(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_pool_size") == 0) {
+				params.gpu_pool_size = convert_int(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_worker") == 0) {
+				params.gpu_worker = convert_int(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_worker_stop") == 0) {
+				params.gpu_worker_stop = convert_int(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_treels_margin") == 0) {
+				params.gpu_treels_margin = convert_double(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_boot_nni_rounds") == 0) {
+				params.gpu_boot_nni_rounds = convert_int(argv[++cnt]);
+				continue;
+			}
+			if (strcmp(argv[cnt], "-gpu_device") == 0) {
+				params.gpu_device = atoi(argv[++cnt]);
 				continue;
 			}
 			if (argv[cnt][0] == '-') {

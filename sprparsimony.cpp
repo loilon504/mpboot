@@ -7,6 +7,7 @@
 #include "sprparsimony.h"
 #include "parstree.h"
 #include <string>
+#include "gpu/include/profiler.hpp"
 /**
  * PLL (version 1.0.0) a software library for phylogenetic inference
  * Copyright (C) 2013 Tomas Flouri and Alexandros Stamatakis
@@ -127,6 +128,9 @@ extern double masterTime;
 extern Params *globalParam;
 IQTree * iqtree = NULL;
 unsigned long bestTreeScoreHits; // to count hits to bestParsimony
+#ifdef _OPENMP
+#pragma omp threadprivate(bestTreeScoreHits)
+#endif
 
 extern parsimonyNumber * pllCostMatrix; // Diep: For weighted version
 extern int pllCostNstates; // Diep: For weighted version
@@ -2840,7 +2844,8 @@ static void compressDNA(pllInstance *tr, partitionList *pr, int *informative, in
     i,
     model;
 
-  totalNodes = 2 * (size_t)tr->mxtips;
+  // totalNodes = 2 * (size_t)tr->mxtips;
+  totalNodes = 2 * (size_t)tr->mxtips + 1;
 
 
 
@@ -2997,6 +3002,7 @@ static void stepwiseAddition(pllInstance *tr, partitionList *pr, nodeptr p, node
   tr->ti[2] = p->back->number;
 
   mp = evaluateParsimonyIterativeFast(tr, pr, PLL_FALSE);
+  // cout << "[DBG] score in stepwiseAddition: " << mp << '\n';
 
   if(mp < tr->bestParsimony) bestTreeScoreHits = 1;
   else if(mp == tr->bestParsimony) bestTreeScoreHits++;
@@ -3133,6 +3139,7 @@ static void _pllMakeParsimonyTreeFast(pllInstance *tr, partitionList *pr, int sp
 
   bestTreeScoreHits = 1;
 
+  int maxNumNodes = 0;
   while(tr->ntips < tr->mxtips)
     {
       nodeptr q;
@@ -3168,6 +3175,7 @@ static void _pllMakeParsimonyTreeFast(pllInstance *tr, partitionList *pr, int sp
         tr->ti[0] = counter;
 
         newviewParsimonyIterativeFast(tr, pr, 0);
+
       }
     }
 
@@ -3208,6 +3216,121 @@ static void _pllMakeParsimonyTreeFast(pllInstance *tr, partitionList *pr, int sp
   rax_free(perm);
 }
 
+pllInstance* pllInstanceClone(pllInstance* src)
+{
+    int mxtips = src->mxtips;
+    int tips   = mxtips;
+    int inner  = mxtips - 1;
+
+    pllInstance* dst = (pllInstance*) rax_malloc(sizeof(pllInstance));
+    memcpy(dst, src, sizeof(pllInstance));
+
+    // node array: tips + 3*inner records (matches utils.c allocation)
+    size_t numNodeRecords = (size_t)(tips + 3 * inner);
+    dst->nodeBaseAddress = (nodeptr) rax_malloc(numNodeRecords * sizeof(node));
+    memcpy(dst->nodeBaseAddress, src->nodeBaseAddress, numNodeRecords * sizeof(node));
+
+    ptrdiff_t delta = (char*)dst->nodeBaseAddress - (char*)src->nodeBaseAddress;
+
+    // Fix next/back pointers in every node record
+    node* n = dst->nodeBaseAddress;
+    for (size_t i = 0; i < numNodeRecords; i++, n++) {
+        if (n->next != NULL)
+            n->next = (nodeptr)((char*)n->next + delta);
+        if (n->back != NULL)
+            n->back = (nodeptr)((char*)n->back + delta);
+    }
+
+    // nodep index array: 2*mxtips slots (matches utils.c allocation)
+    dst->nodep = (nodeptr*) rax_malloc((size_t)(2 * mxtips) * sizeof(nodeptr));
+    dst->nodep[0] = NULL;
+    for (int i = 1; i < 2 * mxtips; i++) {
+        if (src->nodep[i] != NULL)
+            dst->nodep[i] = (nodeptr)((char*)src->nodep[i] + delta);
+        else
+            dst->nodep[i] = NULL;
+    }
+
+    if (src->start != NULL)
+        dst->start = (nodeptr)((char*)src->start + delta);
+
+    dst->removeNode = NULL;
+    dst->insertNode = NULL;
+
+    dst->tree_string = (char*) rax_calloc((size_t)src->treeStringLength, sizeof(char));
+    dst->tree0       = (char*) rax_calloc((size_t)src->treeStringLength, sizeof(char));
+    dst->tree1       = (char*) rax_calloc((size_t)src->treeStringLength, sizeof(char));
+
+    dst->constraintVector = (int*) rax_malloc((size_t)(2 * mxtips) * sizeof(int));
+    memcpy(dst->constraintVector, src->constraintVector, (size_t)(2 * mxtips) * sizeof(int));
+
+    dst->td[0].ti              = (traversalInfo*) rax_malloc((size_t)mxtips * sizeof(traversalInfo));
+    dst->td[0].parameterValues = (double*)        rax_malloc((size_t)PLL_NUM_BRANCHES * sizeof(double));
+    dst->td[0].executeModel    = (pllBoolean*)    rax_malloc((size_t)PLL_NUM_BRANCHES * sizeof(pllBoolean));
+    memcpy(dst->td[0].ti,              src->td[0].ti,              (size_t)mxtips * sizeof(traversalInfo));
+    memcpy(dst->td[0].parameterValues, src->td[0].parameterValues, (size_t)PLL_NUM_BRANCHES * sizeof(double));
+    memcpy(dst->td[0].executeModel,    src->td[0].executeModel,    (size_t)PLL_NUM_BRANCHES * sizeof(pllBoolean));
+
+    // parsimony scratch: managed by _allocate/_freeParsimonyDataStructures per call
+    dst->parsimonyScore = NULL;
+    dst->ti             = NULL;
+
+    dst->rearrangeHistory = NULL;
+
+    // shared read-only: aliaswgt, yVector, nameHash, tipNames, nameList, etc.
+    return dst;
+}
+
+void pllInstanceCloneFree(pllInstance* tr)
+{
+    assert(tr->parsimonyScore == NULL && "parsimony data must be freed before freeing the clone");
+    assert(tr->ti == NULL && "parsimony ti must be freed before freeing the clone");
+
+    rax_free(tr->nodeBaseAddress);
+    rax_free(tr->nodep);
+    rax_free(tr->tree_string);
+    rax_free(tr->tree0);
+    rax_free(tr->tree1);
+    rax_free(tr->constraintVector);
+    rax_free(tr->td[0].ti);
+    rax_free(tr->td[0].parameterValues);
+    rax_free(tr->td[0].executeModel);
+    rax_free(tr);
+}
+
+partitionList* pllPartitionsClone(partitionList* src)
+{
+    partitionList* dst = (partitionList*) rax_malloc(sizeof(partitionList));
+    memcpy(dst, src, sizeof(partitionList));
+
+    int np = src->numberOfPartitions;
+    dst->partitionData = (pInfo**) rax_malloc((size_t)np * sizeof(pInfo*));
+
+    for (int i = 0; i < np; i++) {
+        dst->partitionData[i] = (pInfo*) rax_malloc(sizeof(pInfo));
+        memcpy(dst->partitionData[i], src->partitionData[i], sizeof(pInfo));
+
+        // nullify per-thread parsimony arrays; filled by compressDNA inside _allocateParsimonyDataStructures
+        dst->partitionData[i]->parsVect            = NULL;
+        dst->partitionData[i]->perSitePartialPars  = NULL;
+        dst->partitionData[i]->informativePtnWgt   = NULL;
+        dst->partitionData[i]->informativePtnScore = NULL;
+        dst->partitionData[i]->parsimonyLength      = 0;
+    }
+
+    return dst;
+}
+
+void pllPartitionsCloneFree(partitionList* pr)
+{
+    for (int i = 0; i < pr->numberOfPartitions; i++) {
+        assert(pr->partitionData[i]->parsVect == NULL && "parsVect must be freed before freeing the clone");
+        rax_free(pr->partitionData[i]);
+    }
+    rax_free(pr->partitionData);
+    rax_free(pr);
+}
+
 /** @brief Compute a randomized stepwise addition oder parsimony tree
 
     Implements the RAxML randomized stepwise addition order algorithm
@@ -3231,8 +3354,8 @@ void _pllComputeRandomizedStepwiseAdditionParsimonyTree(pllInstance * tr, partit
 //	cout << "DONE make...." << endl;
 	_pllFreeParsimonyDataStructures(tr, partitions);
 	doing_stepwise_addition = false;
-//	cout << "Done free..." << endl;
 }
+
 
 /**
  * DTH: optimize whatever tree is stored in tr by parsimony SPR
@@ -3251,7 +3374,9 @@ int pllOptimizeSprParsimony(pllInstance * tr, partitionList * pr, int mintrav, i
 		_updateInternalPllOnRatchet(tr, pr);
 		_allocateParsimonyDataStructures(tr, pr, perSiteScores);
 	}else if(first_call || (iqtree && iqtree->on_opt_btree))
+  {
 		_allocateParsimonyDataStructures(tr, pr, perSiteScores); // called once if not running ratchet
+  }
 
 	if(first_call){
 		first_call = false;
@@ -3292,12 +3417,14 @@ int pllOptimizeSprParsimony(pllInstance * tr, partitionList * pr, int mintrav, i
 	unsigned int bestIterationScoreHits = 1;
 	randomMP = tr->bestParsimony;
 	tr->ntips = tr->mxtips;
+	int _outer_round = 0;
 	do{
 		startMP = randomMP;
 		nodeRectifierPars(tr);
 		for(i = 1; i <= tr->mxtips + tr->mxtips - 2; i++){
 //		for(j = 1; j <= tr->mxtips + tr->mxtips - 2; j++){
 //			i = perm[j];
+			if(tr->stop_search) break;
 			tr->insertNode = NULL;
 			tr->removeNode = NULL;
 			bestTreeScoreHits = 1;
@@ -3313,7 +3440,12 @@ int pllOptimizeSprParsimony(pllInstance * tr, partitionList * pr, int mintrav, i
 				randomMP = tr->bestParsimony;
 			}
 		}
-	}while(randomMP < startMP);
+		_outer_round++;
+		if (iqtree && iqtree->on_opt_btree && globalParam->use_gpu &&
+		    globalParam->gpu_boot_nni_rounds > 0 &&
+		    _outer_round >= globalParam->gpu_boot_nni_rounds)
+			break;
+	}while(randomMP < startMP && !tr->stop_search);
 
 	return startMP;
 }

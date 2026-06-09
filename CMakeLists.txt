@@ -29,9 +29,32 @@
 #
 
 
-cmake_minimum_required(VERSION 2.8)
+# cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.18)
 
 project(mpboot)
+
+# Enforce C++14 globally — prevents clang++ from defaulting to C++17,
+# which breaks legacy code in model/ (dynamic exception specs, register keyword).
+set(CMAKE_CXX_STANDARD 14 CACHE STRING "" FORCE)
+set(CMAKE_CXX_STANDARD_REQUIRED ON CACHE BOOL "" FORCE)
+set(CMAKE_CXX_EXTENSIONS OFF CACHE BOOL "" FORCE)
+
+option(USE_GPU "Enable GPU acceleration with CUDA" OFF)
+
+if(USE_GPU)
+	# A100 = Ampere (sm_80), RTX 4090 = Ada Lovelace (sm_89)
+    # set(CMAKE_CUDA_ARCHITECTURES "80;86;89" CACHE STRING "CUDA architectures")  # full (sm_86 + sm_89 tắt khi dev)
+    set(CMAKE_CUDA_ARCHITECTURES "80" CACHE STRING "CUDA architectures")
+    enable_language(CUDA)
+	set(CMAKE_CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
+    set(CMAKE_CUDA_STANDARD 14)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    find_package(CUDAToolkit REQUIRED)
+    message(STATUS "CUDA enabled: ${CUDAToolkit_VERSION}")
+    message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+
 add_definitions(-DIQ_TREE)
 # The version number.
 set (iqtree_VERSION_MAJOR 1)
@@ -337,6 +360,7 @@ add_subdirectory(sprng)
 add_subdirectory(zlib-1.2.7)
 add_subdirectory(vectorclass)
 add_subdirectory(model)
+add_subdirectory(gpu)
 
 ##################################################################
 # the main executable
@@ -428,10 +452,11 @@ if (IQTREE_FLAGS MATCHES "omp")
 	endif()
 endif()
 
-target_link_libraries(mpboot pll ncl whtest zlibstatic sprng vectorclass model ${PLATFORM_LIB} ${THREAD_LIB})	
+target_link_libraries(mpboot MPBOOTlib pll ncl whtest zlibstatic sprng vectorclass model ${PLATFORM_LIB} ${THREAD_LIB})
+
 
 ##################################################################
-# setup the executable name 
+# setup the executable name
 ##################################################################
 set_target_properties(mpboot PROPERTIES OUTPUT_NAME "mpboot${EXE_SUFFIX}")
 

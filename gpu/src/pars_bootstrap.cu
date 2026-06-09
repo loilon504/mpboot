@@ -1,0 +1,226 @@
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+#include "gpu/include/pars_bootstrap.cuh"
+#include "gpu/include/utils.cuh"
+
+namespace mpbootgpu
+{
+
+// ─── REPSKernel ───────────────────────────────────────────────────────────────
+// Grid:  (B, 1, 1)  — one block per bootstrap replicate
+// Block: (32, 1, 1) — one warp
+//
+// Each block computes:
+//   rell[i] = sum_{p=0}^{P-1}  pattern_pars[p] * boot_samples[i][p]
+//
+// Access pattern:
+//   - boot_samples row i: 32 lanes read boot[lane], boot[lane+32], ...
+//     → 32 consecutive unsigned short per iteration = 64 bytes = 1 cache line (coalesced)
+//   - pattern_pars: all B blocks read the same array → L2 broadcast (~10 KB, stays in cache)
+__global__ void REPSKernel(
+    const unsigned short* __restrict__ d_pattern_pars,  // [nunit]
+    const unsigned short* __restrict__ d_boot_samples,  // [B × nunit], row-major
+    int*                               d_rell,           // [B] output
+    int P,
+    int nunit
+)
+{
+    const int i    = blockIdx.x;   // replicate index (0..B-1)
+    const int lane = threadIdx.x;  // 0..31
+
+    const unsigned short* boot = d_boot_samples + (size_t)i * nunit;
+
+    unsigned int local_sum = 0;
+    for (int p = lane; p < P; p += 32)
+        local_sum += (unsigned int)d_pattern_pars[p] * (unsigned int)boot[p];
+
+    // Warp reduction: accumulate across all 32 lanes
+    for (int s = 16; s > 0; s >>= 1)
+        local_sum += __shfl_down_sync(0xFFFFFFFFu, local_sum, s);
+
+    if (lane == 0)
+        d_rell[i] = (int)local_sum;
+}
+
+// ─── Host API ─────────────────────────────────────────────────────────────────
+
+// ─── batchREPSKernel ──────────────────────────────────────────────────────────
+// Grid:  dim3(T, B)  — one block per (tree, replicate) pair
+// Block: (32, 1, 1)  — one warp
+//
+// gridDim.x = T (up to max_treels ~100k; gridDim.x limit = 2^31-1)
+// gridDim.y = B = 1000 (well within gridDim.y limit = 65535)
+//
+// Each block (t=blockIdx.x, i=blockIdx.y) computes:
+//   batch_rell[t * B + i] = sum_{p=0}^{P-1}  batch_pars[t*nunit+p] * boot_samples[i*nunit+p]
+__global__ void batchREPSKernel(
+    const unsigned short* __restrict__ d_batch_pars,   // [T × nunit]
+    const unsigned short* __restrict__ d_boot_samples, // [B × nunit]
+    int*                               d_batch_rell,   // [T × B], row-major
+    int T, int B, int P, int nunit
+)
+{
+    const int t    = blockIdx.x;  // tree index (0..T-1)
+    const int i    = blockIdx.y;  // replicate index (0..B-1)
+    const int lane = threadIdx.x; // 0..31
+
+    const unsigned short* pars = d_batch_pars   + (size_t)t * nunit;
+    const unsigned short* boot = d_boot_samples + (size_t)i * nunit;
+
+    unsigned int local_sum = 0;
+    for (int p = lane; p < P; p += 32)
+        local_sum += (unsigned int)pars[p] * (unsigned int)boot[p];
+
+    for (int s = 16; s > 0; s >>= 1)
+        local_sum += __shfl_down_sync(0xFFFFFFFFu, local_sum, s);
+
+    if (lane == 0)
+        d_batch_rell[(size_t)t * B + i] = (int)local_sum;
+}
+
+// ─── Host API ─────────────────────────────────────────────────────────────────
+
+GpuBootstrapMem* gpuBootstrapMemAlloc(int B, int P, int nunit)
+{
+    auto* mem = new GpuBootstrapMem();
+    mem->B     = B;
+    mem->P     = P;
+    mem->nunit = nunit;
+
+    CUDA_CHECK(cudaMalloc(&mem->d_boot_samples, (size_t)B * nunit * sizeof(unsigned short)));
+    CUDA_CHECK(cudaMalloc(&mem->d_pattern_pars, (size_t)nunit    * sizeof(unsigned short)));
+    CUDA_CHECK(cudaMalloc(&mem->d_rell,         (size_t)B        * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&mem->h_rell,     (size_t)B        * sizeof(int)));
+
+    mem->d_batch_pars  = nullptr;
+    mem->d_batch_rell  = nullptr;
+    mem->h_batch_rell  = nullptr;
+    mem->max_batch     = 0;
+
+    printf("[GPU Bootstrap] REPS memory: B=%d, P=%d, nunit=%d (%.2f MB boot_samples)\n",
+           B, P, nunit, (double)B * nunit * sizeof(unsigned short) / (1 << 20));
+    return mem;
+}
+
+void gpuBatchREPSInit(GpuBootstrapMem* mem, int max_batch)
+{
+    if (!mem || max_batch <= 0) return;
+    mem->max_batch = max_batch;
+    CUDA_CHECK(cudaMalloc(&mem->d_batch_pars,
+        (size_t)max_batch * mem->nunit * sizeof(unsigned short)));
+    CUDA_CHECK(cudaMalloc(&mem->d_batch_rell,
+        (size_t)max_batch * mem->B * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&mem->h_batch_rell,
+        (size_t)max_batch * mem->B * sizeof(int)));
+}
+
+void gpuBootstrapMemFree(GpuBootstrapMem* mem)
+{
+    if (!mem) return;
+    cudaFree(mem->d_boot_samples);
+    cudaFree(mem->d_pattern_pars);
+    cudaFree(mem->d_rell);
+    cudaFreeHost(mem->h_rell);
+    if (mem->d_batch_pars) cudaFree(mem->d_batch_pars);
+    if (mem->d_batch_rell) cudaFree(mem->d_batch_rell);
+    if (mem->h_batch_rell) cudaFreeHost(mem->h_batch_rell);
+    delete mem;
+}
+
+void gpuBatchREPSGrow(GpuBootstrapMem* mem, int new_max)
+{
+    if (!mem || new_max <= mem->max_batch) return;
+    if (mem->d_batch_pars) { cudaFree(mem->d_batch_pars);   mem->d_batch_pars = nullptr; }
+    if (mem->d_batch_rell) { cudaFree(mem->d_batch_rell);   mem->d_batch_rell = nullptr; }
+    if (mem->h_batch_rell) { cudaFreeHost(mem->h_batch_rell); mem->h_batch_rell = nullptr; }
+    mem->max_batch = 0;
+    CUDA_CHECK(cudaMalloc(&mem->d_batch_pars,
+        (size_t)new_max * mem->nunit * sizeof(unsigned short)));
+    CUDA_CHECK(cudaMalloc(&mem->d_batch_rell,
+        (size_t)new_max * mem->B * sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&mem->h_batch_rell,
+        (size_t)new_max * mem->B * sizeof(int)));
+    mem->max_batch = new_max;
+}
+
+void gpuBatchREPSEval(GpuBootstrapMem* mem,
+                      const unsigned short* h_batch_pars, int T,
+                      cudaStream_t stream)
+{
+    if (T <= 0 || !mem->d_batch_pars) return;
+
+    // Upload compacted pattern_pars for all T trees
+    CUDA_CHECK(cudaMemcpyAsync(
+        mem->d_batch_pars, h_batch_pars,
+        (size_t)T * mem->nunit * sizeof(unsigned short),
+        cudaMemcpyHostToDevice, stream
+    ));
+
+    // Launch: one warp per (tree, replicate) pair
+    // gridDim.x=T (limit 2^31-1), gridDim.y=B (limit 65535) — avoids gridDim.y overflow
+    dim3 grid(T, mem->B);
+    batchREPSKernel<<<grid, 32, 0, stream>>>(
+        mem->d_batch_pars,
+        mem->d_boot_samples,
+        mem->d_batch_rell,
+        T, mem->B, mem->P, mem->nunit
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Download all T × B scores (h_batch_rell is pinned — true async DMA)
+    CUDA_CHECK(cudaMemcpyAsync(
+        mem->h_batch_rell, mem->d_batch_rell,
+        (size_t)T * mem->B * sizeof(int),
+        cudaMemcpyDeviceToHost, stream
+    ));
+
+    // Block host until h_batch_rell is ready for CPU consumption
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void gpuUploadBootSamples(
+    GpuBootstrapMem*                     mem,
+    const std::vector<unsigned short*>&  boot_samples_pars
+)
+{
+    const size_t row_bytes = (size_t)mem->nunit * sizeof(unsigned short);
+    for (int i = 0; i < mem->B; ++i)
+    {
+        CUDA_CHECK(cudaMemcpy(
+            mem->d_boot_samples + (size_t)i * mem->nunit,
+            boot_samples_pars[i],
+            row_bytes,
+            cudaMemcpyHostToDevice
+        ));
+    }
+}
+
+void gpuREPSEval(GpuBootstrapMem* mem, const unsigned short* pattern_pars)
+{
+    // Upload current candidate tree's per-pattern parsimony
+    CUDA_CHECK(cudaMemcpy(
+        mem->d_pattern_pars, pattern_pars,
+        (size_t)mem->nunit * sizeof(unsigned short),
+        cudaMemcpyHostToDevice
+    ));
+
+    // Launch B warps in parallel — one warp per bootstrap replicate
+    REPSKernel<<<mem->B, 32>>>(
+        mem->d_pattern_pars,
+        mem->d_boot_samples,
+        mem->d_rell,
+        mem->P,
+        mem->nunit
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Synchronous download: B ints = B * 4 bytes
+    CUDA_CHECK(cudaMemcpy(
+        mem->h_rell, mem->d_rell,
+        (size_t)mem->B * sizeof(int),
+        cudaMemcpyDeviceToHost
+    ));
+}
+
+}  // namespace mpbootgpu
