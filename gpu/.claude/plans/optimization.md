@@ -26,9 +26,13 @@
 | **Pool restart simplify** | **Lane-0 O(pool_size²) selection-sort, unsigned long long bitmask (pool_size ≤ 60); accessible=10+outer** | **K2 regs 151→128; simpler code** |
 | **Opt-S: Per-slot locks** | **pool_lock→pool_slot_locks[pool_size]; thundering herd fix** | **Contention 1000→50 blocks/lock (pool=20)** |
 | **Sankoff encoding fix** | **uploadSankoffTipParsVect: width=parsimonyLength, tr->yVector PLL bitmask** | **GPU Sankoff đúng, 6662=CPU** |
-| **Sankoff ratchet (d_ratchetScratch)** | **Buffer scratch riêng; iter_is_nni bỏ use_sankoff||** | **K=200 đạt 6662 (cần K=5000 trước)** |
+| **Fix 2 — AA tip bitmask** | **`uploadSankoffTipParsVect`: one-hot convert AA index→bitmask (DNA dùng PLL_MAP_NT, AA dùng PLL_MAP_AA)** | **20/20 protein non-bootstrap diff ≤ 0 ✅ (2026-05-31)** |
+| **Bug A — score_tree Sankoff** | **`warpNewviewStep`: accumulate `min_s(p[s][b])` vào `score` để Opt-B prune hoạt động** | **Applied; benchmark pending** |
+| **Sankoff ratchet (d_ratchetScratch)** | **Buffer scratch riêng; iter_is_nni bỏ use_sankoff\|\|** | **K=200 đạt 6662 (cần K=5000 trước)** |
 | **Opt 1: parsVect layout [ptn][state]→[state][ptn]** | **Coalesced warp access; Fitch→memcpy; Sankoff h_buf reindex** | **Fitch 2.5×, Sankoff 2.1× ms/tree** |
 | **Opt 3: Remove dead min_site in Sankoff newview** | **Xóa score_tree accumulation không được đọc** | **Minor; absorbed into Opt 1** |
+| **Opt-4: Register preload Sankoff** | **`lv_[STATES], rv_[STATES]` preload trước ii×jj loop; `#pragma unroll` cả hai vòng** | **S²→S global loads; protein speedup ~1.4–1.8× (thành Opt-5 baseline)** |
+| **Opt-5: Constant memory cost matrix** | **`g_sankoff_cm` trong `__constant__` 64 KB; `cudaMemcpyToSymbol`; `#ifdef PARS_BUILD_DEFINE_CM` macro** | **DRAM≈0% (NCU); avg 1.64× protein speedup vs Opt-4** |
 
 ---
 
@@ -227,3 +231,85 @@ Rectify vẫn được gọi ở iter 2+ (khi topology thực sự thay đổi s
 **File**: `gpu/src/pars_build.cu` — `gpuSPRHillClimb` (lines 322-338)
 
 ---
+## Opt-4: Register Preload trong Sankoff newview/evaluate (2026-06-07)
+
+**Vấn đề**: Loop Sankoff `for (ii) { for (jj) { load q[jj], r[jj] } }` — `q[jj]` và `r[jj]` là loop-invariant với `ii` nhưng compiler không hoist được vì global memory pointer (`__restrict__` không giúp ích với non-contiguous strides). S²=400 loads thay vì S=20.
+
+**Fix** (`pars_tree.cuh`, Sankoff branch của `newviewParsimony`):
+- Preload `lv_[STATES]`, `rv_[STATES]` trước vòng ii×jj
+- Evaluate: chỉ preload `rv_[STATES]` (r cần S², còn `qi` scalar S lần)
+- `#pragma unroll` cho cả ba loops (STATES=compile-time constant)
+
+**Chi phí**: S=4 → 8 extra regs (không đáng kể); S=20 → 40 extra regs → kernel đạt 255 regs (hardware max A100) → stack spill 4096 bytes.
+
+**Kết quả** (protein, STATES=20): Opt-4 là baseline để đo Opt-5. Speedup Opt-4 so với layout cũ chưa được đo riêng (Opt-4 implement cùng session với Opt-5).
+
+**Files**: `gpu/include/pars_tree.cuh` (~line 394–419 newview, ~line 470–488 evaluate)
+
+---
+
+## Opt-5: Sankoff Cost Matrix vào CUDA `__constant__` Memory (2026-06-07)
+
+**Vấn đề**: `d_cost_matrix` (cudaMalloc) → kernel đọc từ L2 cache. Với uniform warp access `cm[same_ii][same_jj]`, constant memory broadcast hardware là optimal.
+
+**Cơ chế**: CUDA constant memory = 64 KB dedicated per-device cache. Khi 32 lanes cùng đọc một địa chỉ → hardware broadcast từ constant cache → ~0 latency. Cost matrix 1600 bytes (S=20) fit dễ dàng.
+
+**Implementation**:
+
+```cuda
+// pars_tree.cuh — khai báo symbol
+static constexpr int kMaxSankoffStates = 20;
+#ifdef PARS_BUILD_DEFINE_CM
+__constant__ unsigned int g_sankoff_cm[kMaxSankoffStates * kMaxSankoffStates];
+#else
+extern __constant__ unsigned int g_sankoff_cm[kMaxSankoffStates * kMaxSankoffStates];
+#endif
+
+// pars_build.cu — define + upload
+#define PARS_BUILD_DEFINE_CM
+void gpuUploadSankoffCostMatrix(const unsigned int* cm, int nstates) {
+    CUDA_CHECK(cudaMemcpyToSymbol(g_sankoff_cm, cm, nstates*nstates*sizeof(unsigned int)));
+}
+
+// pars_tree.cu — sentinel pattern
+gpuUploadSankoffCostMatrix(cost_matrix, nstates);
+CUDA_CHECK(cudaMalloc(&mem->d_cost_matrix, sizeof(unsigned int)));  // sentinel
+
+// Kernel — dùng g_sankoff_cm
+const unsigned int* cm = sh.use_sankoff ? g_sankoff_cm : nullptr;
+```
+
+**Bugs fixed trong quá trình implement**:
+1. NVCC redefinition error → `#ifdef PARS_BUILD_DEFINE_CM` macro (không cần RDC vì template chỉ instantiate trong 1 TU)
+2. `sh.use_sankoff = false` sau khi `d_cost_matrix = nullptr` → 4-byte sentinel
+3. `pars_bootstrap.cuh` include `cuda_runtime_api.h` trong C++ TU → `#ifdef __CUDACC__` guard
+
+**NCU profiling** (A100 Device 5, STATES=20, prot_M10236_59_164):
+
+| Metric | Giá trị | Ý nghĩa |
+|--------|---------|---------|
+| DRAM Throughput | **0.00%** | Opt-5 thành công: constant cache phục vụ toàn bộ cost matrix |
+| L1/TEX Hit Rate | 68.87% | parsVect cho N=59 fit tốt trong L1 |
+| L2 Hit Rate | 99.9% | Gần như toàn bộ từ L2 |
+| Registers/thread | **255** | Hardware max (do Opt-4 thêm 40 regs) |
+| Stack Size | 4096 bytes | Register spill (đã bump từ 1024) |
+| Theoretical Occupancy | **12.5%** | 8 blocks/SM — giờ register-limited (không còn smem-limited) |
+| Warp Cycles/Issued Inst | **2.93** | Pipeline gần đầy, ít latency stall |
+
+**Speedup Opt-5 vs Opt-4** (5 protein datasets, device 4, numpars=200, sprdist=6):
+
+| Dataset | Opt-4 | Opt-5 | Speedup |
+|---------|-------|-------|---------|
+| prot_M10236 (59T, w=164) | 40.53 ms | 25.66 ms | **1.58×** |
+| prot_M11595 (66T, w=463) | 87.15 ms | 62.45 ms | **1.40×** |
+| prot_M3807 (82T, w=591) | 229.36 ms | 137.40 ms | **1.67×** |
+| prot_M10866 (88T, w=3329) | 1051.96 ms | 574.74 ms | **1.83×** |
+| prot_M11740 (138T, w=4427) | 3569.00 ms | 2074.64 ms | **1.72×** |
+| **Trung bình** | | | **1.64×** |
+
+Speedup tăng theo width: datasets có width lớn (3329, 4427) benefit nhiều hơn vì cost matrix được tái sử dụng nhiều lần hơn trên nhiều patterns.
+
+**Files**: `gpu/include/pars_tree.cuh` (khai báo + usage), `gpu/src/pars_build.cu` (define + upload), `gpu/src/pars_tree.cu` (sentinel), `gpu/include/pars_bootstrap.cuh` (CUDACC guard)
+
+**NCU reports**: `/output/profile_opt5/prot_M10236_ncu.ncu-rep`, `prot_M10866_ncu.ncu-rep` (pending), `prot_M11740_ncu.ncu-rep` (pending)
+

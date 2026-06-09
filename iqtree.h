@@ -773,6 +773,24 @@ public:
     // GPU-accelerated REPS evaluation (nullptr = CPU path, set when -use_gpu -bb)
     mpbootgpu::GpuBootstrapMem* gpu_boot_mem_;
 
+    // Copy src[0..nptn-1] into _pattern_pars (allocates if needed).
+    // Used by GPU treels path to inject pre-computed per-pattern parsimony.
+    void gpuSetPatternPars(const BootValTypePars* src, int nptn);
+
+    // When non-empty, saveCurrentTree uses this as tree_str key instead of calling printTree.
+    // Allows skipping readTreeString for non-duplicate treels entries.
+    // Caller must clear after saveCurrentTree returns.
+    std::string _gpu_newick_key;
+
+    // When non-null, saveCurrentTree uses this pre-computed REPS array (B elements)
+    // instead of calling gpuREPSEval. Points into gpu_boot_mem_->h_batch_rell.
+    // Caller must reset to nullptr after saveCurrentTree returns.
+    const int* _gpu_precomputed_rell = nullptr;
+
+    double _gpu_t_pp = 0.0;
+    double _gpu_t_reps = 0.0;
+    double _gpu_t_bupdate = 0.0;
+
     /** corresponding RELL log-likelihood */
     DoubleVector boot_logl;
 

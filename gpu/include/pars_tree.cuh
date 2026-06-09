@@ -23,6 +23,16 @@ static constexpr int kWarpSize = 32;
 // Opt-P: reduced stack for SPR doAddTraverse + NNI bitset
 // NNI bitset needs ceil(2*kMaxTaxa/32)+1 = 51 words; SPR stack depth ≤ 2*sprDist ≈ 12
 static constexpr int kMaxSprStack = 64;  // >> max(51 bitset words, 12 SPR entries)
+static constexpr int kMaxSankoffStates = 20;
+
+// Opt-5: Sankoff cost matrix in constant memory.
+// When PARS_BUILD_DEFINE_CM is set (pars_build.cu), the symbol is defined here.
+// All other TUs see the extern declaration — template never instantiated there, so no link issue.
+#ifdef PARS_BUILD_DEFINE_CM
+__constant__ unsigned int g_sankoff_cm[kMaxSankoffStates * kMaxSankoffStates];
+#else
+extern __constant__ unsigned int g_sankoff_cm[kMaxSankoffStates * kMaxSankoffStates];
+#endif
 
 // ─── GPU Topology ─────────────────────────────────────────────────────────────
 // Mirrors PLL's node rings as plain integer arrays.
@@ -74,7 +84,7 @@ struct GpuTopology
 // CPU layout (Fitch): [node][state][block]  — same → direct memcpy on upload
 struct GpuParsimonyMem
 {
-    parsimonyNumber* d_parsVect;  // [K][2N+1][width][states]
+    parsimonyNumber* d_parsVect;  // [K][2N+1][states][width] i.e. [node][state][block]
     unsigned int* d_parsScore;    // [K][2N+1]
     GpuTopology* d_topos;         // [K] topology per tree (global mem)
     unsigned int* d_siteWeights;  // [K][width] per-block weights; 1=normal, 2=ratchet-doubled
@@ -96,6 +106,7 @@ struct GpuParsimonyMem
     int*   d_treelsBackVf;          // [max_treels × kMaxVFaces] back_vf snapshots
     int*   d_treelsFilled;          // atomic fill counter (0..max_treels)
     unsigned int* d_treelsCutoff;   // score ≤ cutoff → write to treels (UINT_MAX = all qualify)
+    unsigned int* d_treelsHashes;   // [max_treels] topology hash per slot (Knuth over back_vf)
 
     int K;  // number of trees
     int mxtips;
@@ -111,6 +122,13 @@ struct GpuParsimonyMem
     size_t siteWeightsPerTree;  // = width (elements). Fitch: ratchet weights; Sankoff: pattern frequencies
 
     size_t total_gpu_bytes;     // total GPU memory allocated (sum of all cudaMalloc calls)
+    float save_margin;  // relative SAVE A margin: -1=save all, r≥0 → mp < randomMP*(1+r)
+
+    // ppars dedicated scratch: may be larger than K to improve GPU occupancy.
+    // Allocated after all other buffers using remaining free VRAM (up to 1000 blocks).
+    // Aliases d_parsVect when no extra VRAM is available (K_ppars == K in that case).
+    parsimonyNumber* d_ppars_parsVect;  // [K_ppars × parsVectPerTree]
+    int K_ppars;                        // ppars batch block count; K_ppars >= K
 };
 
 // ─── Shared memory per block ──────────────────────────────────────────────────
@@ -165,9 +183,9 @@ struct alignas(16) BuildSharedT
     // ── [MEDIUM] Ratchet / site weights ──────────────────────────────────────
     const unsigned int* site_weights;  // nullptr = uniform weight 1
 
-    // ── [Sankoff] Cost matrix pointer (nullptr = Fitch uniform mode) ─────────
-    bool use_sankoff;                    // true = Sankoff parsimony
-    const unsigned int* cost_matrix;     // device ptr to [states×states] cost matrix
+    // ── [Sankoff] mode flag ──────────────────────────────────────────────────
+    bool use_sankoff;                    // true = Sankoff parsimony; cost matrix is g_sankoff_cm
+    float save_margin;                   // relative SAVE A margin: -1=save all, r≥0 → mp < randomMP*(1+r)
 
     // ── [BUILD-ONLY] Phase 0-1 scalars (not touched during SPR) ─────────────
     int insertVf;
@@ -203,10 +221,10 @@ GpuParsimonyMem* gpuParsimonyMemAlloc(int K, int mxtips, int width, int states,
 void gpuParsimonyMemFree(GpuParsimonyMem* mem);
 
 // Reset treels buffer and set new cutoff threshold (call before each K2 bootstrap round).
-void resetTreelsRound(GpuParsimonyMem* mem, unsigned int cutoff_pars);
+void resetTreelsRound(GpuParsimonyMem* mem, unsigned int cutoff_pars, cudaStream_t stream);
 
 // Upload tip parsVect for ALL K trees (shared; tips are read-only).
-// Reorders from CPU [node][state][block] → GPU [node][block][state].
+// CPU and GPU both use [node][state][block] layout → direct memcpy, no reorder needed.
 // pr must be the pllInstance whose compressDNA has already been called.
 void uploadTipParsVect(
     GpuParsimonyMem* mem, const pllInstance* tr, const partitionList* pr, cudaStream_t stream = 0
@@ -238,7 +256,7 @@ void downloadPoolBackVf(
 );
 
 // Reset pool topology hashes to 0xFFFFFFFF (call before each K2 bootstrap round).
-void resetPoolRound(GpuParsimonyMem* mem);
+void resetPoolRound(GpuParsimonyMem* mem, cudaStream_t stream);
 
 // ─── Validation kernel (Phase 1 test) ─────────────────────────────────────────
 // Runs newview for all (p,q,r) triples in h_ti[0..tiCount-1]
@@ -330,7 +348,7 @@ __device__ __forceinline__ unsigned int newviewParsimony(
     // Fitch: sh.site_weights = ratchet weights (nullptr = uniform). Multiply partial scores.
     // Sankoff: sh.site_weights = pattern frequencies (from aln->at(ptn).frequency).
     const unsigned int* sw = sh.site_weights;
-    const unsigned int* cm = sh.cost_matrix;  // nullptr in Fitch mode
+    const unsigned int* cm = sh.use_sankoff ? g_sankoff_cm : nullptr;
 
     for (int i = sh.tiSize - 3; i >= 3; i -= 3)
     {
@@ -373,6 +391,14 @@ __device__ __forceinline__ unsigned int newviewParsimony(
             {
                 // Sankoff: each b = one pattern; elements are costs (not bitmasks)
                 // partial_p[s][b] = min_j(q[j][b] + cost[s][j]) + min_j(r[j][b] + cost[s][j])
+                // Opt-4: preload child columns into registers — eliminates S-fold redundant global loads.
+                unsigned int lv_[STATES], rv_[STATES];
+                #pragma unroll
+                for (int jj = 0; jj < STATES; ++jj) {
+                    lv_[jj] = (unsigned int)q_base[(size_t)jj * width + b];
+                    rv_[jj] = (unsigned int)r_base[(size_t)jj * width + b];
+                }
+                unsigned int min_cost_b = kSankoffInf;
                 #pragma unroll
                 for (int ii = 0; ii < STATES; ++ii)
                 {
@@ -381,13 +407,16 @@ __device__ __forceinline__ unsigned int newviewParsimony(
                     for (int jj = 0; jj < STATES; ++jj)
                     {
                         unsigned int c = cm[ii * STATES + jj];
-                        unsigned int lv = (unsigned int)q_base[(size_t)jj * width + b];
-                        unsigned int rv = (unsigned int)r_base[(size_t)jj * width + b];
-                        best_left  = min(best_left,  lv + c);
-                        best_right = min(best_right, rv + c);
+                        best_left  = min(best_left,  lv_[jj] + c);
+                        best_right = min(best_right, rv_[jj] + c);
                     }
-                    p_base[(size_t)ii * width + b] = (parsimonyNumber)(best_left + best_right);
+                    unsigned int val = best_left + best_right;
+                    p_base[(size_t)ii * width + b] = (parsimonyNumber)val;
+                    min_cost_b = min(min_cost_b, val);
                 }
+                // Accumulate subtree lower-bound for Opt-B pruning in doAddTraverse.
+                // min_cost_b = min_s(p[s][b]) = minimum Sankoff cost of this subtree at site b.
+                score += (min_cost_b < kSankoffInf) ? min_cost_b : 0u;
             }
         }
         score = warpReduceU32(score);
@@ -438,6 +467,11 @@ __device__ __forceinline__ unsigned int newviewParsimony(
         {
             // Sankoff evaluate at edge (q_num, r_num): min_ij(q[i] + cost[i][j] + r[j])
             // No score_tree terms — partial vectors already encode full subtree costs
+            // Opt-4: preload r columns into registers — eliminates S-fold redundant global loads.
+            unsigned int rv_[STATES];
+            #pragma unroll
+            for (int jj = 0; jj < STATES; ++jj)
+                rv_[jj] = (unsigned int)r_base[(size_t)jj * width + b];
             unsigned int min_edge = kSankoffInf;
             #pragma unroll
             for (int ii = 0; ii < STATES; ++ii)
@@ -447,8 +481,7 @@ __device__ __forceinline__ unsigned int newviewParsimony(
                 for (int jj = 0; jj < STATES; ++jj)
                 {
                     unsigned int c = cm[ii * STATES + jj];
-                    unsigned int rj = (unsigned int)r_base[(size_t)jj * width + b];
-                    min_edge = min(min_edge, qi + c + rj);
+                    min_edge = min(min_edge, qi + c + rv_[jj]);
                 }
             }
             score += (sw ? sw[b] : 1u) * min_edge;

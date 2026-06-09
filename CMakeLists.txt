@@ -34,6 +34,12 @@ cmake_minimum_required(VERSION 3.18)
 
 project(mpboot)
 
+# Enforce C++14 globally — prevents clang++ from defaulting to C++17,
+# which breaks legacy code in model/ (dynamic exception specs, register keyword).
+set(CMAKE_CXX_STANDARD 14 CACHE STRING "" FORCE)
+set(CMAKE_CXX_STANDARD_REQUIRED ON CACHE BOOL "" FORCE)
+set(CMAKE_CXX_EXTENSIONS OFF CACHE BOOL "" FORCE)
+
 option(USE_GPU "Enable GPU acceleration with CUDA" OFF)
 
 if(USE_GPU)
@@ -446,10 +452,11 @@ if (IQTREE_FLAGS MATCHES "omp")
 	endif()
 endif()
 
-target_link_libraries(mpboot MPBOOTlib pll ncl whtest zlibstatic sprng vectorclass model ${PLATFORM_LIB} ${THREAD_LIB})	
+target_link_libraries(mpboot MPBOOTlib pll ncl whtest zlibstatic sprng vectorclass model ${PLATFORM_LIB} ${THREAD_LIB})
+
 
 ##################################################################
-# setup the executable name 
+# setup the executable name
 ##################################################################
 set_target_properties(mpboot PROPERTIES OUTPUT_NAME "mpboot${EXE_SUFFIX}")
 
